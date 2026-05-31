@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportMode {
     Train,
@@ -263,4 +263,3 @@ pub fn seconds_to_time(value: u32) -> String {
 pub fn naive_time_to_seconds(value: NaiveTime) -> u32 {
     value.signed_duration_since(NaiveTime::MIN).num_seconds() as u32
 }
-
