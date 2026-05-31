@@ -34,6 +34,22 @@ cp .env.example .env
 docker compose up --build
 ```
 
+If a host port is already taken, change only the host-side port. Containers still use `postgres:5432` and `redis:6379` internally:
+
+```env
+POSTGRES_HOST_PORT=5433
+REDIS_HOST_PORT=6380
+DATABASE_URL=postgres://cesta:cesta@postgres:5432/cesta
+REDIS_URL=redis://redis:6379
+API_PORT=8070
+```
+
+On ARM Linux servers, if `postgis/postgis:16-3.4` exits with `exec format error`, use an ARM-compatible PostGIS image:
+
+```env
+POSTGRES_IMAGE=imresamu/postgis-arm64:16-3.4-alpine3.21
+```
+
 Useful local commands:
 
 ```powershell
