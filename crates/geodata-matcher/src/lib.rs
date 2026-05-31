@@ -92,4 +92,3 @@ mod tests {
         assert_eq!(matched.confidence, CoordinateConfidence::High);
     }
 }
-

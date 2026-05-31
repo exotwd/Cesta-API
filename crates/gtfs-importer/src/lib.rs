@@ -7,7 +7,9 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use transit_model::{Agency, Route, Stop, StopTime, TransportMode, normalize_czech_name, parse_gtfs_time};
+use transit_model::{
+    Agency, Route, Stop, StopTime, TransportMode, normalize_czech_name, parse_gtfs_time,
+};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +84,13 @@ fn parse_archive<R: Read + Seek>(
     let mut dataset = GtfsDataset::default();
     let names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
 
-    for required in ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"] {
+    for required in [
+        "agency.txt",
+        "stops.txt",
+        "routes.txt",
+        "trips.txt",
+        "stop_times.txt",
+    ] {
         if !names.iter().any(|name| name == required) {
             dataset.validation_issues.push(ValidationIssue {
                 severity: ValidationSeverity::Error,
@@ -99,7 +107,12 @@ fn parse_archive<R: Read + Seek>(
         dataset.agencies = parse_agencies(archive, options.limit_rows)?;
     }
     if names.iter().any(|name| name == "stops.txt") {
-        dataset.stops = parse_stops(archive, &options, options.limit_rows, &mut dataset.validation_issues)?;
+        dataset.stops = parse_stops(
+            archive,
+            &options,
+            options.limit_rows,
+            &mut dataset.validation_issues,
+        )?;
     }
     if names.iter().any(|name| name == "routes.txt") {
         dataset.routes = parse_routes(archive, &options, options.limit_rows)?;
@@ -108,7 +121,8 @@ fn parse_archive<R: Read + Seek>(
         dataset.trips = parse_trips(archive, options.limit_rows)?;
     }
     if names.iter().any(|name| name == "stop_times.txt") {
-        dataset.stop_times = parse_stop_times(archive, options.limit_rows, &mut dataset.validation_issues)?;
+        dataset.stop_times =
+            parse_stop_times(archive, options.limit_rows, &mut dataset.validation_issues)?;
     }
 
     Ok(dataset)
@@ -137,7 +151,10 @@ fn parse_agencies<R: Read + Seek>(
         .map(|row| {
             let row = row?;
             Ok(Agency {
-                id: row.agency_id.clone().unwrap_or_else(|| row.agency_name.clone()),
+                id: row
+                    .agency_id
+                    .clone()
+                    .unwrap_or_else(|| row.agency_name.clone()),
                 source_id: row.agency_id.unwrap_or_else(|| row.agency_name.clone()),
                 name: row.agency_name,
                 url: row.agency_url,
@@ -195,7 +212,10 @@ fn parse_stops<R: Read + Seek>(
                     region: None,
                     lat: row.stop_lat,
                     lon: row.stop_lon,
-                    geom: row.stop_lat.zip(row.stop_lon).map(|(lat, lon)| geo_types::Point::new(lon, lat)),
+                    geom: row
+                        .stop_lat
+                        .zip(row.stop_lon)
+                        .map(|(lat, lon)| geo_types::Point::new(lon, lat)),
                     coordinate_confidence: if row.stop_lat.is_some() && row.stop_lon.is_some() {
                         transit_model::CoordinateConfidence::Exact
                     } else {
@@ -379,7 +399,8 @@ mod tests {
             zip.start_file("routes.txt", options).unwrap();
             zip.write_all(b"route_id,agency_id,route_short_name,route_long_name,route_type\nr1,pid,R9,Praha - Brno,2\n").unwrap();
             zip.start_file("trips.txt", options).unwrap();
-            zip.write_all(b"route_id,service_id,trip_id,trip_headsign\nr1,wd,t1,Brno\n").unwrap();
+            zip.write_all(b"route_id,service_id,trip_id,trip_headsign\nr1,wd,t1,Brno\n")
+                .unwrap();
             zip.start_file("stop_times.txt", options).unwrap();
             zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,10:35:00,10:35:00,s2,2\n").unwrap();
             zip.finish().unwrap();
@@ -414,7 +435,8 @@ mod tests {
             zip.start_file("routes.txt", options).unwrap();
             zip.write_all(b"route_id,route_type\nr1,3\n").unwrap();
             zip.start_file("trips.txt", options).unwrap();
-            zip.write_all(b"route_id,service_id,trip_id\nr1,wd,t1\n").unwrap();
+            zip.write_all(b"route_id,service_id,trip_id\nr1,wd,t1\n")
+                .unwrap();
             zip.start_file("stop_times.txt", options).unwrap();
             zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,bad,08:00:00,s1,1\n").unwrap();
             zip.finish().unwrap();
@@ -430,8 +452,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(dataset.validation_issues.iter().any(|issue| issue.code == "stop_without_coordinates"));
-        assert!(dataset.validation_issues.iter().any(|issue| issue.code == "malformed_stop_time"));
+        assert!(
+            dataset
+                .validation_issues
+                .iter()
+                .any(|issue| issue.code == "stop_without_coordinates")
+        );
+        assert!(
+            dataset
+                .validation_issues
+                .iter()
+                .any(|issue| issue.code == "malformed_stop_time")
+        );
     }
 
     #[test]
@@ -442,4 +474,3 @@ mod tests {
         assert_eq!(checksum.len(), 64);
     }
 }
-

@@ -18,13 +18,13 @@ Cesta API is an API-only backend foundation for Czech public transport data. It 
 
 - Realtime data uses explicit mock updates and reports `mock = true`.
 - Ticket recommendation endpoints return mock recommendations and do not implement payment.
-- The API uses fixture transport data when `USE_MOCK_DATA=true` or when no database import is available.
+- The API uses fixture transport data only when `USE_MOCK_DATA=true`; with `USE_MOCK_DATA=false`, stop search, stop detail and departures read imported PostgreSQL data.
 - Offline package records are metadata-only placeholders until package generation is wired to imported data.
 
 ## What Uses Real Data
 
-- The `data-pipeline` service can download GGU latest GTFS and log files, archive them without overwrites, compute SHA-256 checksums and parse GTFS core files.
-- Database migrations are ready for imported entities with source tracking and import run metadata.
+- The `data-pipeline` service can download GGU latest GTFS and log files, archive them without overwrites, compute SHA-256 checksums, parse GTFS core files and export agencies, stops, routes, trips, stop times and validation issues to PostgreSQL.
+- `/metadata/data-status`, `/stops/search`, `/stops/{id}` and `/departures` read imported database data when `USE_MOCK_DATA=false`.
 - API response shapes include data freshness and warnings so mock or unavailable data is not hidden.
 
 ## Run Locally
@@ -44,6 +44,12 @@ cargo run -p data-pipeline -- summarize latest
 cargo run -p realtime-worker
 ```
 
+On Windows, native `cargo run` requires Visual Studio Build Tools with the C++ workload because the default Rust toolchain uses MSVC `link.exe`. If that is not installed, use Docker Compose:
+
+```powershell
+docker compose up --build
+```
+
 The API listens on `http://localhost:8080` by default.
 
 ## First Admin
@@ -57,25 +63,35 @@ $env:ADMIN_BOOTSTRAP_PASSWORD="change-me-locally"
 
 The current bootstrap path is documented and represented in migrations; production bootstrap should be finalized with an explicit database task before deployment.
 
+Admin database stats are available after logging in:
+
+```powershell
+$login = Invoke-RestMethod -Method Post http://localhost:8080/auth/login -ContentType "application/json" -Body '{"email":"admin@example.com","password":"change-me-locally"}'
+Invoke-RestMethod http://localhost:8080/admin/database/stats -Headers @{ Authorization = "Bearer $($login.access_token)" }
+```
+
 ## Example Calls
 
 ```powershell
 Invoke-RestMethod http://localhost:8080/health
-Invoke-RestMethod "http://localhost:8080/stops/search?q=Praha"
-Invoke-RestMethod "http://localhost:8080/departures?stopId=stop-praha-hl-n&limit=5"
+$stops = Invoke-RestMethod "http://localhost:8080/stops/search?q=a"
+Invoke-RestMethod ("http://localhost:8080/departures?stopId=" + [uri]::EscapeDataString($stops.stops[0].id) + "&limit=5")
 Invoke-RestMethod -Method Post http://localhost:8080/journeys/search -ContentType "application/json" -Body '{"from":{"type":"stop","id":"stop-praha-hl-n"},"to":{"type":"stop","id":"stop-brno-hl-n"},"datetime":"2026-07-06T21:05:00+02:00","mode":"depart_at","transport_modes":["train"],"max_transfers":4,"walking_speed":"normal","prefer_reliable_transfers":true,"offline_compatible":false}'
 ```
 
 ## GGU Latest Import
 
 ```powershell
-cargo run -p data-pipeline -- download ggu-latest
-cargo run -p data-pipeline -- import ggu-latest --limit-rows 1000
-cargo run -p data-pipeline -- validate latest
-cargo run -p data-pipeline -- import-and-validate ggu-latest --limit-rows 1000
+docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest --limit-rows 1000
 ```
 
-Full national imports can be large. Use `--limit-rows` for development and remove it for production-style runs.
+This downloads real GGU latest files into `storage/raw/...`, parses GTFS core files and exports imported rows to PostgreSQL. If the latest local GGU run still matches the remote `ETag`, `Last-Modified` or content length, the pipeline reuses the existing files instead of downloading them again. Database export also skips a source when the same feed checksum was already imported successfully, and it refuses to start a duplicate export while the same source is already running. Use `--force-db-export` only when you intentionally want to rewrite an unchanged feed. Full national imports can be large. Use `--limit-rows` for development and remove it for production-style runs.
+
+After import, restart the API if it was already running:
+
+```powershell
+docker compose up --build api
+```
 
 ## OpenAPI
 

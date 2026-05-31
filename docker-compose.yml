@@ -29,8 +29,10 @@ services:
       JWT_SECRET: dev-only-change-me
       REFRESH_TOKEN_SECRET: dev-only-change-me-too
       STORAGE_DIR: /app/storage
-      USE_MOCK_DATA: "true"
+      USE_MOCK_DATA: "false"
       API_PORT: 8080
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       RUST_LOG: info
     ports:
       - "8080:8080"
@@ -46,6 +48,22 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
+
+  data-pipeline:
+    build:
+      context: .
+      dockerfile: infra/docker/data-pipeline.Dockerfile
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
+      STORAGE_DIR: /app/storage
+      GGU_LATEST_BASE_URL: https://data.jr.ggu.cz/results/latest/
+      RUST_LOG: info
+    volumes:
+      - ./storage:/app/storage
+    profiles:
+      - tools
 
 volumes:
   postgres-data:

@@ -17,12 +17,28 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use sqlx::{PgPool, Row};
+use tokio::{sync::RwLock, time};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use transit_model::{
     CoordinateConfidence, OfflinePackage, Stop, TicketOption, TransportMode, normalize_czech_name,
 };
 use uuid::Uuid;
+
+const DB_STAT_TABLES: &[&str] = &[
+    "import_runs",
+    "source_feeds",
+    "agencies",
+    "stops",
+    "stop_source_ids",
+    "routes",
+    "trips",
+    "stop_times",
+    "validation_issues",
+    "realtime_updates",
+    "manual_stop_matches",
+    "offline_packages",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -31,6 +47,7 @@ struct AppState {
     saved_places: Arc<RwLock<HashMap<Uuid, Vec<SavedPlace>>>>,
     favorite_stops: Arc<RwLock<HashMap<Uuid, Vec<FavoriteStop>>>>,
     stops: Arc<Vec<Stop>>,
+    db: Option<PgPool>,
     jwt_secret: String,
     use_mock_data: bool,
 }
@@ -209,14 +226,25 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn app_state() -> anyhow::Result<AppState> {
+    let use_mock_data = env::var("USE_MOCK_DATA")
+        .map(|value| value == "true")
+        .unwrap_or(true);
+    let db = if use_mock_data {
+        None
+    } else {
+        let database_url = env::var("DATABASE_URL")?;
+        Some(connect_database_with_retry(&database_url).await?)
+    };
+
     let state = AppState {
         users: Arc::new(RwLock::new(HashMap::new())),
         refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
         saved_places: Arc::new(RwLock::new(HashMap::new())),
         favorite_stops: Arc::new(RwLock::new(HashMap::new())),
         stops: Arc::new(fixture_stops()),
+        db,
         jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-change-me".to_string()),
-        use_mock_data: env::var("USE_MOCK_DATA").map(|value| value == "true").unwrap_or(true),
+        use_mock_data,
     };
 
     if let (Ok(email), Ok(password)) = (
@@ -224,11 +252,37 @@ async fn app_state() -> anyhow::Result<AppState> {
         env::var("ADMIN_BOOTSTRAP_PASSWORD"),
     ) {
         if !email.is_empty() && !password.is_empty() {
-            let user = create_user_record(&email, &password, Some("Admin".to_string()), vec!["admin".to_string(), "data_admin".to_string()])?;
+            let user = create_user_record(
+                &email,
+                &password,
+                Some("Admin".to_string()),
+                vec!["admin".to_string(), "data_admin".to_string()],
+            )?;
             state.users.write().await.insert(user.id, user);
         }
     }
     Ok(state)
+}
+
+async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPool> {
+    let mut last_error = None;
+    for attempt in 1..=30 {
+        match PgPool::connect(database_url).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) => {
+                tracing::warn!(attempt, %error, "database is not ready yet");
+                last_error = Some(error);
+                time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "database connection failed after retries: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 fn build_router(state: AppState) -> Router {
@@ -244,13 +298,28 @@ fn build_router(state: AppState) -> Router {
         .route("/auth/me", get(auth_me).patch(update_me).delete(delete_me))
         .route("/auth/change-password", post(change_password))
         .route("/me/profile", get(profile).patch(profile))
-        .route("/me/saved-places", get(list_saved_places).post(create_saved_place))
-        .route("/me/saved-places/{id}", patch(update_saved_place).delete(delete_saved_place))
-        .route("/me/favorite-stops", get(list_favorite_stops).post(add_favorite_stop))
+        .route(
+            "/me/saved-places",
+            get(list_saved_places).post(create_saved_place),
+        )
+        .route(
+            "/me/saved-places/{id}",
+            patch(update_saved_place).delete(delete_saved_place),
+        )
+        .route(
+            "/me/favorite-stops",
+            get(list_favorite_stops).post(add_favorite_stop),
+        )
         .route("/me/favorite-stops/{id}", delete(delete_favorite_stop))
-        .route("/me/favorite-routes", get(empty_user_collection).post(empty_user_collection))
+        .route(
+            "/me/favorite-routes",
+            get(empty_user_collection).post(empty_user_collection),
+        )
         .route("/me/favorite-routes/{id}", delete(empty_user_collection))
-        .route("/me/notification-preferences", get(notification_preferences).patch(notification_preferences))
+        .route(
+            "/me/notification-preferences",
+            get(notification_preferences).patch(notification_preferences),
+        )
         .route("/stops/search", get(search_stops))
         .route("/stops/nearby", get(nearby_stops))
         .route("/stops/{id}", get(stop_detail))
@@ -262,8 +331,14 @@ fn build_router(state: AppState) -> Router {
         .route("/realtime/trip/{trip_id}", get(realtime_trip))
         .route("/realtime/status", get(realtime_status))
         .route("/offline/packages", get(offline_packages))
-        .route("/offline/packages/{id}/metadata", get(offline_package_metadata))
-        .route("/offline/packages/{id}/download", get(offline_package_download))
+        .route(
+            "/offline/packages/{id}/metadata",
+            get(offline_package_metadata),
+        )
+        .route(
+            "/offline/packages/{id}/download",
+            get(offline_package_download),
+        )
         .route("/offline/packages/{id}/delta", get(offline_package_delta))
         .route("/tickets/recommendation", get(ticket_recommendation))
         .route("/tickets/quote", post(ticket_quote))
@@ -271,6 +346,7 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/imports/{id}", get(admin_import))
         .route("/admin/imports/latest", get(admin_import_latest))
         .route("/admin/imports/ggu-latest/start", post(admin_import_start))
+        .route("/admin/database/stats", get(admin_database_stats))
         .route("/admin/data-quality", get(admin_data_quality))
         .route("/admin/unmatched-stops", get(admin_unmatched_stops))
         .route("/admin/manual-stop-match", post(admin_manual_stop_match))
@@ -284,7 +360,11 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn auth_marker(State(_state): State<AppState>, request: axum::http::Request<axum::body::Body>, next: Next) -> Response {
+async fn auth_marker(
+    State(_state): State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
     next.run(request).await
 }
 
@@ -304,12 +384,25 @@ async fn openapi() -> Json<Value> {
             "/departures": {"get": {"summary": "Stop departures"}},
             "/journeys/search": {"post": {"summary": "Search journeys"}},
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
+            "/admin/database/stats": {"get": {"summary": "Database row counts and table sizes"}},
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
         }
     }))
 }
 
 async fn data_status(State(state): State<AppState>) -> Json<Value> {
+    if let Some(pool) = &state.db {
+        return Json(database_status(pool).await.unwrap_or_else(|error| {
+            json!({
+                "schedule": "unknown",
+                "realtime": "unavailable",
+                "source": "database",
+                "database_available": false,
+                "warnings": [format!("database status query failed: {error}")]
+            })
+        }));
+    }
+
     Json(json!({
         "schedule": if state.use_mock_data { "mock" } else { "unknown" },
         "realtime": "unavailable",
@@ -333,11 +426,22 @@ async fn register(
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let mut users = state.users.write().await;
-    if users.values().any(|user| user.email == body.email && user.deleted_at.is_none()) {
-        return Err(ApiError { code: "conflict".to_string(), message: "Email is already registered".to_string() });
+    if users
+        .values()
+        .any(|user| user.email == body.email && user.deleted_at.is_none())
+    {
+        return Err(ApiError {
+            code: "conflict".to_string(),
+            message: "Email is already registered".to_string(),
+        });
     }
-    let user = create_user_record(&body.email, &body.password, body.display_name, vec!["user".to_string()])
-        .map_err(internal_error)?;
+    let user = create_user_record(
+        &body.email,
+        &body.password,
+        body.display_name,
+        vec!["user".to_string()],
+    )
+    .map_err(internal_error)?;
     let response = auth_response(&state, &user).await?;
     users.insert(user.id, user);
     Ok(Json(response))
@@ -378,16 +482,27 @@ async fn logout(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    state.refresh_tokens.write().await.remove(&hash_token(&body.refresh_token));
+    state
+        .refresh_tokens
+        .write()
+        .await
+        .remove(&hash_token(&body.refresh_token));
     Ok(Json(json!({"status":"logged_out"})))
 }
 
-async fn auth_me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<PublicUser>, ApiError> {
+async fn auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PublicUser>, ApiError> {
     let user = current_user(&state, &headers).await?;
     Ok(Json(public_user(&user)))
 }
 
-async fn update_me(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Json<PublicUser>, ApiError> {
+async fn update_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<PublicUser>, ApiError> {
     let current = current_user(&state, &headers).await?;
     let mut users = state.users.write().await;
     let user = users.get_mut(&current.id).ok_or_else(unauthorized)?;
@@ -397,7 +512,10 @@ async fn update_me(State(state): State<AppState>, headers: HeaderMap, Json(body)
     Ok(Json(public_user(user)))
 }
 
-async fn delete_me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn delete_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     let current = current_user(&state, &headers).await?;
     if let Some(user) = state.users.write().await.get_mut(&current.id) {
         user.deleted_at = Some(Utc::now());
@@ -406,10 +524,15 @@ async fn delete_me(State(state): State<AppState>, headers: HeaderMap) -> Result<
 }
 
 async fn change_password() -> Json<Value> {
-    Json(json!({"status":"not_implemented","warning":"password change endpoint is reserved for the database-backed auth flow"}))
+    Json(
+        json!({"status":"not_implemented","warning":"password change endpoint is reserved for the database-backed auth flow"}),
+    )
 }
 
-async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     let user = current_user(&state, &headers).await?;
     Ok(Json(json!({
         "user_id": user.id,
@@ -422,9 +545,18 @@ async fn profile(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
     })))
 }
 
-async fn list_saved_places(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn list_saved_places(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let places = state.saved_places.read().await.get(&user.id).cloned().unwrap_or_default();
+    let places = state
+        .saved_places
+        .read()
+        .await
+        .get(&user.id)
+        .cloned()
+        .unwrap_or_default();
     Ok(Json(json!({"saved_places": places})))
 }
 
@@ -447,15 +579,27 @@ async fn create_saved_place(
         created_at: now,
         updated_at: now,
     };
-    state.saved_places.write().await.entry(user.id).or_default().push(place.clone());
+    state
+        .saved_places
+        .write()
+        .await
+        .entry(user.id)
+        .or_default()
+        .push(place.clone());
     Ok(Json(place))
 }
 
 async fn update_saved_place() -> Json<Value> {
-    Json(json!({"status":"not_implemented","warning":"PATCH saved place is reserved for repository-backed update"}))
+    Json(
+        json!({"status":"not_implemented","warning":"PATCH saved place is reserved for repository-backed update"}),
+    )
 }
 
-async fn delete_saved_place(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
+async fn delete_saved_place(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
     let user = current_user(&state, &headers).await?;
     state
         .saved_places
@@ -467,9 +611,18 @@ async fn delete_saved_place(State(state): State<AppState>, headers: HeaderMap, P
     Ok(Json(json!({"status":"deleted"})))
 }
 
-async fn list_favorite_stops(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn list_favorite_stops(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     let user = current_user(&state, &headers).await?;
-    let favorites = state.favorite_stops.read().await.get(&user.id).cloned().unwrap_or_default();
+    let favorites = state
+        .favorite_stops
+        .read()
+        .await
+        .get(&user.id)
+        .cloned()
+        .unwrap_or_default();
     Ok(Json(json!({"favorite_stops": favorites})))
 }
 
@@ -485,11 +638,21 @@ async fn add_favorite_stop(
         stop_id: body.stop_id,
         created_at: Utc::now(),
     };
-    state.favorite_stops.write().await.entry(user.id).or_default().push(favorite.clone());
+    state
+        .favorite_stops
+        .write()
+        .await
+        .entry(user.id)
+        .or_default()
+        .push(favorite.clone());
     Ok(Json(favorite))
 }
 
-async fn delete_favorite_stop(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
+async fn delete_favorite_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
     let user = current_user(&state, &headers).await?;
     state
         .favorite_stops
@@ -509,8 +672,26 @@ async fn notification_preferences() -> Json<Value> {
     Json(json!({"notification_preferences":[],"warning":"notification persistence is pending"}))
 }
 
-async fn search_stops(State(state): State<AppState>, Query(query): Query<StopSearchQuery>) -> Json<Value> {
+async fn search_stops(
+    State(state): State<AppState>,
+    Query(query): Query<StopSearchQuery>,
+) -> Json<Value> {
     let q = query.q.unwrap_or_default();
+    if let Some(pool) = &state.db {
+        return match search_stops_db(pool, &q).await {
+            Ok(stops) => Json(json!({"stops": stops, "data_status": database_data_status()})),
+            Err(error) => Json(json!({
+                "stops": [],
+                "data_status": {
+                    "source": "database",
+                    "schedule": "unknown",
+                    "realtime": "unavailable",
+                    "warnings": [format!("database stop search failed: {error}")]
+                }
+            })),
+        };
+    }
+
     let normalized = normalize_czech_name(&q);
     let stops = state
         .stops
@@ -521,8 +702,29 @@ async fn search_stops(State(state): State<AppState>, Query(query): Query<StopSea
     Json(json!({"stops": stops, "data_status": mock_status(state.use_mock_data)}))
 }
 
-async fn nearby_stops(State(state): State<AppState>, Query(query): Query<NearbyQuery>) -> Json<Value> {
+async fn nearby_stops(
+    State(state): State<AppState>,
+    Query(query): Query<NearbyQuery>,
+) -> Json<Value> {
     let radius = query.radius.unwrap_or(1000.0);
+    if let Some(pool) = &state.db {
+        return match nearby_stops_db(pool, query.lat, query.lon, radius).await {
+            Ok(stops) => Json(
+                json!({"stops": stops, "radius": radius, "data_status": database_data_status()}),
+            ),
+            Err(error) => Json(json!({
+                "stops": [],
+                "radius": radius,
+                "data_status": {
+                    "source": "database",
+                    "schedule": "unknown",
+                    "realtime": "unavailable",
+                    "warnings": [format!("database nearby stop query failed: {error}")]
+                }
+            })),
+        };
+    }
+
     let stops = state
         .stops
         .iter()
@@ -537,18 +739,64 @@ async fn nearby_stops(State(state): State<AppState>, Query(query): Query<NearbyQ
     Json(json!({"stops": stops, "radius": radius, "data_status": mock_status(state.use_mock_data)}))
 }
 
-async fn stop_detail(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let stop = state.stops.iter().find(|stop| stop.id == id).ok_or_else(not_found)?;
-    Ok(Json(json!({"stop": stop, "data_status": mock_status(state.use_mock_data)})))
+async fn stop_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(pool) = &state.db {
+        let stop = get_stop_db(pool, &id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(not_found)?;
+        return Ok(Json(
+            json!({"stop": stop, "data_status": database_data_status()}),
+        ));
+    }
+
+    let stop = state
+        .stops
+        .iter()
+        .find(|stop| stop.id == id)
+        .ok_or_else(not_found)?;
+    Ok(Json(
+        json!({"stop": stop, "data_status": mock_status(state.use_mock_data)}),
+    ))
 }
 
 async fn stop_area(Path(id): Path<String>) -> Json<Value> {
     Json(json!({"id": id, "warning": "stop area detail is pending imported stop-area data"}))
 }
 
-async fn departures(State(state): State<AppState>, Query(query): Query<DeparturesQuery>) -> Json<Value> {
-    let _time = query.time;
+async fn departures(
+    State(state): State<AppState>,
+    Query(query): Query<DeparturesQuery>,
+) -> Json<Value> {
     let limit = query.limit.unwrap_or(10);
+    if let Some(pool) = &state.db {
+        let earliest = query
+            .time
+            .as_deref()
+            .and_then(parse_query_time_seconds)
+            .unwrap_or(0);
+        return match departures_db(pool, &query.stop_id, earliest, limit).await {
+            Ok(departures) => Json(json!({
+                "stop_id": query.stop_id,
+                "departures": departures,
+                "data_status": database_data_status()
+            })),
+            Err(error) => Json(json!({
+                "stop_id": query.stop_id,
+                "departures": [],
+                "data_status": {
+                    "source": "database",
+                    "schedule": "unknown",
+                    "realtime": "unavailable",
+                    "warnings": [format!("database departures query failed: {error}")]
+                }
+            })),
+        };
+    }
+
     Json(json!({
         "stop_id": query.stop_id,
         "departures": fixture_departures().into_iter().take(limit).collect::<Vec<_>>(),
@@ -565,11 +813,26 @@ async fn board_departures(Path(stop_id): Path<String>) -> Json<Value> {
 }
 
 async fn board_qr(Path(stop_id): Path<String>) -> Json<Value> {
-    Json(json!({"stop_id": stop_id, "qr_url": format!("https://cesta.local/boards/{stop_id}"), "mock": true}))
+    Json(
+        json!({"stop_id": stop_id, "qr_url": format!("https://cesta.local/boards/{stop_id}"), "mock": true}),
+    )
 }
 
-async fn journey_search(State(state): State<AppState>, Json(body): Json<JourneySearchBody>) -> Json<Value> {
-    let _request_metadata = (&body.datetime, &body.mode, &body.walking_speed, body.prefer_reliable_transfers, body.offline_compatible, body.from.lat, body.from.lon, body.to.lat, body.to.lon);
+async fn journey_search(
+    State(state): State<AppState>,
+    Json(body): Json<JourneySearchBody>,
+) -> Json<Value> {
+    let _request_metadata = (
+        &body.datetime,
+        &body.mode,
+        &body.walking_speed,
+        body.prefer_reliable_transfers,
+        body.offline_compatible,
+        body.from.lat,
+        body.from.lon,
+        body.to.lat,
+        body.to.lon,
+    );
     let from_stop_id = body.from.id.unwrap_or_else(|| body.from.point_type);
     let to_stop_id = body.to.id.unwrap_or_else(|| body.to.point_type);
     let journeys = earliest_arrivals(
@@ -595,11 +858,15 @@ async fn journey_search(State(state): State<AppState>, Json(body): Json<JourneyS
 }
 
 async fn realtime_trip(Path(trip_id): Path<String>) -> Json<Value> {
-    Json(json!({"trip_id": trip_id, "updates": [], "realtime_status": "unavailable", "mock": false}))
+    Json(
+        json!({"trip_id": trip_id, "updates": [], "realtime_status": "unavailable", "mock": false}),
+    )
 }
 
 async fn realtime_status() -> Json<Value> {
-    Json(json!({"status":"unavailable","sources":[],"mock_worker_available":true,"warning":"real realtime feeds are not connected yet"}))
+    Json(
+        json!({"status":"unavailable","sources":[],"mock_worker_available":true,"warning":"real realtime feeds are not connected yet"}),
+    )
 }
 
 async fn offline_packages() -> Json<Value> {
@@ -612,37 +879,60 @@ async fn offline_package_metadata(Path(id): Path<String>) -> Result<Json<Value>,
 }
 
 async fn offline_package_download(Path(id): Path<String>) -> Json<Value> {
-    Json(json!({"id": id, "status":"not_available", "warning":"offline package binary generation is pending"}))
+    Json(
+        json!({"id": id, "status":"not_available", "warning":"offline package binary generation is pending"}),
+    )
 }
 
 async fn offline_package_delta(Path(id): Path<String>) -> Json<Value> {
-    Json(json!({"id": id, "status":"not_available", "warning":"delta packages are planned for a later phase"}))
+    Json(
+        json!({"id": id, "status":"not_available", "warning":"delta packages are planned for a later phase"}),
+    )
 }
 
 async fn ticket_recommendation() -> Json<Value> {
-    Json(json!({"options": [mock_ticket()], "mock": true, "warning": "ticket purchase and payment are out of scope"}))
+    Json(
+        json!({"options": [mock_ticket()], "mock": true, "warning": "ticket purchase and payment are out of scope"}),
+    )
 }
 
 async fn ticket_quote() -> Json<Value> {
     Json(json!({"quote": mock_ticket(), "mock": true, "payment_enabled": false}))
 }
 
-async fn admin_imports(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_imports(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"imports": [], "warning": "database import run repository is pending"})))
+    Ok(Json(
+        json!({"imports": [], "warning": "database import run repository is pending"}),
+    ))
 }
 
-async fn admin_import(Path(id): Path<String>, headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_import(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(json!({"id": id, "status": "unknown"})))
 }
 
-async fn admin_import_latest(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_import_latest(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"latest": null, "warning": "run data is produced by data-pipeline summarize latest"})))
+    Ok(Json(
+        json!({"latest": null, "warning": "run data is produced by data-pipeline summarize latest"}),
+    ))
 }
 
-async fn admin_import_start(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_import_start(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(json!({
         "status": "accepted",
@@ -651,7 +941,28 @@ async fn admin_import_start(headers: HeaderMap, State(state): State<AppState>) -
     })))
 }
 
-async fn admin_data_quality(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_database_stats(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "database_available": false,
+            "mock": state.use_mock_data,
+            "warning": "database is not configured; set USE_MOCK_DATA=false and DATABASE_URL"
+        })));
+    };
+
+    Ok(Json(
+        database_admin_stats(pool).await.map_err(internal_error)?,
+    ))
+}
+
+async fn admin_data_quality(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(json!({
         "validation_issue_counts": {"warning": 0, "error": 0},
@@ -662,22 +973,37 @@ async fn admin_data_quality(headers: HeaderMap, State(state): State<AppState>) -
     })))
 }
 
-async fn admin_unmatched_stops(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_unmatched_stops(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(json!({"stops": []})))
 }
 
-async fn admin_manual_stop_match(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_manual_stop_match(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"status": "accepted", "warning": "manual match persistence is pending"})))
+    Ok(Json(
+        json!({"status": "accepted", "warning": "manual match persistence is pending"}),
+    ))
 }
 
-async fn admin_source_feeds(headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_source_feeds(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(sources().await)
 }
 
-async fn admin_source_feed_patch(Path(id): Path<String>, headers: HeaderMap, State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn admin_source_feed_patch(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(json!({"id": id, "status":"not_implemented"})))
 }
@@ -687,10 +1013,17 @@ async fn public_board(Path(stop_id): Path<String>) -> Json<Value> {
 }
 
 async fn public_board_qr(Path(stop_id): Path<String>) -> Json<Value> {
-    Json(json!({"stop_id": stop_id, "board_url": format!("https://cesta.local/public/boards/{stop_id}"), "theme": "default", "mock": true}))
+    Json(
+        json!({"stop_id": stop_id, "board_url": format!("https://cesta.local/public/boards/{stop_id}"), "theme": "default", "mock": true}),
+    )
 }
 
-fn create_user_record(email: &str, password: &str, display_name: Option<String>, roles: Vec<String>) -> anyhow::Result<UserRecord> {
+fn create_user_record(
+    email: &str,
+    password: &str,
+    display_name: Option<String>,
+    roles: Vec<String>,
+) -> anyhow::Result<UserRecord> {
     let salt = SaltString::generate(&mut OsRng);
     let password_hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -757,15 +1090,28 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<UserRecor
     .map_err(|_| unauthorized())?
     .claims;
     let id = Uuid::parse_str(&claims.sub).map_err(|_| unauthorized())?;
-    state.users.read().await.get(&id).cloned().ok_or_else(unauthorized)
+    state
+        .users
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(unauthorized)
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {
     let user = current_user(state, headers).await?;
-    if user.roles.iter().any(|role| role == "admin" || role == "data_admin") {
+    if user
+        .roles
+        .iter()
+        .any(|role| role == "admin" || role == "data_admin")
+    {
         Ok(user)
     } else {
-        Err(ApiError { code: "forbidden".to_string(), message: "Admin role is required".to_string() })
+        Err(ApiError {
+            code: "forbidden".to_string(),
+            message: "Admin role is required".to_string(),
+        })
     }
 }
 
@@ -785,15 +1131,24 @@ fn hash_token(value: &str) -> String {
 }
 
 fn unauthorized() -> ApiError {
-    ApiError { code: "unauthorized".to_string(), message: "Authentication required".to_string() }
+    ApiError {
+        code: "unauthorized".to_string(),
+        message: "Authentication required".to_string(),
+    }
 }
 
 fn not_found() -> ApiError {
-    ApiError { code: "not_found".to_string(), message: "Resource not found".to_string() }
+    ApiError {
+        code: "not_found".to_string(),
+        message: "Resource not found".to_string(),
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError { code: "internal_error".to_string(), message: error.to_string() }
+    ApiError {
+        code: "internal_error".to_string(),
+        message: error.to_string(),
+    }
 }
 
 fn package_by_id(id: &str) -> Result<OfflinePackage, ApiError> {
@@ -801,6 +1156,428 @@ fn package_by_id(id: &str) -> Result<OfflinePackage, ApiError> {
         .into_iter()
         .find(|package| package.id == id)
         .ok_or_else(not_found)
+}
+
+async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
+    let latest = sqlx::query(
+        r#"
+        SELECT id, source, status, started_at, finished_at, summary
+        FROM import_runs
+        WHERE status = 'success'
+        ORDER BY finished_at DESC NULLS LAST, started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let stop_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stops WHERE is_active = true")
+        .fetch_one(pool)
+        .await?;
+    let route_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE is_active = true")
+        .fetch_one(pool)
+        .await?;
+    let trip_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trips")
+        .fetch_one(pool)
+        .await?;
+    let stop_time_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stop_times")
+        .fetch_one(pool)
+        .await?;
+    let has_successful_import = latest.is_some();
+
+    Ok(json!({
+        "schedule": if has_successful_import { "current" } else { "unknown" },
+        "realtime": "unavailable",
+        "source": "database",
+        "database_available": true,
+        "latest_import": latest.map(|row| json!({
+            "id": row.get::<Uuid, _>("id"),
+            "source": row.get::<String, _>("source"),
+            "status": row.get::<String, _>("status"),
+            "started_at": row.get::<chrono::DateTime<Utc>, _>("started_at"),
+            "finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
+            "summary": row.get::<Value, _>("summary")
+        })),
+        "counts": {
+            "stops": stop_count,
+            "routes": route_count,
+            "trips": trip_count,
+            "stop_times": stop_time_count
+        },
+        "warnings": if has_successful_import { Vec::<String>::new() } else { vec!["no successful import has been loaded yet".to_string()] }
+    }))
+}
+
+async fn database_admin_stats(pool: &PgPool) -> Result<Value, sqlx::Error> {
+    let database_row = sqlx::query(
+        r#"
+        SELECT
+          current_database() AS database_name,
+          pg_database_size(current_database()) AS total_size_bytes,
+          pg_size_pretty(pg_database_size(current_database())) AS total_size_pretty
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let mut tables = Vec::new();
+    let mut total_rows = 0_i64;
+    for table in DB_STAT_TABLES {
+        let row_count = table_row_count(pool, table).await?;
+        total_rows += row_count;
+        let size = sqlx::query(
+            r#"
+            SELECT
+              pg_total_relation_size($1::regclass) AS total_size_bytes,
+              pg_relation_size($1::regclass) AS table_size_bytes,
+              pg_indexes_size($1::regclass) AS indexes_size_bytes,
+              pg_size_pretty(pg_total_relation_size($1::regclass)) AS total_size_pretty
+            "#,
+        )
+        .bind(*table)
+        .fetch_one(pool)
+        .await?;
+
+        tables.push(json!({
+            "table": table,
+            "rows": row_count,
+            "total_size_bytes": size.get::<i64, _>("total_size_bytes"),
+            "table_size_bytes": size.get::<i64, _>("table_size_bytes"),
+            "indexes_size_bytes": size.get::<i64, _>("indexes_size_bytes"),
+            "total_size_pretty": size.get::<String, _>("total_size_pretty")
+        }));
+    }
+
+    let source_rows = sqlx::query(
+        r#"
+        SELECT
+          sf.id,
+          sf.name,
+          sf.type,
+          sf.priority,
+          COALESCE(stop_counts.count, 0) AS stops,
+          COALESCE(route_counts.count, 0) AS routes,
+          COALESCE(trip_counts.count, 0) AS trips,
+          COALESCE(stop_time_counts.count, 0) AS stop_times,
+          COALESCE(issue_counts.count, 0) AS validation_issues
+        FROM source_feeds sf
+        LEFT JOIN (
+          SELECT source_feed_id, COUNT(*) AS count FROM stops GROUP BY source_feed_id
+        ) stop_counts ON stop_counts.source_feed_id = sf.id
+        LEFT JOIN (
+          SELECT source_feed_id, COUNT(*) AS count FROM routes GROUP BY source_feed_id
+        ) route_counts ON route_counts.source_feed_id = sf.id
+        LEFT JOIN (
+          SELECT source_feed_id, COUNT(*) AS count FROM trips GROUP BY source_feed_id
+        ) trip_counts ON trip_counts.source_feed_id = sf.id
+        LEFT JOIN (
+          SELECT source_feed_id, COUNT(*) AS count FROM stop_times GROUP BY source_feed_id
+        ) stop_time_counts ON stop_time_counts.source_feed_id = sf.id
+        LEFT JOIN (
+          SELECT source_feed_id, COUNT(*) AS count FROM validation_issues GROUP BY source_feed_id
+        ) issue_counts ON issue_counts.source_feed_id = sf.id
+        ORDER BY sf.priority, sf.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let source_feeds = source_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "type": row.get::<String, _>("type"),
+                "priority": row.get::<i32, _>("priority"),
+                "counts": {
+                    "stops": row.get::<i64, _>("stops"),
+                    "routes": row.get::<i64, _>("routes"),
+                    "trips": row.get::<i64, _>("trips"),
+                    "stop_times": row.get::<i64, _>("stop_times"),
+                    "validation_issues": row.get::<i64, _>("validation_issues")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let latest_import_rows = sqlx::query(
+        r#"
+        SELECT id, source, status, started_at, finished_at, summary
+        FROM import_runs
+        ORDER BY started_at DESC
+        LIMIT 10
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let latest_imports = latest_import_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<Uuid, _>("id"),
+                "source": row.get::<String, _>("source"),
+                "status": row.get::<String, _>("status"),
+                "started_at": row.get::<chrono::DateTime<Utc>, _>("started_at"),
+                "finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
+                "summary": row.get::<Value, _>("summary")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let issue_rows = sqlx::query(
+        "SELECT severity, COUNT(*) AS count FROM validation_issues GROUP BY severity ORDER BY severity",
+    )
+    .fetch_all(pool)
+    .await?;
+    let validation_issues = issue_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "severity": row.get::<String, _>("severity"),
+                "count": row.get::<i64, _>("count")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let unresolved_stop_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM stops
+        WHERE is_active = true
+          AND (lat IS NULL OR lon IS NULL OR coordinate_confidence = 'unresolved')
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(json!({
+        "database_available": true,
+        "database": {
+            "name": database_row.get::<String, _>("database_name"),
+            "total_size_bytes": database_row.get::<i64, _>("total_size_bytes"),
+            "total_size_pretty": database_row.get::<String, _>("total_size_pretty")
+        },
+        "totals": {
+            "tracked_rows": total_rows,
+            "unresolved_active_stops": unresolved_stop_count
+        },
+        "tables": tables,
+        "source_feeds": source_feeds,
+        "latest_imports": latest_imports,
+        "validation_issues": validation_issues
+    }))
+}
+
+async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(pool)
+        .await
+}
+
+async fn search_stops_db(pool: &PgPool, query: &str) -> Result<Vec<Stop>, sqlx::Error> {
+    let normalized = normalize_czech_name(query);
+    let like = format!("%{normalized}%");
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority, is_active
+        FROM stops
+        WHERE is_active = true
+          AND ($1 = '' OR normalized_name LIKE $2 OR name ILIKE $2)
+        ORDER BY
+          CASE WHEN normalized_name = $1 THEN 0 ELSE 1 END,
+          source_priority ASC,
+          name ASC
+        LIMIT 50
+        "#,
+    )
+    .bind(&normalized)
+    .bind(&like)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(stop_from_row).collect()
+}
+
+async fn nearby_stops_db(
+    pool: &PgPool,
+    lat: f64,
+    lon: f64,
+    radius: f64,
+) -> Result<Vec<Stop>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority, is_active
+        FROM stops
+        WHERE is_active = true
+          AND geom IS NOT NULL
+          AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)
+        ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+        LIMIT 50
+        "#,
+    )
+    .bind(lon)
+    .bind(lat)
+    .bind(radius)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(stop_from_row).collect()
+}
+
+async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority, is_active
+        FROM stops
+        WHERE id = $1 AND is_active = true
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(stop_from_row).transpose()
+}
+
+async fn departures_db(
+    pool: &PgPool,
+    stop_id: &str,
+    earliest_seconds: u32,
+    limit: usize,
+) -> Result<Vec<Value>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          st.trip_id,
+          st.departure_time,
+          st.arrival_time,
+          t.headsign,
+          r.id AS route_id,
+          r.short_name,
+          r.long_name,
+          r.mode
+        FROM stop_times st
+        JOIN trips t ON t.id = st.trip_id
+        JOIN routes r ON r.id = t.route_id
+        WHERE st.stop_id = $1
+          AND st.departure_time >= $2
+        ORDER BY st.departure_time ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(stop_id)
+    .bind(earliest_seconds as i32)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let departure_time = row.get::<i32, _>("departure_time") as u32;
+            json!({
+                "trip_id": row.get::<String, _>("trip_id"),
+                "route_id": row.get::<String, _>("route_id"),
+                "line": row.get::<Option<String>, _>("short_name")
+                    .or_else(|| row.get::<Option<String>, _>("long_name"))
+                    .unwrap_or_else(|| row.get::<String, _>("route_id")),
+                "destination": row.get::<Option<String>, _>("headsign"),
+                "mode": row.get::<String, _>("mode"),
+                "scheduled_departure": transit_model::seconds_to_time(departure_time),
+                "scheduled_arrival": transit_model::seconds_to_time(row.get::<i32, _>("arrival_time") as u32),
+                "realtime_departure": null,
+                "delay_seconds": null,
+                "status": "scheduled"
+            })
+        })
+        .collect())
+}
+
+fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
+    let lat = row.get::<Option<f64>, _>("lat");
+    let lon = row.get::<Option<f64>, _>("lon");
+    let source_feed_id = row
+        .get::<Option<String>, _>("source_feed_id")
+        .unwrap_or_else(|| "database".to_string());
+    let source_priority = row.get::<i32, _>("source_priority");
+    let id = row.get::<String, _>("id");
+    Ok(Stop {
+        id: id.clone(),
+        source_ids: vec![transit_model::SourceRef {
+            feed_id: source_feed_id.clone(),
+            original_id: id,
+            import_run_id: None,
+            priority: source_priority,
+            confidence: None,
+            suppressed_as_duplicate: false,
+        }],
+        name: row.get("name"),
+        normalized_name: row.get("normalized_name"),
+        municipality: row.get("municipality"),
+        district: row.get("district"),
+        region: row.get("region"),
+        lat,
+        lon,
+        geom: lat
+            .zip(lon)
+            .map(|(lat, lon)| geo_types::Point::new(lon, lat)),
+        coordinate_confidence: db_confidence_to_model(
+            &row.get::<String, _>("coordinate_confidence"),
+        ),
+        coordinate_source: row.get("coordinate_source"),
+        stop_area_id: row.get("stop_area_id"),
+        platform_code: row.get("platform_code"),
+        modes: row
+            .get::<Vec<String>, _>("modes")
+            .into_iter()
+            .map(|mode| db_mode_to_model(&mode))
+            .collect(),
+        is_active: row.get("is_active"),
+    })
+}
+
+fn database_data_status() -> Value {
+    json!({
+        "source": "database",
+        "schedule": "current",
+        "realtime": "unavailable",
+        "warnings": Vec::<String>::new()
+    })
+}
+
+fn db_mode_to_model(mode: &str) -> TransportMode {
+    match mode {
+        "train" => TransportMode::Train,
+        "tram" => TransportMode::Tram,
+        "bus" => TransportMode::Bus,
+        "metro" => TransportMode::Metro,
+        "trolleybus" => TransportMode::Trolleybus,
+        "ferry" => TransportMode::Ferry,
+        "cable_car" => TransportMode::CableCar,
+        _ => TransportMode::Unknown,
+    }
+}
+
+fn db_confidence_to_model(confidence: &str) -> CoordinateConfidence {
+    match confidence {
+        "exact" => CoordinateConfidence::Exact,
+        "high" => CoordinateConfidence::High,
+        "medium" => CoordinateConfidence::Medium,
+        "low" => CoordinateConfidence::Low,
+        _ => CoordinateConfidence::Unresolved,
+    }
+}
+
+fn parse_query_time_seconds(value: &str) -> Option<u32> {
+    if let Some(time) = value.rsplit('T').next().and_then(|part| part.get(..8)) {
+        return transit_model::parse_gtfs_time(time);
+    }
+    transit_model::parse_gtfs_time(value)
 }
 
 fn mock_status(use_mock_data: bool) -> Value {
@@ -814,9 +1591,27 @@ fn mock_status(use_mock_data: bool) -> Value {
 
 fn fixture_stops() -> Vec<Stop> {
     vec![
-        fixture_stop("stop-praha-hl-n", "Praha hlavni nadrazi", 50.083, 14.435, TransportMode::Train),
-        fixture_stop("stop-brno-hl-n", "Brno hlavni nadrazi", 49.191, 16.612, TransportMode::Train),
-        fixture_stop("stop-jihlava", "Jihlava autobusove nadrazi", 49.396, 15.591, TransportMode::Bus),
+        fixture_stop(
+            "stop-praha-hl-n",
+            "Praha hlavni nadrazi",
+            50.083,
+            14.435,
+            TransportMode::Train,
+        ),
+        fixture_stop(
+            "stop-brno-hl-n",
+            "Brno hlavni nadrazi",
+            49.191,
+            16.612,
+            TransportMode::Train,
+        ),
+        fixture_stop(
+            "stop-jihlava",
+            "Jihlava autobusove nadrazi",
+            49.396,
+            15.591,
+            TransportMode::Bus,
+        ),
     ]
 }
 
@@ -884,8 +1679,7 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let d_lon = (lon2 - lon1).to_radians();
     let lat1 = lat1.to_radians();
     let lat2 = lat2.to_radians();
-    let a = (d_lat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (d_lon / 2.0).sin().powi(2);
+    let a = (d_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (d_lon / 2.0).sin().powi(2);
     2.0 * earth_radius_m * a.sqrt().asin()
 }
 
@@ -900,7 +1694,12 @@ mod tests {
     async fn health_endpoint() {
         let app = build_router(app_state().await.unwrap());
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -910,10 +1709,14 @@ mod tests {
     async fn protected_endpoint_blocked_without_token() {
         let app = build_router(app_state().await.unwrap());
         let response = app
-            .oneshot(Request::builder().uri("/auth/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
-

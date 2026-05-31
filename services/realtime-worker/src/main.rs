@@ -1,4 +1,5 @@
 use chrono::{Duration, Utc};
+use tokio::time;
 use transit_model::{RealtimeConfidence, RealtimeUpdate};
 
 #[tokio::main]
@@ -6,6 +7,17 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    tracing::info!("starting mock realtime worker");
+    let mut interval = time::interval(std::time::Duration::from_secs(60));
+
+    loop {
+        interval.tick().await;
+        emit_mock_update();
+    }
+}
+
+fn emit_mock_update() {
     let update = RealtimeUpdate {
         id: "mock-update-1".to_string(),
         trip_id: Some("trip-rail-1".to_string()),
@@ -24,4 +36,3 @@ async fn main() {
     };
     tracing::info!(mock = true, update = %serde_json::to_string(&update).unwrap(), "realtime worker emitted mock update");
 }
-
