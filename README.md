@@ -50,7 +50,7 @@ On Windows, native `cargo run` requires Visual Studio Build Tools with the C++ w
 docker compose up --build
 ```
 
-The API listens on `http://localhost:8080` by default.
+The API listens on `http://localhost:8070` by default.
 
 ## First Admin
 
@@ -66,17 +66,17 @@ The current bootstrap path is documented and represented in migrations; producti
 Admin database stats are available after logging in:
 
 ```powershell
-$login = Invoke-RestMethod -Method Post http://localhost:8080/auth/login -ContentType "application/json" -Body '{"email":"admin@example.com","password":"change-me-locally"}'
-Invoke-RestMethod http://localhost:8080/admin/database/stats -Headers @{ Authorization = "Bearer $($login.access_token)" }
+$login = Invoke-RestMethod -Method Post http://localhost:8070/auth/login -ContentType "application/json" -Body '{"email":"admin@example.com","password":"change-me-locally"}'
+Invoke-RestMethod http://localhost:8070/admin/database/stats -Headers @{ Authorization = "Bearer $($login.access_token)" }
 ```
 
 ## Example Calls
 
 ```powershell
-Invoke-RestMethod http://localhost:8080/health
-$stops = Invoke-RestMethod "http://localhost:8080/stops/search?q=a"
-Invoke-RestMethod ("http://localhost:8080/departures?stopId=" + [uri]::EscapeDataString($stops.stops[0].id) + "&limit=5")
-Invoke-RestMethod -Method Post http://localhost:8080/journeys/search -ContentType "application/json" -Body '{"from":{"type":"stop","id":"stop-praha-hl-n"},"to":{"type":"stop","id":"stop-brno-hl-n"},"datetime":"2026-07-06T21:05:00+02:00","mode":"depart_at","transport_modes":["train"],"max_transfers":4,"walking_speed":"normal","prefer_reliable_transfers":true,"offline_compatible":false}'
+Invoke-RestMethod http://localhost:8070/health
+$stops = Invoke-RestMethod "http://localhost:8070/stops/search?q=a"
+Invoke-RestMethod ("http://localhost:8070/departures?stopId=" + [uri]::EscapeDataString($stops.stops[0].id) + "&limit=5")
+Invoke-RestMethod -Method Post http://localhost:8070/journeys/search -ContentType "application/json" -Body '{"from":{"type":"stop","id":"stop-praha-hl-n"},"to":{"type":"stop","id":"stop-brno-hl-n"},"datetime":"2026-07-06T21:05:00+02:00","mode":"depart_at","transport_modes":["train"],"max_transfers":4,"walking_speed":"normal","prefer_reliable_transfers":true,"offline_compatible":false}'
 ```
 
 ## GGU Latest Import

@@ -215,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
     let port = env::var("API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(8080);
+        .unwrap_or(8070);
     let app = app_state().await?;
     let router = build_router(app);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

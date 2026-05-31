@@ -30,12 +30,12 @@ services:
       REFRESH_TOKEN_SECRET: dev-only-change-me-too
       STORAGE_DIR: /app/storage
       USE_MOCK_DATA: "false"
-      API_PORT: 8080
+      API_PORT: 8070
       ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-}
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       RUST_LOG: info
     ports:
-      - "8080:8080"
+      - "8070:8070"
     volumes:
       - ./storage:/app/storage
 
