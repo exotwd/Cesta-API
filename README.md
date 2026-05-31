@@ -44,6 +44,12 @@ cargo run -p data-pipeline -- summarize latest
 cargo run -p realtime-worker
 ```
 
+On Windows, native `cargo run` requires Visual Studio Build Tools with the C++ workload because the default Rust toolchain uses MSVC `link.exe`. If that is not installed, use Docker Compose:
+
+```powershell
+docker compose up --build
+```
+
 The API listens on `http://localhost:8080` by default.
 
 ## First Admin
@@ -92,4 +98,3 @@ GET /openapi.json
 - Add official PID/GTFS-RT realtime integrations.
 - Implement geodata reconciliation and manual match workflows.
 - Add production bootstrap/admin management commands.
-
