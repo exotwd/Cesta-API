@@ -1,0 +1,445 @@
+use std::{
+    fs::File,
+    io::{Read, Seek},
+    path::Path,
+};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use transit_model::{Agency, Route, Stop, StopTime, TransportMode, normalize_czech_name, parse_gtfs_time};
+use zip::ZipArchive;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportOptions {
+    pub source_feed_id: String,
+    pub source_priority: i32,
+    pub limit_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GtfsDataset {
+    pub agencies: Vec<Agency>,
+    pub stops: Vec<Stop>,
+    pub routes: Vec<Route>,
+    pub trips: Vec<GtfsTrip>,
+    pub stop_times: Vec<StopTime>,
+    pub validation_issues: Vec<ValidationIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GtfsTrip {
+    pub route_id: String,
+    pub service_id: String,
+    pub trip_id: String,
+    pub trip_headsign: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub severity: ValidationSeverity,
+    pub code: String,
+    pub message: String,
+    pub source_file: Option<String>,
+    pub affected_entity: Option<String>,
+    pub raw_payload: Option<serde_json::Value>,
+}
+
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
+    let mut file = File::open(path.as_ref())
+        .with_context(|| format!("failed to open {}", path.as_ref().display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn parse_gtfs_zip(path: impl AsRef<Path>, options: ImportOptions) -> Result<GtfsDataset> {
+    let file = File::open(path.as_ref())
+        .with_context(|| format!("failed to open GTFS zip {}", path.as_ref().display()))?;
+    let mut archive = ZipArchive::new(file)?;
+    parse_archive(&mut archive, options)
+}
+
+fn parse_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    options: ImportOptions,
+) -> Result<GtfsDataset> {
+    let mut dataset = GtfsDataset::default();
+    let names = archive.file_names().map(str::to_string).collect::<Vec<_>>();
+
+    for required in ["agency.txt", "stops.txt", "routes.txt", "trips.txt", "stop_times.txt"] {
+        if !names.iter().any(|name| name == required) {
+            dataset.validation_issues.push(ValidationIssue {
+                severity: ValidationSeverity::Error,
+                code: "missing_required_file".to_string(),
+                message: format!("Required GTFS file {required} is missing"),
+                source_file: Some(required.to_string()),
+                affected_entity: None,
+                raw_payload: None,
+            });
+        }
+    }
+
+    if names.iter().any(|name| name == "agency.txt") {
+        dataset.agencies = parse_agencies(archive, options.limit_rows)?;
+    }
+    if names.iter().any(|name| name == "stops.txt") {
+        dataset.stops = parse_stops(archive, &options, options.limit_rows, &mut dataset.validation_issues)?;
+    }
+    if names.iter().any(|name| name == "routes.txt") {
+        dataset.routes = parse_routes(archive, &options, options.limit_rows)?;
+    }
+    if names.iter().any(|name| name == "trips.txt") {
+        dataset.trips = parse_trips(archive, options.limit_rows)?;
+    }
+    if names.iter().any(|name| name == "stop_times.txt") {
+        dataset.stop_times = parse_stop_times(archive, options.limit_rows, &mut dataset.validation_issues)?;
+    }
+
+    Ok(dataset)
+}
+
+fn csv_reader<R: Read>(reader: R) -> csv::Reader<R> {
+    csv::ReaderBuilder::new().flexible(true).from_reader(reader)
+}
+
+#[derive(Debug, Deserialize)]
+struct AgencyRow {
+    agency_id: Option<String>,
+    agency_name: String,
+    agency_url: Option<String>,
+    agency_timezone: Option<String>,
+}
+
+fn parse_agencies<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+) -> Result<Vec<Agency>> {
+    let file = archive.by_name("agency.txt")?;
+    csv_reader(file)
+        .deserialize::<AgencyRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| {
+            let row = row?;
+            Ok(Agency {
+                id: row.agency_id.clone().unwrap_or_else(|| row.agency_name.clone()),
+                source_id: row.agency_id.unwrap_or_else(|| row.agency_name.clone()),
+                name: row.agency_name,
+                url: row.agency_url,
+                timezone: row.agency_timezone,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct StopRow {
+    stop_id: String,
+    stop_name: String,
+    stop_lat: Option<f64>,
+    stop_lon: Option<f64>,
+    platform_code: Option<String>,
+}
+
+fn parse_stops<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    options: &ImportOptions,
+    limit: Option<usize>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Vec<Stop>> {
+    let file = archive.by_name("stops.txt")?;
+    csv_reader(file)
+        .deserialize::<StopRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .filter_map(|row| match row {
+            Ok(row) => {
+                if row.stop_lat.is_none() || row.stop_lon.is_none() {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        code: "stop_without_coordinates".to_string(),
+                        message: "Stop has no usable coordinates".to_string(),
+                        source_file: Some("stops.txt".to_string()),
+                        affected_entity: Some(row.stop_id.clone()),
+                        raw_payload: None,
+                    });
+                }
+                Some(Ok(Stop {
+                    id: row.stop_id.clone(),
+                    source_ids: vec![transit_model::SourceRef {
+                        feed_id: options.source_feed_id.clone(),
+                        original_id: row.stop_id,
+                        import_run_id: None,
+                        priority: options.source_priority,
+                        confidence: None,
+                        suppressed_as_duplicate: false,
+                    }],
+                    name: row.stop_name.clone(),
+                    normalized_name: normalize_czech_name(&row.stop_name),
+                    municipality: None,
+                    district: None,
+                    region: None,
+                    lat: row.stop_lat,
+                    lon: row.stop_lon,
+                    geom: row.stop_lat.zip(row.stop_lon).map(|(lat, lon)| geo_types::Point::new(lon, lat)),
+                    coordinate_confidence: if row.stop_lat.is_some() && row.stop_lon.is_some() {
+                        transit_model::CoordinateConfidence::Exact
+                    } else {
+                        transit_model::CoordinateConfidence::Unresolved
+                    },
+                    coordinate_source: Some(options.source_feed_id.clone()),
+                    stop_area_id: None,
+                    platform_code: row.platform_code,
+                    modes: Vec::new(),
+                    is_active: true,
+                }))
+            }
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteRow {
+    route_id: String,
+    agency_id: Option<String>,
+    route_short_name: Option<String>,
+    route_long_name: Option<String>,
+    route_type: Option<i32>,
+    route_color: Option<String>,
+    route_text_color: Option<String>,
+}
+
+fn parse_routes<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    options: &ImportOptions,
+    limit: Option<usize>,
+) -> Result<Vec<Route>> {
+    let file = archive.by_name("routes.txt")?;
+    csv_reader(file)
+        .deserialize::<RouteRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| {
+            let row = row?;
+            Ok(Route {
+                id: row.route_id.clone(),
+                source_id: row.route_id,
+                agency_id: row.agency_id,
+                operator_id: None,
+                short_name: row.route_short_name,
+                long_name: row.route_long_name,
+                mode: map_gtfs_route_type(row.route_type),
+                gtfs_route_type: row.route_type,
+                color: row.route_color,
+                text_color: row.route_text_color,
+                source_priority: options.source_priority,
+                is_active: true,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct TripRow {
+    route_id: String,
+    service_id: String,
+    trip_id: String,
+    trip_headsign: Option<String>,
+}
+
+fn parse_trips<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+) -> Result<Vec<GtfsTrip>> {
+    let file = archive.by_name("trips.txt")?;
+    csv_reader(file)
+        .deserialize::<TripRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| {
+            let row = row?;
+            Ok(GtfsTrip {
+                route_id: row.route_id,
+                service_id: row.service_id,
+                trip_id: row.trip_id,
+                trip_headsign: row.trip_headsign,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct StopTimeRow {
+    trip_id: String,
+    arrival_time: String,
+    departure_time: String,
+    stop_id: String,
+    stop_sequence: u32,
+    pickup_type: Option<i16>,
+    drop_off_type: Option<i16>,
+    timepoint: Option<i16>,
+}
+
+fn parse_stop_times<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Vec<StopTime>> {
+    let file = archive.by_name("stop_times.txt")?;
+    let mut stop_times = Vec::new();
+    for row in csv_reader(file)
+        .deserialize::<StopTimeRow>()
+        .take(limit.unwrap_or(usize::MAX))
+    {
+        match row {
+            Ok(row) => {
+                let arrival_time = parse_gtfs_time(&row.arrival_time);
+                let departure_time = parse_gtfs_time(&row.departure_time);
+                match (arrival_time, departure_time) {
+                    (Some(arrival_time), Some(departure_time)) => stop_times.push(StopTime {
+                        trip_id: row.trip_id,
+                        stop_id: row.stop_id,
+                        stop_sequence: row.stop_sequence,
+                        arrival_time,
+                        departure_time,
+                        pickup_type: row.pickup_type,
+                        drop_off_type: row.drop_off_type,
+                        timepoint: row.timepoint.map(|value| value == 1),
+                        platform: None,
+                        raw_notes: None,
+                    }),
+                    _ => issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        code: "malformed_stop_time".to_string(),
+                        message: "Stop time has invalid arrival or departure time".to_string(),
+                        source_file: Some("stop_times.txt".to_string()),
+                        affected_entity: Some(row.trip_id),
+                        raw_payload: None,
+                    }),
+                }
+            }
+            Err(error) => issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                code: "malformed_row".to_string(),
+                message: error.to_string(),
+                source_file: Some("stop_times.txt".to_string()),
+                affected_entity: None,
+                raw_payload: None,
+            }),
+        }
+    }
+    Ok(stop_times)
+}
+
+pub fn map_gtfs_route_type(route_type: Option<i32>) -> TransportMode {
+    match route_type {
+        Some(0) => TransportMode::Tram,
+        Some(1) => TransportMode::Metro,
+        Some(2) => TransportMode::Train,
+        Some(3) => TransportMode::Bus,
+        Some(4) => TransportMode::Ferry,
+        Some(5) => TransportMode::CableCar,
+        Some(11) => TransportMode::Trolleybus,
+        _ => TransportMode::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::NamedTempFile;
+    use zip::write::SimpleFileOptions;
+
+    use super::*;
+
+    #[test]
+    fn parses_small_fixture() {
+        let mut file = NamedTempFile::new().unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(&mut file);
+            let options = SimpleFileOptions::default();
+            zip.start_file("agency.txt", options).unwrap();
+            zip.write_all(b"agency_id,agency_name,agency_url,agency_timezone\npid,PID,https://pid.cz,Europe/Prague\n").unwrap();
+            zip.start_file("stops.txt", options).unwrap();
+            zip.write_all(b"stop_id,stop_name,stop_lat,stop_lon\ns1,Praha hl.n.,50.083,14.435\ns2,Brno hl.n.,49.191,16.612\n").unwrap();
+            zip.start_file("routes.txt", options).unwrap();
+            zip.write_all(b"route_id,agency_id,route_short_name,route_long_name,route_type\nr1,pid,R9,Praha - Brno,2\n").unwrap();
+            zip.start_file("trips.txt", options).unwrap();
+            zip.write_all(b"route_id,service_id,trip_id,trip_headsign\nr1,wd,t1,Brno\n").unwrap();
+            zip.start_file("stop_times.txt", options).unwrap();
+            zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,10:35:00,10:35:00,s2,2\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dataset = parse_gtfs_zip(
+            file.path(),
+            ImportOptions {
+                source_feed_id: "fixture".to_string(),
+                source_priority: 10,
+                limit_rows: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dataset.agencies.len(), 1);
+        assert_eq!(dataset.stops.len(), 2);
+        assert_eq!(dataset.routes[0].mode, TransportMode::Train);
+        assert_eq!(dataset.stop_times.len(), 2);
+    }
+
+    #[test]
+    fn reports_missing_optional_coordinates() {
+        let mut file = NamedTempFile::new().unwrap();
+        {
+            let mut zip = zip::ZipWriter::new(&mut file);
+            let options = SimpleFileOptions::default();
+            zip.start_file("agency.txt", options).unwrap();
+            zip.write_all(b"agency_name\nAgency\n").unwrap();
+            zip.start_file("stops.txt", options).unwrap();
+            zip.write_all(b"stop_id,stop_name\ns1,Stop\n").unwrap();
+            zip.start_file("routes.txt", options).unwrap();
+            zip.write_all(b"route_id,route_type\nr1,3\n").unwrap();
+            zip.start_file("trips.txt", options).unwrap();
+            zip.write_all(b"route_id,service_id,trip_id\nr1,wd,t1\n").unwrap();
+            zip.start_file("stop_times.txt", options).unwrap();
+            zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,bad,08:00:00,s1,1\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dataset = parse_gtfs_zip(
+            file.path(),
+            ImportOptions {
+                source_feed_id: "fixture".to_string(),
+                source_priority: 10,
+                limit_rows: None,
+            },
+        )
+        .unwrap();
+
+        assert!(dataset.validation_issues.iter().any(|issue| issue.code == "stop_without_coordinates"));
+        assert!(dataset.validation_issues.iter().any(|issue| issue.code == "malformed_stop_time"));
+    }
+
+    #[test]
+    fn checksum_generation() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"cesta").unwrap();
+        let checksum = sha256_file(file.path()).unwrap();
+        assert_eq!(checksum.len(), 64);
+    }
+}
+

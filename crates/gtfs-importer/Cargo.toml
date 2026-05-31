@@ -1,0 +1,18 @@
+[package]
+name = "gtfs-importer"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+csv.workspace = true
+geo-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+transit-model = { path = "../transit-model" }
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
