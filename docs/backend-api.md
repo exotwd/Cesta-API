@@ -5,7 +5,7 @@ The API exposes:
 - `GET /health`
 - auth endpoints under `/auth`
 - user data endpoints under `/me`
-- stops under `/stops`
+- stops under `/stops`, including ranked stop suggestions at `GET /stops/search?q=...&limit=10`
 - departures under `/departures`
 - journey search at `POST /journeys/search`
 - realtime status under `/realtime`
@@ -15,4 +15,3 @@ The API exposes:
 - public board data under `/public/boards`
 
 Every schedule/realtime response should include data-status metadata and warnings where data is mock, stale, unavailable or partial.
-

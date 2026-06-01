@@ -151,6 +151,7 @@ struct FavoriteStop {
 #[derive(Debug, Deserialize)]
 struct StopSearchQuery {
     q: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,7 +301,14 @@ async fn openapi() -> Json<Value> {
             "/health": {"get": {"summary": "Health check"}},
             "/auth/register": {"post": {"summary": "Register user"}},
             "/auth/login": {"post": {"summary": "Login user"}},
-            "/stops/search": {"get": {"summary": "Search stops"}},
+            "/stops/search": {"get": {
+                "summary": "Search stops",
+                "description": "Returns closest ranked stop suggestions using normalized, abbreviation and typo-tolerant matching.",
+                "parameters": [
+                    {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}},
+                    {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}
+                ]
+            }},
             "/departures": {"get": {"summary": "Stop departures"}},
             "/journeys/search": {"post": {"summary": "Search journeys"}},
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
@@ -511,12 +519,28 @@ async fn notification_preferences() -> Json<Value> {
 
 async fn search_stops(State(state): State<AppState>, Query(query): Query<StopSearchQuery>) -> Json<Value> {
     let q = query.q.unwrap_or_default();
-    let normalized = normalize_czech_name(&q);
-    let stops = state
+    let normalized = normalize_search_text(&q);
+    let limit = query.limit.unwrap_or(10).clamp(1, 50);
+    let mut scored_stops = state
         .stops
         .iter()
-        .filter(|stop| normalized.is_empty() || stop.normalized_name.contains(&normalized))
-        .cloned()
+        .enumerate()
+        .filter_map(|(index, stop)| {
+            stop_search_score(stop, &normalized).map(|score| (score, index, stop.clone()))
+        })
+        .collect::<Vec<_>>();
+    scored_stops.sort_by(
+        |(left_score, left_index, left_stop), (right_score, right_index, right_stop)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_stop.name.cmp(&right_stop.name))
+                .then_with(|| left_index.cmp(right_index))
+        },
+    );
+    let stops = scored_stops
+        .into_iter()
+        .map(|(_, _, stop)| stop)
+        .take(limit)
         .collect::<Vec<_>>();
     Json(json!({"stops": stops, "data_status": mock_status(state.use_mock_data)}))
 }
@@ -812,6 +836,226 @@ fn mock_status(use_mock_data: bool) -> Value {
     })
 }
 
+fn stop_search_score(stop: &Stop, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(if stop.is_active { 10 } else { 0 });
+    }
+
+    let name = normalize_search_text(&stop.name);
+    let normalized_name = normalize_search_text(&stop.normalized_name);
+    let searchable_text = searchable_stop_text(stop);
+    let name_tokens = name.split_whitespace().collect::<Vec<_>>();
+    let query_tokens = query.split_whitespace().collect::<Vec<_>>();
+    let mut score = None;
+
+    if name == query || normalized_name == query {
+        score = Some(10_000);
+    } else if name.starts_with(query) || normalized_name.starts_with(query) {
+        score = Some(9_000 - (name.len() as i32 - query.len() as i32).abs());
+    } else if let Some(position) = searchable_text.find(query) {
+        score = Some(8_000 - position as i32);
+    }
+
+    if tokens_match_in_order_by_prefix(&query_tokens, &name_tokens) {
+        score = score.max(Some(
+            7_500
+                + query_tokens
+                    .iter()
+                    .map(|token| token.len() as i32)
+                    .sum::<i32>(),
+        ));
+    } else if tokens_match_unordered_by_prefix(&query_tokens, &name_tokens) {
+        score = score.max(Some(
+            7_000
+                + query_tokens
+                    .iter()
+                    .map(|token| token.len() as i32)
+                    .sum::<i32>(),
+        ));
+    }
+
+    if let Some(fuzzy_score) = fuzzy_token_score(&query_tokens, &name_tokens) {
+        score = score.max(Some(fuzzy_score));
+    }
+
+    if query.chars().count() >= 3 {
+        let initials = stop_name_initials(&name_tokens);
+        if initials.starts_with(query) {
+            score = score.max(Some(6_900 + query.len() as i32));
+        }
+
+        let distance = levenshtein(query, &name);
+        let max_len = query.chars().count().max(name.chars().count());
+        let ratio = 1.0 - (distance as f64 / max_len as f64);
+        if ratio >= 0.62 || distance <= typo_distance_threshold(query.chars().count()) {
+            score = score.max(Some(6_000 + (ratio * 500.0) as i32 - distance as i32));
+        }
+    }
+
+    score.map(|value| value + if stop.is_active { 10 } else { 0 })
+}
+
+fn searchable_stop_text(stop: &Stop) -> String {
+    [
+        Some(stop.name.as_str()),
+        Some(stop.normalized_name.as_str()),
+        stop.municipality.as_deref(),
+        stop.district.as_deref(),
+        stop.region.as_deref(),
+        stop.platform_code.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_search_text)
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn normalize_search_text(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = true;
+
+    for character in value.trim().to_lowercase().chars() {
+        if let Some(folded) = fold_czech_character(character) {
+            normalized.push(folded);
+            previous_was_space = false;
+        } else if character.is_ascii_alphanumeric() {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    if normalized.ends_with(' ') {
+        normalized.pop();
+    }
+
+    normalized
+}
+
+fn fold_czech_character(character: char) -> Option<char> {
+    match character {
+        '\u{00e1}' | '\u{00e0}' | '\u{00e2}' | '\u{00e4}' => Some('a'),
+        '\u{010d}' => Some('c'),
+        '\u{010f}' => Some('d'),
+        '\u{00e9}' | '\u{011b}' | '\u{00e8}' | '\u{00ea}' | '\u{00eb}' => {
+            Some('e')
+        }
+        '\u{00ed}' | '\u{00ec}' | '\u{00ee}' | '\u{00ef}' => Some('i'),
+        '\u{0148}' => Some('n'),
+        '\u{00f3}' | '\u{00f2}' | '\u{00f4}' | '\u{00f6}' => Some('o'),
+        '\u{0159}' => Some('r'),
+        '\u{0161}' => Some('s'),
+        '\u{0165}' => Some('t'),
+        '\u{00fa}' | '\u{016f}' | '\u{00f9}' | '\u{00fb}' | '\u{00fc}' => {
+            Some('u')
+        }
+        '\u{00fd}' | '\u{00ff}' => Some('y'),
+        '\u{017e}' => Some('z'),
+        _ => None,
+    }
+}
+
+fn tokens_match_in_order_by_prefix(query_tokens: &[&str], name_tokens: &[&str]) -> bool {
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    let mut search_from = 0;
+    for query_token in query_tokens {
+        let Some(position) = name_tokens[search_from..]
+            .iter()
+            .position(|name_token| name_token.starts_with(query_token))
+        else {
+            return false;
+        };
+        search_from += position + 1;
+    }
+    true
+}
+
+fn tokens_match_unordered_by_prefix(query_tokens: &[&str], name_tokens: &[&str]) -> bool {
+    !query_tokens.is_empty()
+        && query_tokens.iter().all(|query_token| {
+            name_tokens
+                .iter()
+                .any(|name_token| name_token.starts_with(query_token))
+        })
+}
+
+fn fuzzy_token_score(query_tokens: &[&str], name_tokens: &[&str]) -> Option<i32> {
+    if query_tokens.is_empty() || name_tokens.is_empty() {
+        return None;
+    }
+
+    let mut search_from = 0;
+    let mut distance_total = 0;
+    let mut matched_characters = 0;
+
+    for query_token in query_tokens {
+        let threshold = typo_distance_threshold(query_token.chars().count());
+        let mut best_match = None;
+
+        for (offset, name_token) in name_tokens[search_from..].iter().enumerate() {
+            let distance = levenshtein(query_token, name_token);
+            if distance <= threshold {
+                best_match = match best_match {
+                    Some((best_offset, best_distance)) if best_distance <= distance => {
+                        Some((best_offset, best_distance))
+                    }
+                    _ => Some((offset, distance)),
+                };
+            }
+        }
+
+        let (offset, distance) = best_match?;
+        search_from += offset + 1;
+        distance_total += distance as i32;
+        matched_characters += query_token.chars().count() as i32;
+    }
+
+    Some(6_500 + matched_characters * 10 - distance_total * 35)
+}
+
+fn typo_distance_threshold(length: usize) -> usize {
+    match length {
+        0..=2 => 0,
+        3..=5 => 1,
+        6..=9 => 2,
+        _ => 3,
+    }
+}
+
+fn stop_name_initials(tokens: &[&str]) -> String {
+    tokens
+        .iter()
+        .filter_map(|token| token.chars().next())
+        .collect()
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let right_len = right.chars().count();
+    let mut costs = (0..=right_len).collect::<Vec<_>>();
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut previous_diagonal = left_index;
+        costs[0] = left_index + 1;
+
+        for (right_index, right_char) in right.chars().enumerate() {
+            let insertion = costs[right_index + 1] + 1;
+            let deletion = costs[right_index] + 1;
+            let substitution = previous_diagonal + usize::from(left_char != right_char);
+            previous_diagonal = costs[right_index + 1];
+            costs[right_index + 1] = insertion.min(deletion).min(substitution);
+        }
+    }
+
+    costs[right_len]
+}
+
 fn fixture_stops() -> Vec<Stop> {
     vec![
         fixture_stop("stop-praha-hl-n", "Praha hlavni nadrazi", 50.083, 14.435, TransportMode::Train),
@@ -891,7 +1135,10 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use tower::ServiceExt;
 
     use super::*;
@@ -915,5 +1162,42 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-}
 
+    #[tokio::test]
+    async fn stop_search_ranks_closest_typo_match_first() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=Praha%20hlavny%20nadrazy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["stops"][0]["id"], "stop-praha-hl-n");
+    }
+
+    #[tokio::test]
+    async fn stop_search_supports_abbreviated_tokens() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=brno%20hl%20n")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["stops"][0]["id"], "stop-brno-hl-n");
+    }
+}
