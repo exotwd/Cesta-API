@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
 use serde::{Deserialize, Serialize};
@@ -821,9 +821,9 @@ async fn board_qr(Path(stop_id): Path<String>) -> Json<Value> {
 async fn journey_search(
     State(state): State<AppState>,
     Json(body): Json<JourneySearchBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
+    let departure_time = parse_journey_departure_seconds(&body.datetime)?;
     let _request_metadata = (
-        &body.datetime,
         &body.mode,
         &body.walking_speed,
         body.prefer_reliable_transfers,
@@ -840,12 +840,12 @@ async fn journey_search(
         RoutingSearchRequest {
             from_stop_id,
             to_stop_id,
-            departure_time: 7 * 3600,
+            departure_time,
             max_transfers: body.max_transfers,
             modes: body.transport_modes,
         },
     );
-    Json(json!({
+    Ok(Json(json!({
         "journeys": journeys,
         "data_status": {
             "schedule": if state.use_mock_data { "mock" } else { "current" },
@@ -854,7 +854,35 @@ async fn journey_search(
             "valid_until": "2026-12-31"
         },
         "warnings": if state.use_mock_data { vec!["routing uses fixture snapshot until imported snapshots are wired"] } else { Vec::<&str>::new() }
-    }))
+    })))
+}
+
+fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S") {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveTime::parse_from_str(datetime, "%H:%M:%S") {
+        return Ok(seconds_since_midnight(value));
+    }
+
+    Err(ApiError {
+        code: "invalid_datetime".to_string(),
+        message: "datetime must be RFC3339, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, or HH:MM:SS"
+            .to_string(),
+    })
+}
+
+fn seconds_since_midnight(time: NaiveTime) -> u32 {
+    time.num_seconds_from_midnight()
 }
 
 async fn realtime_trip(Path(trip_id): Path<String>) -> Json<Value> {
