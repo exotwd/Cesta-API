@@ -1,0 +1,9 @@
+target/
+.git/
+.env
+storage/raw/**
+storage/processed/**
+storage/reports/**
+!storage/raw/.gitkeep
+!storage/processed/.gitkeep
+!storage/reports/.gitkeep

@@ -120,12 +120,18 @@ pub fn earliest_arrivals(snapshot: &RoutingSnapshot, request: SearchRequest) -> 
 
     let warnings = best.legs.iter().flat_map(|leg| leg.warnings.iter()).count() as f32;
 
+    let departure_time = best
+        .legs
+        .first()
+        .map(|leg| leg.departure_time)
+        .unwrap_or(request.departure_time);
+
     vec![Journey {
         id: "journey-1".to_string(),
         legs: best.legs.clone(),
-        departure_time: request.departure_time,
+        departure_time,
         arrival_time: best.arrival_time,
-        duration_seconds: best.arrival_time.saturating_sub(request.departure_time),
+        duration_seconds: best.arrival_time.saturating_sub(departure_time),
         transfer_count: best.transfers,
         walking_distance_meters: 0,
         realtime_status: RealtimeStatus::Unavailable,
@@ -277,6 +283,24 @@ mod tests {
         );
 
         assert!(journeys.is_empty());
+    }
+
+    #[test]
+    fn uses_next_viable_departure_after_requested_time() {
+        let journeys = earliest_arrivals(
+            &fixture_snapshot(),
+            SearchRequest {
+                from_stop_id: "stop-praha-hl-n".to_string(),
+                to_stop_id: "stop-brno-hl-n".to_string(),
+                departure_time: 8 * 3600 + 1,
+                max_transfers: 2,
+                modes: vec![TransportMode::Bus],
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].departure_time, 9 * 3600);
+        assert_eq!(journeys[0].legs[0].departure_time, 9 * 3600);
     }
 
     #[test]

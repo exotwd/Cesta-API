@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
 use serde::{Deserialize, Serialize};
@@ -863,8 +863,8 @@ async fn board_qr(Path(stop_id): Path<String>) -> Json<Value> {
 async fn journey_search(
     State(state): State<AppState>,
     Json(body): Json<JourneySearchBody>,
-) -> Json<Value> {
-    let departure_time = parse_query_time_seconds(&body.datetime).unwrap_or(7 * 3600);
+) -> Result<Json<Value>, ApiError> {
+    let departure_time = parse_journey_departure_seconds(&body.datetime)?;
     let _request_metadata = (
         &body.mode,
         &body.walking_speed,
@@ -878,12 +878,12 @@ async fn journey_search(
 
     if let Some(pool) = &state.db {
         return match query_journeys_db(pool, &body, departure_time).await {
-            Ok((journeys, warnings)) => Json(json!({
+            Ok((journeys, warnings)) => Ok(Json(json!({
                 "journeys": journeys,
                 "data_status": database_data_status(),
                 "warnings": warnings
-            })),
-            Err(error) => Json(json!({
+            }))),
+            Err(error) => Ok(Json(json!({
                 "journeys": [],
                 "data_status": {
                     "source": "database",
@@ -892,7 +892,7 @@ async fn journey_search(
                     "warnings": [format!("database journey search failed: {error}")]
                 },
                 "warnings": [format!("database journey search failed: {error}")]
-            })),
+            }))),
         };
     }
 
@@ -909,17 +909,40 @@ async fn journey_search(
             .clone()
             .unwrap_or_else(|| body.to.point_type.clone())
     });
-    let journeys = earliest_arrivals(
+    let mut journeys = earliest_arrivals(
         &fixture_snapshot(),
         RoutingSearchRequest {
-            from_stop_id,
-            to_stop_id,
-            departure_time: 7 * 3600,
+            from_stop_id: from_stop_id.clone(),
+            to_stop_id: to_stop_id.clone(),
+            departure_time,
             max_transfers: body.max_transfers,
-            modes: body.transport_modes,
+            modes: body.transport_modes.clone(),
         },
     );
-    Json(json!({
+    let mut warnings = if state.use_mock_data {
+        vec!["routing uses fixture snapshot until imported snapshots are wired".to_string()]
+    } else {
+        Vec::new()
+    };
+    if journeys.is_empty() && departure_time > 0 {
+        journeys = earliest_arrivals(
+            &fixture_snapshot(),
+            RoutingSearchRequest {
+                from_stop_id,
+                to_stop_id,
+                departure_time: 0,
+                max_transfers: body.max_transfers,
+                modes: body.transport_modes,
+            },
+        );
+        if !journeys.is_empty() {
+            warnings.push(
+                "no departures were found after the requested time; returned earliest service-day journeys"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(Json(json!({
         "journeys": journeys,
         "data_status": {
             "schedule": if state.use_mock_data { "mock" } else { "current" },
@@ -927,8 +950,36 @@ async fn journey_search(
             "offline_compatible": true,
             "valid_until": "2026-12-31"
         },
-        "warnings": if state.use_mock_data { vec!["routing uses fixture snapshot until imported snapshots are wired"] } else { Vec::<&str>::new() }
-    }))
+        "warnings": warnings
+    })))
+}
+
+fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S") {
+        return Ok(seconds_since_midnight(value.time()));
+    }
+
+    if let Ok(value) = NaiveTime::parse_from_str(datetime, "%H:%M:%S") {
+        return Ok(seconds_since_midnight(value));
+    }
+
+    Err(ApiError {
+        code: "invalid_datetime".to_string(),
+        message: "datetime must be RFC3339, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, or HH:MM:SS"
+            .to_string(),
+    })
+}
+
+fn seconds_since_midnight(time: NaiveTime) -> u32 {
+    time.num_seconds_from_midnight()
 }
 
 async fn realtime_trip(Path(trip_id): Path<String>) -> Json<Value> {
@@ -1642,9 +1693,14 @@ async fn search_stops_db(
     normalized_query: &str,
     limit: usize,
 ) -> Result<Vec<Stop>, sqlx::Error> {
-    let db_normalized = normalize_czech_name(raw_query);
-    let like = format!("%{db_normalized}%");
+    let normalized = normalize_czech_name(raw_query);
+    let like = format!("%{normalized}%");
     let raw_like = format!("%{}%", raw_query.trim());
+    let first_token = normalized_query
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    let first_token_like = format!("%{first_token}%");
     let rows = sqlx::query(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
@@ -1652,18 +1708,31 @@ async fn search_stops_db(
                platform_code, modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
-          AND ($1 = '' OR id = $4 OR normalized_name LIKE $2 OR name ILIKE $3)
+          AND (
+            $1 = ''
+            OR id = $4
+            OR normalized_name LIKE $2
+            OR name ILIKE $3
+            OR normalized_name LIKE $5
+            OR name ILIKE $5
+            OR normalized_name % $1
+            OR name % $6
+          )
         ORDER BY
           CASE WHEN id = $4 THEN 0 WHEN normalized_name = $1 THEN 1 ELSE 2 END,
+          similarity(normalized_name, $1) DESC,
+          similarity(name, $6) DESC,
           platform_code IS NULL DESC,
           source_priority ASC,
           name ASC
-        LIMIT 50
+        LIMIT 250
         "#,
     )
-    .bind(&db_normalized)
+    .bind(&normalized)
     .bind(&like)
     .bind(&raw_like)
+    .bind(raw_query.trim())
+    .bind(&first_token_like)
     .bind(raw_query.trim())
     .fetch_all(pool)
     .await?;
@@ -1988,7 +2057,7 @@ fn stop_suggestion_key(stop: &Stop) -> String {
     }
 
     match stop.lat.zip(stop.lon) {
-        Some((lat, lon)) => format!("{name}:{:.5}:{:.5}", lat, lon),
+        Some((lat, lon)) => format!("{name}:{lat:.5}:{lon:.5}"),
         None => format!(
             "{name}:{}",
             stop.municipality.as_deref().unwrap_or_default()
@@ -2363,6 +2432,40 @@ mod tests {
                         json!({
                             "from": {"type": "stop", "id": "Praha hl. n."},
                             "to": {"type": "stop", "id": "Brno hl. n."},
+                            "datetime": "2026-07-06T07:05:00+02:00",
+                            "mode": "depart_at",
+                            "transport_modes": ["train"],
+                            "max_transfers": 4,
+                            "walking_speed": "normal",
+                            "prefer_reliable_transfers": true,
+                            "offline_compatible": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["journeys"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn journey_search_falls_back_to_fixture_service_day_when_requested_time_is_too_late() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/journeys/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "from": {"type": "stop", "id": "stop-praha-hl-n"},
+                            "to": {"type": "stop", "id": "stop-brno-hl-n"},
                             "datetime": "2026-07-06T21:05:00+02:00",
                             "mode": "depart_at",
                             "transport_modes": ["train"],
@@ -2382,5 +2485,16 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["journeys"].as_array().unwrap().len(), 1);
+        assert!(
+            payload["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .is_some_and(|value| value.contains("earliest service-day journeys"))
+                })
+        );
     }
 }
