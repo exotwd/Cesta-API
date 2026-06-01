@@ -77,9 +77,9 @@ pub fn earliest_arrivals(snapshot: &RoutingSnapshot, request: SearchRequest) -> 
             continue;
         }
 
-        let risk_warning = connection.delay_seconds.and_then(|delay| {
-            (delay > 0).then(|| format!("delay_may_affect_connection:{delay}"))
-        });
+        let risk_warning = connection
+            .delay_seconds
+            .and_then(|delay| (delay > 0).then(|| format!("delay_may_affect_connection:{delay}")));
         let mut warnings = Vec::new();
         if let Some(warning) = risk_warning {
             warnings.push(warning);
@@ -118,11 +118,7 @@ pub fn earliest_arrivals(snapshot: &RoutingSnapshot, request: SearchRequest) -> 
         return Vec::new();
     };
 
-    let warnings = best
-        .legs
-        .iter()
-        .flat_map(|leg| leg.warnings.iter())
-        .count() as f32;
+    let warnings = best.legs.iter().flat_map(|leg| leg.warnings.iter()).count() as f32;
 
     vec![Journey {
         id: "journey-1".to_string(),

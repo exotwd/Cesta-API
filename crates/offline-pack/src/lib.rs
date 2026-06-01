@@ -49,4 +49,3 @@ pub fn package_manifest(package: &OfflinePackage) -> serde_json::Value {
         ]
     })
 }
-

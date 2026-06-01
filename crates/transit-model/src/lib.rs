@@ -242,7 +242,12 @@ pub struct TicketOption {
 }
 
 pub fn normalize_czech_name(value: &str) -> String {
-    value.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    value
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn parse_gtfs_time(value: &str) -> Option<u32> {

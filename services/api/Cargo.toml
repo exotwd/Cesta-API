@@ -17,6 +17,7 @@ rand_core.workspace = true
 routing-core = { path = "../../crates/routing-core" }
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

@@ -1,12 +1,12 @@
 services:
   postgres:
-    image: postgis/postgis:16-3.4
+    image: ${POSTGRES_IMAGE:-postgis/postgis:16-3.4}
     environment:
       POSTGRES_USER: cesta
       POSTGRES_PASSWORD: cesta
       POSTGRES_DB: cesta
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/migrations:/docker-entrypoint-initdb.d:ro
@@ -14,7 +14,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6380}:6379"
 
   api:
     build:
@@ -29,11 +29,13 @@ services:
       JWT_SECRET: dev-only-change-me
       REFRESH_TOKEN_SECRET: dev-only-change-me-too
       STORAGE_DIR: /app/storage
-      USE_MOCK_DATA: "true"
-      API_PORT: 8080
+      USE_MOCK_DATA: "false"
+      API_PORT: 8070
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-}
       RUST_LOG: info
     ports:
-      - "8080:8080"
+      - "8070:8070"
     volumes:
       - ./storage:/app/storage
 
@@ -46,6 +48,22 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       RUST_LOG: info
+
+  data-pipeline:
+    build:
+      context: .
+      dockerfile: infra/docker/data-pipeline.Dockerfile
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
+      STORAGE_DIR: /app/storage
+      GGU_LATEST_BASE_URL: https://data.jr.ggu.cz/results/latest/
+      RUST_LOG: info
+    volumes:
+      - ./storage:/app/storage
+    profiles:
+      - tools
 
 volumes:
   postgres-data:
