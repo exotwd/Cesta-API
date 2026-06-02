@@ -1626,25 +1626,48 @@ async fn direct_journeys_db(
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
+        WITH candidate_legs AS (
+          SELECT
+            st_from.trip_id,
+            r.id AS route_id,
+            st_from.stop_id AS from_stop_id,
+            st_to.stop_id AS to_stop_id,
+            st_from.departure_time,
+            st_to.arrival_time,
+            CASE
+              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
+              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
+              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
+              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS public_mode
+          FROM stop_times st_from
+          JOIN stop_times st_to
+            ON st_to.trip_id = st_from.trip_id
+           AND st_to.stop_sequence > st_from.stop_sequence
+          JOIN trips t ON t.id = st_from.trip_id
+          JOIN routes r ON r.id = t.route_id
+          WHERE st_from.stop_id = ANY($1)
+            AND st_to.stop_id = ANY($2)
+            AND st_from.departure_time >= $3
+            AND COALESCE(st_from.pickup_type, 0) = 0
+            AND COALESCE(st_to.drop_off_type, 0) = 0
+        )
         SELECT
-          st_from.trip_id,
-          r.id AS route_id,
-          st_from.stop_id AS from_stop_id,
-          st_to.stop_id AS to_stop_id,
-          st_from.departure_time,
-          st_to.arrival_time,
-          r.mode
-        FROM stop_times st_from
-        JOIN stop_times st_to
-          ON st_to.trip_id = st_from.trip_id
-         AND st_to.stop_sequence > st_from.stop_sequence
-        JOIN trips t ON t.id = st_from.trip_id
-        JOIN routes r ON r.id = t.route_id
-        WHERE st_from.stop_id = ANY($1)
-          AND st_to.stop_id = ANY($2)
-          AND st_from.departure_time >= $3
-          AND ($4 = false OR r.mode = ANY($5))
-        ORDER BY st_from.departure_time ASC, st_to.arrival_time ASC
+          trip_id,
+          route_id,
+          from_stop_id,
+          to_stop_id,
+          departure_time,
+          arrival_time,
+          public_mode AS mode
+        FROM candidate_legs
+        WHERE public_mode <> 'unknown'
+          AND ($4 = false OR public_mode = ANY($5))
+        ORDER BY departure_time ASC, arrival_time ASC
         LIMIT 5
         "#,
     )
@@ -1815,6 +1838,7 @@ async fn departures_db(
         JOIN routes r ON r.id = t.route_id
         WHERE st.stop_id = $1
           AND st.departure_time >= $2
+          AND COALESCE(st.pickup_type, 0) = 0
         ORDER BY st.departure_time ASC
         LIMIT $3
         "#,
