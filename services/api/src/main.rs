@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
@@ -40,6 +45,8 @@ const DB_STAT_TABLES: &[&str] = &[
     "manual_stop_matches",
     "offline_packages",
 ];
+const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
+const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 
 #[derive(Clone)]
 struct AppState {
@@ -1527,9 +1534,29 @@ async fn query_journeys_db(
         &mode_filters,
     )
     .await?;
+    if body.max_transfers > 0 {
+        journeys.append(
+            &mut one_transfer_journeys_db(
+                pool,
+                &from_stop_ids,
+                &to_stop_ids,
+                departure_time,
+                &mode_filters,
+            )
+            .await?,
+        );
+    }
+    journeys = ranked_journey_results(journeys);
 
     if journeys.is_empty() && departure_time > 0 {
         journeys = direct_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters).await?;
+        if body.max_transfers > 0 {
+            journeys.append(
+                &mut one_transfer_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters)
+                    .await?,
+            );
+        }
+        journeys = ranked_journey_results(journeys);
         if !journeys.is_empty() {
             warnings.push(
                 "no departures were found after the requested time; returned earliest service-day journeys"
@@ -1543,6 +1570,54 @@ async fn query_journeys_db(
     }
 
     Ok((journeys, warnings))
+}
+
+fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
+    journeys.sort_by_key(|journey| {
+        (
+            journey.arrival_time,
+            journey.duration_seconds,
+            journey.transfer_count,
+            journey.departure_time,
+        )
+    });
+
+    let mut seen = HashSet::new();
+    journeys
+        .into_iter()
+        .filter(|journey| {
+            let key = journey
+                .legs
+                .iter()
+                .map(|leg| {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        leg.trip_id.as_deref().unwrap_or_default(),
+                        leg.route_id.as_deref().unwrap_or_default(),
+                        leg.from_stop_id,
+                        leg.to_stop_id,
+                        leg.departure_time,
+                        leg.arrival_time
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            seen.insert(key)
+        })
+        .take(5)
+        .enumerate()
+        .map(|(index, mut journey)| {
+            journey.id = format!("journey-{}", index + 1);
+            if index == 0 {
+                if !journey.labels.iter().any(|label| label == "nejrychlejsi") {
+                    journey.labels.push("nejrychlejsi".to_string());
+                }
+            } else {
+                journey.labels.retain(|label| label != "nejrychlejsi");
+            }
+            journey
+        })
+        .collect()
 }
 
 async fn resolve_journey_point_db(
@@ -1667,7 +1742,7 @@ async fn direct_journeys_db(
         FROM candidate_legs
         WHERE public_mode <> 'unknown'
           AND ($4 = false OR public_mode = ANY($5))
-        ORDER BY departure_time ASC, arrival_time ASC
+        ORDER BY arrival_time ASC, departure_time ASC
         LIMIT 5
         "#,
     )
@@ -1705,6 +1780,173 @@ async fn direct_journeys_db(
                 realtime_status: RealtimeStatus::Unavailable,
                 risk_score: 0.0,
                 labels: vec!["nejrychlejsi".to_string()],
+            }
+        })
+        .collect())
+}
+
+async fn one_transfer_journeys_db(
+    pool: &PgPool,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    departure_time: u32,
+    mode_filters: &[String],
+) -> Result<Vec<Journey>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        WITH first_legs AS (
+          SELECT
+            st_from.trip_id AS first_trip_id,
+            r.id AS first_route_id,
+            st_from.stop_id AS first_from_stop_id,
+            st_mid.stop_id AS transfer_arrival_stop_id,
+            st_from.departure_time AS first_departure_time,
+            st_mid.arrival_time AS first_arrival_time,
+            s_mid.normalized_name AS transfer_normalized_name,
+            s_mid.lat AS transfer_lat,
+            s_mid.lon AS transfer_lon,
+            CASE
+              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
+              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
+              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
+              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS first_mode
+          FROM stop_times st_from
+          JOIN stop_times st_mid
+            ON st_mid.trip_id = st_from.trip_id
+           AND st_mid.stop_sequence > st_from.stop_sequence
+          JOIN stops s_mid ON s_mid.id = st_mid.stop_id
+          JOIN trips t ON t.id = st_from.trip_id
+          JOIN routes r ON r.id = t.route_id
+          WHERE st_from.stop_id = ANY($1)
+            AND st_from.departure_time >= $3
+            AND COALESCE(st_from.pickup_type, 0) = 0
+            AND COALESCE(st_mid.drop_off_type, 0) = 0
+          ORDER BY st_mid.arrival_time ASC
+          LIMIT 500
+        ),
+        transfer_stops AS (
+          SELECT
+            first_legs.*,
+            s_transfer.id AS transfer_departure_stop_id
+          FROM first_legs
+          JOIN stops s_transfer
+            ON s_transfer.is_active = true
+           AND (
+             s_transfer.id = first_legs.transfer_arrival_stop_id
+             OR (
+               s_transfer.normalized_name = first_legs.transfer_normalized_name
+               AND s_transfer.lat IS NOT NULL
+               AND s_transfer.lon IS NOT NULL
+               AND first_legs.transfer_lat IS NOT NULL
+               AND first_legs.transfer_lon IS NOT NULL
+               AND abs(s_transfer.lat - first_legs.transfer_lat) < 0.00005
+               AND abs(s_transfer.lon - first_legs.transfer_lon) < 0.00005
+             )
+           )
+          WHERE first_mode <> 'unknown'
+            AND ($4 = false OR first_mode = ANY($5))
+        ),
+        candidate_journeys AS (
+          SELECT
+            transfer_stops.first_trip_id,
+            transfer_stops.first_route_id,
+            transfer_stops.first_from_stop_id,
+            transfer_stops.transfer_arrival_stop_id,
+            transfer_stops.first_departure_time,
+            transfer_stops.first_arrival_time,
+            transfer_stops.first_mode,
+            st_transfer.trip_id AS second_trip_id,
+            r2.id AS second_route_id,
+            st_transfer.stop_id AS transfer_departure_stop_id,
+            st_to.stop_id AS second_to_stop_id,
+            st_transfer.departure_time AS second_departure_time,
+            st_to.arrival_time AS second_arrival_time,
+            CASE
+              WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r2.mode) = 'metro' OR r2.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(r2.mode) = 'bus' OR r2.gtfs_route_type = 3 THEN 'bus'
+              WHEN lower(r2.mode) = 'ferry' OR r2.gtfs_route_type = 4 THEN 'ferry'
+              WHEN lower(r2.mode) IN ('cable_car', 'cablecar') OR r2.gtfs_route_type = 5 THEN 'cable_car'
+              WHEN lower(r2.mode) = 'trolleybus' OR r2.gtfs_route_type = 11 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS second_mode
+          FROM transfer_stops
+          JOIN stop_times st_transfer ON st_transfer.stop_id = transfer_stops.transfer_departure_stop_id
+          JOIN stop_times st_to
+            ON st_to.trip_id = st_transfer.trip_id
+           AND st_to.stop_sequence > st_transfer.stop_sequence
+          JOIN trips t2 ON t2.id = st_transfer.trip_id
+          JOIN routes r2 ON r2.id = t2.route_id
+          WHERE st_to.stop_id = ANY($2)
+            AND st_transfer.trip_id <> transfer_stops.first_trip_id
+            AND st_transfer.departure_time >= transfer_stops.first_arrival_time + $6
+            AND st_transfer.departure_time <= transfer_stops.first_arrival_time + $7
+            AND COALESCE(st_transfer.pickup_type, 0) = 0
+            AND COALESCE(st_to.drop_off_type, 0) = 0
+        )
+        SELECT *
+        FROM candidate_journeys
+        WHERE second_mode <> 'unknown'
+          AND ($4 = false OR second_mode = ANY($5))
+        ORDER BY second_arrival_time ASC, first_departure_time ASC
+        LIMIT 20
+        "#,
+    )
+    .bind(from_stop_ids.to_vec())
+    .bind(to_stop_ids.to_vec())
+    .bind(departure_time as i32)
+    .bind(!mode_filters.is_empty())
+    .bind(mode_filters.to_vec())
+    .bind(MIN_TRANSFER_SECONDS as i32)
+    .bind(MAX_TRANSFER_WAIT_SECONDS as i32)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let departure_time = row.get::<i32, _>("first_departure_time") as u32;
+            let first_arrival_time = row.get::<i32, _>("first_arrival_time") as u32;
+            let second_departure_time = row.get::<i32, _>("second_departure_time") as u32;
+            let arrival_time = row.get::<i32, _>("second_arrival_time") as u32;
+            Journey {
+                id: String::new(),
+                legs: vec![
+                    JourneyLeg {
+                        from_stop_id: row.get("first_from_stop_id"),
+                        to_stop_id: row.get("transfer_arrival_stop_id"),
+                        route_id: Some(row.get("first_route_id")),
+                        trip_id: Some(row.get("first_trip_id")),
+                        departure_time,
+                        arrival_time: first_arrival_time,
+                        mode: db_mode_to_model(&row.get::<String, _>("first_mode")),
+                        warnings: Vec::new(),
+                    },
+                    JourneyLeg {
+                        from_stop_id: row.get("transfer_departure_stop_id"),
+                        to_stop_id: row.get("second_to_stop_id"),
+                        route_id: Some(row.get("second_route_id")),
+                        trip_id: Some(row.get("second_trip_id")),
+                        departure_time: second_departure_time,
+                        arrival_time,
+                        mode: db_mode_to_model(&row.get::<String, _>("second_mode")),
+                        warnings: Vec::new(),
+                    },
+                ],
+                departure_time,
+                arrival_time,
+                duration_seconds: arrival_time.saturating_sub(departure_time),
+                transfer_count: 1,
+                walking_distance_meters: 0,
+                realtime_status: RealtimeStatus::Unavailable,
+                risk_score: 0.0,
+                labels: vec!["s prestupem".to_string()],
             }
         })
         .collect())
@@ -2520,5 +2762,71 @@ mod tests {
                         .is_some_and(|value| value.contains("earliest service-day journeys"))
                 })
         );
+    }
+
+    #[test]
+    fn ranked_journeys_prefer_earliest_arrival_over_earliest_departure() {
+        let slow_direct = Journey {
+            id: "old".to_string(),
+            legs: vec![JourneyLeg {
+                from_stop_id: "a".to_string(),
+                to_stop_id: "c".to_string(),
+                route_id: Some("slow".to_string()),
+                trip_id: Some("slow-trip".to_string()),
+                departure_time: 4 * 3600,
+                arrival_time: 9 * 3600,
+                mode: TransportMode::Train,
+                warnings: Vec::new(),
+            }],
+            departure_time: 4 * 3600,
+            arrival_time: 9 * 3600,
+            duration_seconds: 5 * 3600,
+            transfer_count: 0,
+            walking_distance_meters: 0,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: vec!["nejrychlejsi".to_string()],
+        };
+        let faster_transfer = Journey {
+            id: "old-2".to_string(),
+            legs: vec![
+                JourneyLeg {
+                    from_stop_id: "a".to_string(),
+                    to_stop_id: "b".to_string(),
+                    route_id: Some("feeder".to_string()),
+                    trip_id: Some("feeder-trip".to_string()),
+                    departure_time: 5 * 3600,
+                    arrival_time: 6 * 3600,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+                JourneyLeg {
+                    from_stop_id: "b".to_string(),
+                    to_stop_id: "c".to_string(),
+                    route_id: Some("fast".to_string()),
+                    trip_id: Some("fast-trip".to_string()),
+                    departure_time: 6 * 3600 + 10 * 60,
+                    arrival_time: 8 * 3600,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+            ],
+            departure_time: 5 * 3600,
+            arrival_time: 8 * 3600,
+            duration_seconds: 3 * 3600,
+            transfer_count: 1,
+            walking_distance_meters: 0,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: vec!["s prestupem".to_string()],
+        };
+
+        let ranked = ranked_journey_results(vec![slow_direct, faster_transfer]);
+
+        assert_eq!(ranked[0].id, "journey-1");
+        assert_eq!(ranked[0].arrival_time, 8 * 3600);
+        assert_eq!(ranked[0].transfer_count, 1);
+        assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
+        assert!(!ranked[1].labels.iter().any(|label| label == "nejrychlejsi"));
     }
 }
