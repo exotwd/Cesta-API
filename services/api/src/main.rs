@@ -46,6 +46,8 @@ const DB_STAT_TABLES: &[&str] = &[
     "offline_packages",
 ];
 const MAX_JOURNEY_RESULTS: usize = 5;
+const MAX_DIRECT_JOURNEY_CANDIDATES: i64 = 20;
+const MAX_TRANSFER_JOURNEY_CANDIDATES: i64 = 40;
 const SERVICE_DAY_SECONDS: u32 = 24 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
@@ -393,14 +395,17 @@ async fn openapi() -> Json<Value> {
             "/auth/login": {"post": {"summary": "Login user"}},
             "/stops/search": {"get": {
                 "summary": "Search stops",
-                "description": "Returns closest ranked stop suggestions using normalized, abbreviation and typo-tolerant matching.",
+                "description": "Returns closest ranked stop suggestions using normalized, abbreviation and typo-tolerant matching, plus related source IDs, stop areas and routes.",
                 "parameters": [
                     {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}},
                     {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}
                 ]
             }},
             "/departures": {"get": {"summary": "Stop departures"}},
-            "/journeys/search": {"post": {"summary": "Search journeys"}},
+            "/journeys/search": {"post": {
+                "summary": "Search journeys",
+                "description": "Returns ranked direct and one-transfer journey candidates with related stops, routes, trips, stop times, agencies, source feeds and query context."
+            }},
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
             "/admin/database/stats": {"get": {"summary": "Database row counts and table sizes"}},
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
@@ -699,7 +704,18 @@ async fn search_stops(
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
     if let Some(pool) = &state.db {
         return match search_stops_db(pool, &q, &normalized, limit).await {
-            Ok(stops) => Json(json!({"stops": stops, "data_status": database_data_status()})),
+            Ok(stops) => {
+                let related = stop_search_related_data_db(pool, &stops)
+                    .await
+                    .unwrap_or_else(|error| {
+                        json!({"warnings": [format!("database stop related data failed: {error}")]})
+                    });
+                Json(json!({
+                    "stops": stops,
+                    "related": related,
+                    "data_status": database_data_status()
+                }))
+            }
             Err(error) => Json(json!({
                 "stops": [],
                 "data_status": {
@@ -887,8 +903,9 @@ async fn journey_search(
 
     if let Some(pool) = &state.db {
         return match query_journeys_db(pool, &body, departure_time).await {
-            Ok((journeys, warnings)) => Ok(Json(json!({
+            Ok((journeys, warnings, related)) => Ok(Json(json!({
                 "journeys": journeys,
+                "related": related,
                 "data_status": database_data_status(),
                 "warnings": warnings
             }))),
@@ -1511,7 +1528,7 @@ async fn query_journeys_db(
     pool: &PgPool,
     body: &JourneySearchBody,
     departure_time: u32,
-) -> Result<(Vec<Journey>, Vec<String>), sqlx::Error> {
+) -> Result<(Vec<Journey>, Vec<String>, Value), sqlx::Error> {
     let mut warnings = Vec::new();
     let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
     let (to_stop_ids, to_warning) = resolve_journey_point_db(pool, &body.to).await?;
@@ -1520,7 +1537,11 @@ async fn query_journeys_db(
 
     if from_stop_ids.is_empty() || to_stop_ids.is_empty() {
         warnings.push("one or both journey stops could not be resolved".to_string());
-        return Ok((Vec::new(), warnings));
+        return Ok((
+            Vec::new(),
+            warnings,
+            json!({"query_context": journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids)}),
+        ));
     }
 
     let mode_filters = body
@@ -1574,7 +1595,26 @@ async fn query_journeys_db(
         warnings.push("no database journeys found for the resolved stops".to_string());
     }
 
-    Ok((journeys, warnings))
+    let mut related = journey_related_data_db(pool, &journeys).await?;
+    related["query_context"] =
+        journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids);
+
+    Ok((journeys, warnings, related))
+}
+
+fn journey_query_context(
+    body: &JourneySearchBody,
+    departure_time: u32,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+) -> Value {
+    json!({
+        "departure_time": departure_time,
+        "max_transfers": body.max_transfers,
+        "transport_modes": body.transport_modes,
+        "from_stop_ids": from_stop_ids,
+        "to_stop_ids": to_stop_ids
+    })
 }
 
 fn next_service_day_journey_results(
@@ -1912,7 +1952,7 @@ async fn direct_journeys_db(
             )
           )
         ORDER BY arrival_time ASC, departure_time ASC
-        LIMIT 5
+        LIMIT $6
         "#,
     )
     .bind(from_stop_ids.to_vec())
@@ -1920,6 +1960,7 @@ async fn direct_journeys_db(
     .bind(departure_time as i32)
     .bind(!mode_filters.is_empty())
     .bind(mode_filters.to_vec())
+    .bind(MAX_DIRECT_JOURNEY_CANDIDATES)
     .fetch_all(pool)
     .await?;
 
@@ -1986,88 +2027,18 @@ async fn one_transfer_journeys_db(
           ) ranked_route_variants
           WHERE route_variant_rank = 1
         ),
-        first_legs AS (
+        second_legs AS (
           SELECT
-            st_from.trip_id AS first_trip_id,
-            r.id AS first_route_id,
-            st_from.stop_id AS first_from_stop_id,
-            st_mid.stop_id AS transfer_arrival_stop_id,
-            st_from.departure_time AS first_departure_time,
-            st_mid.arrival_time AS first_arrival_time,
-            s_mid.normalized_name AS transfer_normalized_name,
-            s_mid.lat AS transfer_lat,
-            s_mid.lon AS transfer_lon,
-            lir.import_run_id IS NOT NULL AS first_from_latest_import,
-            CASE
-              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
-              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
-              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
-              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
-              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
-              ELSE 'unknown'
-            END AS first_mode
-          FROM stop_times st_from
-          JOIN stop_times st_mid
-            ON st_mid.trip_id = st_from.trip_id
-           AND st_mid.stop_sequence > st_from.stop_sequence
-          JOIN stops s_mid ON s_mid.id = st_mid.stop_id
-          JOIN trips t ON t.id = st_from.trip_id
-          LEFT JOIN latest_import_runs lir
-            ON lir.source_feed_id = t.source_feed_id
-           AND lir.import_run_id = t.import_run_id
-          JOIN routes r ON r.id = t.route_id
-          WHERE st_from.stop_id = ANY($1)
-            AND st_from.departure_time >= $3
-            AND (
-              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
-              OR r.id IN (SELECT route_id FROM current_train_route_variants)
-            )
-            AND COALESCE(st_from.pickup_type, 0) = 0
-            AND COALESCE(st_mid.drop_off_type, 0) = 0
-          ORDER BY st_mid.arrival_time ASC
-          LIMIT 500
-        ),
-        transfer_stops AS (
-          SELECT
-            first_legs.*,
-            s_transfer.id AS transfer_departure_stop_id
-          FROM first_legs
-          JOIN stops s_transfer
-            ON s_transfer.is_active = true
-           AND (
-             s_transfer.id = first_legs.transfer_arrival_stop_id
-             OR (
-               s_transfer.normalized_name = first_legs.transfer_normalized_name
-               AND s_transfer.lat IS NOT NULL
-               AND s_transfer.lon IS NOT NULL
-               AND first_legs.transfer_lat IS NOT NULL
-               AND first_legs.transfer_lon IS NOT NULL
-               AND abs(s_transfer.lat - first_legs.transfer_lat) < 0.00005
-               AND abs(s_transfer.lon - first_legs.transfer_lon) < 0.00005
-             )
-           )
-          WHERE first_mode <> 'unknown'
-            AND ($4 = false OR first_mode = ANY($5))
-        ),
-        candidate_journeys AS (
-          SELECT
-            transfer_stops.first_trip_id,
-            transfer_stops.first_route_id,
-            transfer_stops.first_from_stop_id,
-            transfer_stops.transfer_arrival_stop_id,
-            transfer_stops.first_departure_time,
-            transfer_stops.first_arrival_time,
-            transfer_stops.first_mode,
             st_transfer.trip_id AS second_trip_id,
             r2.id AS second_route_id,
             st_transfer.stop_id AS transfer_departure_stop_id,
             st_to.stop_id AS second_to_stop_id,
             st_transfer.departure_time AS second_departure_time,
             st_to.arrival_time AS second_arrival_time,
-            transfer_stops.first_from_latest_import
-              AND lir2.import_run_id IS NOT NULL AS from_latest_import,
+            s_transfer.normalized_name AS transfer_normalized_name,
+            s_transfer.lat AS transfer_lat,
+            s_transfer.lon AS transfer_lon,
+            lir2.import_run_id IS NOT NULL AS second_from_latest_import,
             CASE
               WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 THEN 'tram'
@@ -2078,31 +2049,100 @@ async fn one_transfer_journeys_db(
               WHEN lower(r2.mode) = 'trolleybus' OR r2.gtfs_route_type = 11 THEN 'trolleybus'
               ELSE 'unknown'
             END AS second_mode
-          FROM transfer_stops
-          JOIN stop_times st_transfer ON st_transfer.stop_id = transfer_stops.transfer_departure_stop_id
-          JOIN stop_times st_to
-            ON st_to.trip_id = st_transfer.trip_id
-           AND st_to.stop_sequence > st_transfer.stop_sequence
+          FROM stop_times st_to
+          JOIN stop_times st_transfer
+            ON st_transfer.trip_id = st_to.trip_id
+           AND st_transfer.stop_sequence < st_to.stop_sequence
+          JOIN stops s_transfer
+            ON s_transfer.id = st_transfer.stop_id
+           AND s_transfer.is_active = true
           JOIN trips t2 ON t2.id = st_transfer.trip_id
           LEFT JOIN latest_import_runs lir2
             ON lir2.source_feed_id = t2.source_feed_id
            AND lir2.import_run_id = t2.import_run_id
           JOIN routes r2 ON r2.id = t2.route_id
           WHERE st_to.stop_id = ANY($2)
-            AND st_transfer.trip_id <> transfer_stops.first_trip_id
-            AND st_transfer.departure_time >= transfer_stops.first_arrival_time + $6
-            AND st_transfer.departure_time <= transfer_stops.first_arrival_time + $7
+            AND st_transfer.departure_time >= $3 + $6
             AND (
               COALESCE(r2.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
               OR r2.id IN (SELECT route_id FROM current_train_route_variants)
             )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
+        ),
+        filtered_second_legs AS (
+          SELECT *
+          FROM second_legs
+          WHERE second_mode <> 'unknown'
+            AND ($4 = false OR second_mode = ANY($5))
+        ),
+        candidate_journeys AS (
+          SELECT
+            st_from.trip_id AS first_trip_id,
+            r.id AS first_route_id,
+            st_from.stop_id AS first_from_stop_id,
+            st_mid.stop_id AS transfer_arrival_stop_id,
+            st_from.departure_time AS first_departure_time,
+            st_mid.arrival_time AS first_arrival_time,
+            CASE
+              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
+              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
+              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
+              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS first_mode,
+            filtered_second_legs.second_trip_id,
+            filtered_second_legs.second_route_id,
+            filtered_second_legs.transfer_departure_stop_id,
+            filtered_second_legs.second_to_stop_id,
+            filtered_second_legs.second_departure_time,
+            filtered_second_legs.second_arrival_time,
+            filtered_second_legs.second_mode,
+            lir.import_run_id IS NOT NULL
+              AND filtered_second_legs.second_from_latest_import AS from_latest_import
+          FROM filtered_second_legs
+          JOIN stops s_mid
+            ON s_mid.is_active = true
+           AND (
+             s_mid.id = filtered_second_legs.transfer_departure_stop_id
+             OR (
+               s_mid.normalized_name = filtered_second_legs.transfer_normalized_name
+               AND s_mid.lat IS NOT NULL
+               AND s_mid.lon IS NOT NULL
+               AND filtered_second_legs.transfer_lat IS NOT NULL
+               AND filtered_second_legs.transfer_lon IS NOT NULL
+               AND abs(s_mid.lat - filtered_second_legs.transfer_lat) < 0.00005
+               AND abs(s_mid.lon - filtered_second_legs.transfer_lon) < 0.00005
+             )
+           )
+          JOIN stop_times st_mid ON st_mid.stop_id = s_mid.id
+          JOIN stop_times st_from
+            ON st_from.trip_id = st_mid.trip_id
+           AND st_mid.stop_sequence > st_from.stop_sequence
+          JOIN trips t ON t.id = st_from.trip_id
+          LEFT JOIN latest_import_runs lir
+            ON lir.source_feed_id = t.source_feed_id
+           AND lir.import_run_id = t.import_run_id
+          JOIN routes r ON r.id = t.route_id
+          WHERE st_from.stop_id = ANY($1)
+            AND st_from.departure_time >= $3
+            AND st_from.trip_id <> filtered_second_legs.second_trip_id
+            AND filtered_second_legs.second_departure_time >= st_mid.arrival_time + $6
+            AND filtered_second_legs.second_departure_time <= st_mid.arrival_time + $7
+            AND (
+              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
+              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+            )
+            AND COALESCE(st_from.pickup_type, 0) = 0
+            AND COALESCE(st_mid.drop_off_type, 0) = 0
         )
         SELECT *
         FROM candidate_journeys
-        WHERE second_mode <> 'unknown'
-          AND ($4 = false OR second_mode = ANY($5))
+        WHERE first_mode <> 'unknown'
+          AND ($4 = false OR first_mode = ANY($5))
           AND (
             from_latest_import
             OR NOT EXISTS (
@@ -2110,7 +2150,7 @@ async fn one_transfer_journeys_db(
             )
           )
         ORDER BY second_arrival_time ASC, first_departure_time ASC
-        LIMIT 20
+        LIMIT $8
         "#,
     )
     .bind(from_stop_ids.to_vec())
@@ -2120,6 +2160,7 @@ async fn one_transfer_journeys_db(
     .bind(mode_filters.to_vec())
     .bind(MIN_TRANSFER_SECONDS as i32)
     .bind(MAX_TRANSFER_WAIT_SECONDS as i32)
+    .bind(MAX_TRANSFER_JOURNEY_CANDIDATES)
     .fetch_all(pool)
     .await?;
 
@@ -2165,6 +2206,269 @@ async fn one_transfer_journeys_db(
             }
         })
         .collect())
+}
+
+async fn journey_related_data_db(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<Value, sqlx::Error> {
+    let mut stop_ids = HashSet::new();
+    let mut route_ids = HashSet::new();
+    let mut trip_ids = HashSet::new();
+
+    for journey in journeys {
+        for leg in &journey.legs {
+            stop_ids.insert(leg.from_stop_id.clone());
+            stop_ids.insert(leg.to_stop_id.clone());
+            if let Some(route_id) = &leg.route_id {
+                route_ids.insert(route_id.clone());
+            }
+            if let Some(trip_id) = &leg.trip_id {
+                trip_ids.insert(trip_id.clone());
+            }
+        }
+    }
+
+    let stop_ids = stop_ids.into_iter().collect::<Vec<_>>();
+    let route_ids = route_ids.into_iter().collect::<Vec<_>>();
+    let trip_ids = trip_ids.into_iter().collect::<Vec<_>>();
+    let mut source_feed_ids = HashSet::new();
+    let mut agency_ids = HashSet::new();
+
+    let stops = if stop_ids.is_empty() {
+        Vec::new()
+    } else {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+                   lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+                   platform_code, modes, source_priority, is_active
+            FROM stops
+            WHERE id = ANY($1)
+            ORDER BY name ASC, platform_code ASC NULLS FIRST
+            "#,
+        )
+        .bind(&stop_ids)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(stop_from_row)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for stop in &stops {
+        for source_id in &stop.source_ids {
+            source_feed_ids.insert(source_id.feed_id.clone());
+        }
+    }
+
+    let routes = if route_ids.is_empty() {
+        Vec::new()
+    } else {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_feed_id, source_id, agency_id, operator_id, short_name, long_name,
+                   mode, gtfs_route_type, color, text_color, source_priority, is_active
+            FROM routes
+            WHERE id = ANY($1)
+            ORDER BY source_priority ASC, short_name ASC NULLS LAST, id ASC
+            "#,
+        )
+        .bind(&route_ids)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                    source_feed_ids.insert(feed_id);
+                }
+                if let Some(agency_id) = row.get::<Option<String>, _>("agency_id") {
+                    agency_ids.insert(agency_id);
+                }
+                route_row_json(&row)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let trips = if trip_ids.is_empty() {
+        Vec::new()
+    } else {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_feed_id, source_id, route_id, service_id, headsign,
+                   direction_id, shape_id, restrictions, raw_source_metadata, source_priority
+            FROM trips
+            WHERE id = ANY($1)
+            ORDER BY source_priority ASC, id ASC
+            "#,
+        )
+        .bind(&trip_ids)
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                    source_feed_ids.insert(feed_id);
+                }
+                trip_row_json(&row)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let stop_times = if trip_ids.is_empty() || stop_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            r#"
+            SELECT trip_id, stop_id, stop_sequence, arrival_time, departure_time,
+                   pickup_type, drop_off_type, timepoint, platform, raw_notes,
+                   source_feed_id, source_priority
+            FROM stop_times
+            WHERE trip_id = ANY($1)
+              AND stop_id = ANY($2)
+            ORDER BY trip_id ASC, stop_sequence ASC
+            "#,
+        )
+        .bind(&trip_ids)
+        .bind(&stop_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                source_feed_ids.insert(feed_id);
+            }
+            stop_time_row_json(&row)
+        })
+        .collect::<Vec<_>>()
+    };
+
+    let agencies = fetch_agencies_json(pool, agency_ids.into_iter().collect()).await?;
+    let source_feeds = fetch_source_feeds_json(pool, source_feed_ids.into_iter().collect()).await?;
+
+    Ok(json!({
+        "stops": stops,
+        "routes": routes,
+        "trips": trips,
+        "stop_times": stop_times,
+        "agencies": agencies,
+        "source_feeds": source_feeds
+    }))
+}
+
+async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Value, sqlx::Error> {
+    let stop_ids = stops.iter().map(|stop| stop.id.clone()).collect::<Vec<_>>();
+    let stop_area_ids = stops
+        .iter()
+        .filter_map(|stop| stop.stop_area_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut source_feed_ids = stops
+        .iter()
+        .flat_map(|stop| {
+            stop.source_ids
+                .iter()
+                .map(|source_id| source_id.feed_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    if stop_ids.is_empty() {
+        return Ok(json!({
+            "source_ids": [],
+            "stop_areas": [],
+            "routes": [],
+            "source_feeds": []
+        }));
+    }
+
+    let source_ids = sqlx::query(
+        r#"
+        SELECT stop_id, source_feed_id, original_source_id, import_run_id, priority,
+               confidence, suppressed_as_duplicate
+        FROM stop_source_ids
+        WHERE stop_id = ANY($1)
+        ORDER BY stop_id ASC, priority ASC, source_feed_id ASC
+        "#,
+    )
+    .bind(&stop_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let feed_id = row.get::<String, _>("source_feed_id");
+        source_feed_ids.insert(feed_id.clone());
+        json!({
+            "stop_id": row.get::<String, _>("stop_id"),
+            "source_feed_id": feed_id,
+            "original_source_id": row.get::<String, _>("original_source_id"),
+            "import_run_id": row.get::<Option<Uuid>, _>("import_run_id"),
+            "priority": row.get::<i32, _>("priority"),
+            "confidence": row.get::<Option<String>, _>("confidence"),
+            "suppressed_as_duplicate": row.get::<bool, _>("suppressed_as_duplicate")
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let stop_areas = if stop_area_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, name,
+                   CASE WHEN geom IS NULL THEN NULL ELSE ST_Y(geom::geometry) END AS lat,
+                   CASE WHEN geom IS NULL THEN NULL ELSE ST_X(geom::geometry) END AS lon
+            FROM stop_areas
+            WHERE id = ANY($1)
+            ORDER BY name ASC
+            "#,
+        )
+        .bind(&stop_area_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "lat": row.get::<Option<f64>, _>("lat"),
+                "lon": row.get::<Option<f64>, _>("lon")
+            })
+        })
+        .collect::<Vec<_>>()
+    };
+
+    let route_rows = sqlx::query(
+        r#"
+        SELECT DISTINCT r.id, r.source_feed_id, r.source_id, r.agency_id, r.operator_id,
+               r.short_name, r.long_name, r.mode, r.gtfs_route_type, r.color, r.text_color,
+               r.source_priority, r.is_active
+        FROM stop_times st
+        JOIN trips t ON t.id = st.trip_id
+        JOIN routes r ON r.id = t.route_id
+        WHERE st.stop_id = ANY($1)
+        ORDER BY r.source_priority ASC, r.short_name ASC NULLS LAST, r.id ASC
+        LIMIT 200
+        "#,
+    )
+    .bind(&stop_ids)
+    .fetch_all(pool)
+    .await?;
+    let routes = route_rows
+        .into_iter()
+        .map(|row| {
+            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                source_feed_ids.insert(feed_id);
+            }
+            route_row_json(&row)
+        })
+        .collect::<Vec<_>>();
+    let source_feeds = fetch_source_feeds_json(pool, source_feed_ids.into_iter().collect()).await?;
+
+    Ok(json!({
+        "source_ids": source_ids,
+        "stop_areas": stop_areas,
+        "routes": routes,
+        "source_feeds": source_feeds
+    }))
 }
 
 async fn search_stops_db(
@@ -2369,6 +2673,124 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
             .collect(),
         is_active: row.get("is_active"),
     })
+}
+
+fn route_row_json(row: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": row.get::<String, _>("id"),
+        "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+        "source_id": row.get::<String, _>("source_id"),
+        "agency_id": row.get::<Option<String>, _>("agency_id"),
+        "operator_id": row.get::<Option<String>, _>("operator_id"),
+        "short_name": row.get::<Option<String>, _>("short_name"),
+        "long_name": row.get::<Option<String>, _>("long_name"),
+        "mode": row.get::<String, _>("mode"),
+        "gtfs_route_type": row.get::<Option<i32>, _>("gtfs_route_type"),
+        "color": row.get::<Option<String>, _>("color"),
+        "text_color": row.get::<Option<String>, _>("text_color"),
+        "source_priority": row.get::<i32, _>("source_priority"),
+        "is_active": row.get::<bool, _>("is_active")
+    })
+}
+
+fn trip_row_json(row: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": row.get::<String, _>("id"),
+        "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+        "source_id": row.get::<String, _>("source_id"),
+        "route_id": row.get::<String, _>("route_id"),
+        "service_id": row.get::<String, _>("service_id"),
+        "headsign": row.get::<Option<String>, _>("headsign"),
+        "direction_id": row.get::<Option<i16>, _>("direction_id"),
+        "shape_id": row.get::<Option<String>, _>("shape_id"),
+        "restrictions": row.get::<Value, _>("restrictions"),
+        "raw_source_metadata": row.get::<Value, _>("raw_source_metadata"),
+        "source_priority": row.get::<i32, _>("source_priority")
+    })
+}
+
+fn stop_time_row_json(row: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "trip_id": row.get::<String, _>("trip_id"),
+        "stop_id": row.get::<String, _>("stop_id"),
+        "stop_sequence": row.get::<i32, _>("stop_sequence"),
+        "arrival_time": row.get::<i32, _>("arrival_time"),
+        "departure_time": row.get::<i32, _>("departure_time"),
+        "pickup_type": row.get::<Option<i16>, _>("pickup_type"),
+        "drop_off_type": row.get::<Option<i16>, _>("drop_off_type"),
+        "timepoint": row.get::<Option<bool>, _>("timepoint"),
+        "platform": row.get::<Option<String>, _>("platform"),
+        "raw_notes": row.get::<Option<String>, _>("raw_notes"),
+        "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+        "source_priority": row.get::<i32, _>("source_priority")
+    })
+}
+
+async fn fetch_agencies_json(
+    pool: &PgPool,
+    agency_ids: Vec<String>,
+) -> Result<Vec<Value>, sqlx::Error> {
+    if agency_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(sqlx::query(
+        r#"
+        SELECT id, source_feed_id, source_id, name, url, timezone
+        FROM agencies
+        WHERE id = ANY($1)
+        ORDER BY name ASC
+        "#,
+    )
+    .bind(&agency_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("id"),
+            "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+            "source_id": row.get::<String, _>("source_id"),
+            "name": row.get::<String, _>("name"),
+            "url": row.get::<Option<String>, _>("url"),
+            "timezone": row.get::<Option<String>, _>("timezone")
+        })
+    })
+    .collect())
+}
+
+async fn fetch_source_feeds_json(
+    pool: &PgPool,
+    source_feed_ids: Vec<String>,
+) -> Result<Vec<Value>, sqlx::Error> {
+    if source_feed_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(sqlx::query(
+        r#"
+        SELECT id, name, url, type, mode_scope, priority, enabled
+        FROM source_feeds
+        WHERE id = ANY($1)
+        ORDER BY priority ASC, id ASC
+        "#,
+    )
+    .bind(&source_feed_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("id"),
+            "name": row.get::<String, _>("name"),
+            "url": row.get::<String, _>("url"),
+            "type": row.get::<String, _>("type"),
+            "mode_scope": row.get::<Option<String>, _>("mode_scope"),
+            "priority": row.get::<i32, _>("priority"),
+            "enabled": row.get::<bool, _>("enabled")
+        })
+    })
+    .collect())
 }
 
 fn database_data_status() -> Value {
