@@ -17,7 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
 use serde::{Deserialize, Serialize};
@@ -873,6 +873,7 @@ async fn journey_search(
     Json(body): Json<JourneySearchBody>,
 ) -> Result<Json<Value>, ApiError> {
     let departure_time = parse_journey_departure_seconds(&body.datetime)?;
+    let service_date = parse_journey_service_date(&body.datetime);
     let _request_metadata = (
         &body.mode,
         &body.walking_speed,
@@ -885,7 +886,7 @@ async fn journey_search(
     );
 
     if let Some(pool) = &state.db {
-        return match query_journeys_db(pool, &body, departure_time).await {
+        return match query_journeys_db(pool, &body, departure_time, service_date).await {
             Ok((journeys, warnings)) => Ok(Json(json!({
                 "journeys": journeys,
                 "data_status": database_data_status(),
@@ -984,6 +985,22 @@ fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
         message: "datetime must be RFC3339, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, or HH:MM:SS"
             .to_string(),
     })
+}
+
+fn parse_journey_service_date(datetime: &str) -> Option<NaiveDate> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
+        return Some(value.date_naive());
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
+        return Some(value.date());
+    }
+
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S") {
+        return Some(value.date());
+    }
+
+    None
 }
 
 fn seconds_since_midnight(time: NaiveTime) -> u32 {
@@ -1510,6 +1527,7 @@ async fn query_journeys_db(
     pool: &PgPool,
     body: &JourneySearchBody,
     departure_time: u32,
+    service_date: Option<NaiveDate>,
 ) -> Result<(Vec<Journey>, Vec<String>), sqlx::Error> {
     let mut warnings = Vec::new();
     let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
@@ -1532,6 +1550,7 @@ async fn query_journeys_db(
         &from_stop_ids,
         &to_stop_ids,
         departure_time,
+        service_date,
         &mode_filters,
     )
     .await?;
@@ -1542,6 +1561,7 @@ async fn query_journeys_db(
                 &from_stop_ids,
                 &to_stop_ids,
                 departure_time,
+                service_date,
                 &mode_filters,
             )
             .await?,
@@ -1550,11 +1570,26 @@ async fn query_journeys_db(
     journeys = ranked_journey_results(journeys);
 
     if journeys.is_empty() && departure_time > 0 {
-        journeys = direct_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters).await?;
+        journeys = direct_journeys_db(
+            pool,
+            &from_stop_ids,
+            &to_stop_ids,
+            0,
+            service_date,
+            &mode_filters,
+        )
+        .await?;
         if body.max_transfers > 0 {
             journeys.append(
-                &mut one_transfer_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters)
-                    .await?,
+                &mut one_transfer_journeys_db(
+                    pool,
+                    &from_stop_ids,
+                    &to_stop_ids,
+                    0,
+                    service_date,
+                    &mode_filters,
+                )
+                .await?,
             );
         }
         journeys = ranked_journey_results(journeys);
@@ -1776,11 +1811,52 @@ async fn direct_journeys_db(
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
+    service_date: Option<NaiveDate>,
     mode_filters: &[String],
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH candidate_legs AS (
+        WITH active_trips AS (
+          SELECT t.*
+          FROM trips t
+          WHERE $6::date IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM calendar_dates cd
+               WHERE cd.service_id = t.service_id
+                 AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+                 AND cd.date = $6::date
+                 AND cd.exception_type = 1
+             )
+             OR (
+               EXISTS (
+                 SELECT 1
+                 FROM calendars c
+                 WHERE c.service_id = t.service_id
+                   AND (c.source_feed_id = t.source_feed_id OR c.source_feed_id IS NULL)
+                   AND $6::date BETWEEN c.start_date AND c.end_date
+                   AND CASE EXTRACT(ISODOW FROM $6::date)::integer
+                     WHEN 1 THEN c.monday
+                     WHEN 2 THEN c.tuesday
+                     WHEN 3 THEN c.wednesday
+                     WHEN 4 THEN c.thursday
+                     WHEN 5 THEN c.friday
+                     WHEN 6 THEN c.saturday
+                     WHEN 7 THEN c.sunday
+                     ELSE false
+                   END
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM calendar_dates cd
+                 WHERE cd.service_id = t.service_id
+                   AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+                   AND cd.date = $6::date
+                   AND cd.exception_type = 2
+               )
+             )
+        ),
+        candidate_legs AS (
           SELECT
             st_from.trip_id,
             r.id AS route_id,
@@ -1802,7 +1878,7 @@ async fn direct_journeys_db(
           JOIN stop_times st_to
             ON st_to.trip_id = st_from.trip_id
            AND st_to.stop_sequence > st_from.stop_sequence
-          JOIN trips t ON t.id = st_from.trip_id
+          JOIN active_trips t ON t.id = st_from.trip_id
           JOIN routes r ON r.id = t.route_id
           WHERE st_from.stop_id = ANY($1)
             AND st_to.stop_id = ANY($2)
@@ -1830,6 +1906,7 @@ async fn direct_journeys_db(
     .bind(departure_time as i32)
     .bind(!mode_filters.is_empty())
     .bind(mode_filters.to_vec())
+    .bind(service_date)
     .fetch_all(pool)
     .await?;
 
@@ -1869,11 +1946,52 @@ async fn one_transfer_journeys_db(
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
+    service_date: Option<NaiveDate>,
     mode_filters: &[String],
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH first_legs AS (
+        WITH active_trips AS (
+          SELECT t.*
+          FROM trips t
+          WHERE $8::date IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM calendar_dates cd
+               WHERE cd.service_id = t.service_id
+                 AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+                 AND cd.date = $8::date
+                 AND cd.exception_type = 1
+             )
+             OR (
+               EXISTS (
+                 SELECT 1
+                 FROM calendars c
+                 WHERE c.service_id = t.service_id
+                   AND (c.source_feed_id = t.source_feed_id OR c.source_feed_id IS NULL)
+                   AND $8::date BETWEEN c.start_date AND c.end_date
+                   AND CASE EXTRACT(ISODOW FROM $8::date)::integer
+                     WHEN 1 THEN c.monday
+                     WHEN 2 THEN c.tuesday
+                     WHEN 3 THEN c.wednesday
+                     WHEN 4 THEN c.thursday
+                     WHEN 5 THEN c.friday
+                     WHEN 6 THEN c.saturday
+                     WHEN 7 THEN c.sunday
+                     ELSE false
+                   END
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM calendar_dates cd
+                 WHERE cd.service_id = t.service_id
+                   AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+                   AND cd.date = $8::date
+                   AND cd.exception_type = 2
+               )
+             )
+        ),
+        first_legs AS (
           SELECT
             st_from.trip_id AS first_trip_id,
             r.id AS first_route_id,
@@ -1899,7 +2017,7 @@ async fn one_transfer_journeys_db(
             ON st_mid.trip_id = st_from.trip_id
            AND st_mid.stop_sequence > st_from.stop_sequence
           JOIN stops s_mid ON s_mid.id = st_mid.stop_id
-          JOIN trips t ON t.id = st_from.trip_id
+          JOIN active_trips t ON t.id = st_from.trip_id
           JOIN routes r ON r.id = t.route_id
           WHERE st_from.stop_id = ANY($1)
             AND st_from.departure_time >= $3
@@ -1960,7 +2078,7 @@ async fn one_transfer_journeys_db(
           JOIN stop_times st_to
             ON st_to.trip_id = st_transfer.trip_id
            AND st_to.stop_sequence > st_transfer.stop_sequence
-          JOIN trips t2 ON t2.id = st_transfer.trip_id
+          JOIN active_trips t2 ON t2.id = st_transfer.trip_id
           JOIN routes r2 ON r2.id = t2.route_id
           WHERE st_to.stop_id = ANY($2)
             AND st_transfer.trip_id <> transfer_stops.first_trip_id
@@ -1984,6 +2102,7 @@ async fn one_transfer_journeys_db(
     .bind(mode_filters.to_vec())
     .bind(MIN_TRANSFER_SECONDS as i32)
     .bind(MAX_TRANSFER_WAIT_SECONDS as i32)
+    .bind(service_date)
     .fetch_all(pool)
     .await?;
 
@@ -2841,6 +2960,19 @@ mod tests {
                         .is_some_and(|value| value.contains("earliest service-day journeys"))
                 })
         );
+    }
+
+    #[test]
+    fn parses_service_date_only_when_request_contains_a_date() {
+        assert_eq!(
+            parse_journey_service_date("2026-07-06T07:05:00+02:00"),
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+        );
+        assert_eq!(
+            parse_journey_service_date("2026-07-06 07:05:00"),
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+        );
+        assert_eq!(parse_journey_service_date("07:05:00"), None);
     }
 
     fn test_journey(
