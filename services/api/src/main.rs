@@ -1820,6 +1820,20 @@ async fn direct_journeys_db(
           SELECT t.*
           FROM trips t
           WHERE $6::date IS NULL
+             OR (
+               NOT EXISTS (
+                 SELECT 1
+                 FROM calendars c
+                 WHERE c.service_id = t.service_id
+                   AND (c.source_feed_id = t.source_feed_id OR c.source_feed_id IS NULL)
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM calendar_dates cd
+                 WHERE cd.service_id = t.service_id
+                   AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+               )
+             )
              OR EXISTS (
                SELECT 1
                FROM calendar_dates cd
@@ -1955,6 +1969,20 @@ async fn one_transfer_journeys_db(
           SELECT t.*
           FROM trips t
           WHERE $8::date IS NULL
+             OR (
+               NOT EXISTS (
+                 SELECT 1
+                 FROM calendars c
+                 WHERE c.service_id = t.service_id
+                   AND (c.source_feed_id = t.source_feed_id OR c.source_feed_id IS NULL)
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM calendar_dates cd
+                 WHERE cd.service_id = t.service_id
+                   AND (cd.source_feed_id = t.source_feed_id OR cd.source_feed_id IS NULL)
+               )
+             )
              OR EXISTS (
                SELECT 1
                FROM calendar_dates cd
