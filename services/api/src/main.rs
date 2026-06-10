@@ -1842,6 +1842,20 @@ async fn direct_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
+        current_train_route_variants AS (
+          SELECT route_id
+          FROM (
+            SELECT
+              id AS route_id,
+              row_number() OVER (
+                PARTITION BY source_feed_id, regexp_replace(source_id, 'CZTRAINR-[0-9]{4}-', 'CZTRAINR-')
+                ORDER BY substring(source_id from 'CZTRAINR-([0-9]{4})-')::integer DESC, id DESC
+              ) AS route_variant_rank
+            FROM routes
+            WHERE COALESCE(source_id, '') ~ 'CZTRAINR-[0-9]{4}-'
+          ) ranked_route_variants
+          WHERE route_variant_rank = 1
+        ),
         candidate_legs AS (
           SELECT
             st_from.trip_id,
@@ -1873,6 +1887,10 @@ async fn direct_journeys_db(
           WHERE st_from.stop_id = ANY($1)
             AND st_to.stop_id = ANY($2)
             AND st_from.departure_time >= $3
+            AND (
+              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
+              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+            )
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
         )
@@ -1954,6 +1972,20 @@ async fn one_transfer_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
+        current_train_route_variants AS (
+          SELECT route_id
+          FROM (
+            SELECT
+              id AS route_id,
+              row_number() OVER (
+                PARTITION BY source_feed_id, regexp_replace(source_id, 'CZTRAINR-[0-9]{4}-', 'CZTRAINR-')
+                ORDER BY substring(source_id from 'CZTRAINR-([0-9]{4})-')::integer DESC, id DESC
+              ) AS route_variant_rank
+            FROM routes
+            WHERE COALESCE(source_id, '') ~ 'CZTRAINR-[0-9]{4}-'
+          ) ranked_route_variants
+          WHERE route_variant_rank = 1
+        ),
         first_legs AS (
           SELECT
             st_from.trip_id AS first_trip_id,
@@ -1988,6 +2020,10 @@ async fn one_transfer_journeys_db(
           JOIN routes r ON r.id = t.route_id
           WHERE st_from.stop_id = ANY($1)
             AND st_from.departure_time >= $3
+            AND (
+              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
+              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+            )
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_mid.drop_off_type, 0) = 0
           ORDER BY st_mid.arrival_time ASC
@@ -2056,6 +2092,10 @@ async fn one_transfer_journeys_db(
             AND st_transfer.trip_id <> transfer_stops.first_trip_id
             AND st_transfer.departure_time >= transfer_stops.first_arrival_time + $6
             AND st_transfer.departure_time <= transfer_stops.first_arrival_time + $7
+            AND (
+              COALESCE(r2.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
+              OR r2.id IN (SELECT route_id FROM current_train_route_variants)
+            )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
         )
