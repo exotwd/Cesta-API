@@ -1721,17 +1721,41 @@ fn journey_identity_key(journey: &Journey) -> String {
         .iter()
         .map(|leg| {
             format!(
-                "{}:{}:{}:{}:{}:{}",
-                leg.trip_id.as_deref().unwrap_or_default(),
-                leg.route_id.as_deref().unwrap_or_default(),
-                leg.from_stop_id,
-                leg.to_stop_id,
+                "{}:{}:{}:{}:{}",
+                public_route_key(leg.route_id.as_deref()),
+                canonical_journey_stop_id(&leg.from_stop_id),
+                canonical_journey_stop_id(&leg.to_stop_id),
                 leg.departure_time,
                 leg.arrival_time
             )
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+fn public_route_key(route_id: Option<&str>) -> String {
+    route_id
+        .unwrap_or_default()
+        .split('-')
+        .filter(|part| !(part.len() == 4 && part.chars().all(|ch| ch.is_ascii_digit())))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn canonical_journey_stop_id(stop_id: &str) -> String {
+    let Some((base, suffix)) = stop_id.rsplit_once('-') else {
+        return stop_id.to_string();
+    };
+
+    let looks_like_platform = stop_id.contains("SR70S-CZ-")
+        && suffix.len() <= 4
+        && suffix.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && suffix.chars().all(|ch| ch.is_ascii_alphanumeric());
+    if looks_like_platform {
+        base.to_string()
+    } else {
+        stop_id.to_string()
+    }
 }
 
 async fn resolve_journey_point_db(
@@ -3150,5 +3174,53 @@ mod tests {
         assert!(direct.labels.iter().any(|label| label == "nejjednodussi"));
         assert_eq!(ranked[0].transfer_count, 1);
         assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn ranked_journeys_dedupe_platform_variants_of_same_visible_connection() {
+        let first = Journey {
+            id: "first".to_string(),
+            legs: vec![
+                JourneyLeg {
+                    from_stop_id: "ggu_czptt_gtfs_latest:-SR70S-CZ-35442-2".to_string(),
+                    to_stop_id: "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-7".to_string(),
+                    route_id: Some("ggu_czptt_gtfs_latest:-CZTRAINR-2025-EC-122".to_string()),
+                    trip_id: Some("first-ec-trip".to_string()),
+                    departure_time: 16 * 3600 + 52 * 60,
+                    arrival_time: 18 * 3600 + 60,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+                JourneyLeg {
+                    from_stop_id: "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-2".to_string(),
+                    to_stop_id: "ggu_czptt_gtfs_latest:-SR70S-CZ-57076-13b".to_string(),
+                    route_id: Some("ggu_czptt_gtfs_latest:-CZTRAINR-2025-SC-500".to_string()),
+                    trip_id: Some("first-sc-trip".to_string()),
+                    departure_time: 18 * 3600 + 11 * 60,
+                    arrival_time: 20 * 3600 + 19 * 60,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+            ],
+            departure_time: 16 * 3600 + 52 * 60,
+            arrival_time: 20 * 3600 + 19 * 60,
+            duration_seconds: 3 * 3600 + 27 * 60,
+            transfer_count: 1,
+            walking_distance_meters: 0,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: vec!["s prestupem".to_string()],
+        };
+        let mut duplicate = first.clone();
+        duplicate.id = "duplicate".to_string();
+        duplicate.legs[0].to_stop_id = "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-4".to_string();
+        duplicate.legs[1].from_stop_id = "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-8".to_string();
+        duplicate.legs[0].route_id =
+            Some("ggu_czptt_gtfs_latest:-CZTRAINR-2026-EC-122".to_string());
+
+        let ranked = ranked_journey_results(vec![first, duplicate]);
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].id, "journey-1");
     }
 }
