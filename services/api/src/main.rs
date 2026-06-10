@@ -45,6 +45,7 @@ const DB_STAT_TABLES: &[&str] = &[
     "manual_stop_matches",
     "offline_packages",
 ];
+const MAX_JOURNEY_RESULTS: usize = 5;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 
@@ -1566,58 +1567,136 @@ async fn query_journeys_db(
     }
 
     if journeys.is_empty() {
-        warnings.push("no direct database journeys found for the resolved stops".to_string());
+        warnings.push("no database journeys found for the resolved stops".to_string());
     }
 
     Ok((journeys, warnings))
 }
 
 fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
-    journeys.sort_by_key(|journey| {
-        (
-            journey.arrival_time,
-            journey.duration_seconds,
-            journey.transfer_count,
-            journey.departure_time,
-        )
-    });
+    journeys.sort_by_key(journey_arrival_rank);
 
     let mut seen = HashSet::new();
-    journeys
+    let candidates = journeys
         .into_iter()
         .filter(|journey| {
-            let key = journey
-                .legs
-                .iter()
-                .map(|leg| {
-                    format!(
-                        "{}:{}:{}:{}:{}:{}",
-                        leg.trip_id.as_deref().unwrap_or_default(),
-                        leg.route_id.as_deref().unwrap_or_default(),
-                        leg.from_stop_id,
-                        leg.to_stop_id,
-                        leg.departure_time,
-                        leg.arrival_time
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|");
+            let key = journey_identity_key(journey);
             seen.insert(key)
         })
-        .take(5)
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_keys = HashSet::new();
+    push_ranked_journey(&mut selected, &mut selected_keys, &candidates[0]);
+
+    if let Some(simplest) = candidates.iter().min_by_key(|journey| {
+        (
+            journey.transfer_count,
+            journey.arrival_time,
+            journey.duration_seconds,
+            journey.departure_time,
+        )
+    }) {
+        push_ranked_journey(&mut selected, &mut selected_keys, simplest);
+    }
+
+    let mut transfer_counts = candidates
+        .iter()
+        .map(|journey| journey.transfer_count)
+        .collect::<Vec<_>>();
+    transfer_counts.sort_unstable();
+    transfer_counts.dedup();
+
+    for transfer_count in transfer_counts {
+        if let Some(best_for_transfer_count) = candidates
+            .iter()
+            .filter(|journey| journey.transfer_count == transfer_count)
+            .min_by_key(|journey| journey_arrival_rank(journey))
+        {
+            push_ranked_journey(&mut selected, &mut selected_keys, best_for_transfer_count);
+        }
+    }
+
+    for journey in &candidates {
+        push_ranked_journey(&mut selected, &mut selected_keys, journey);
+    }
+
+    let simplest_key = selected
+        .iter()
+        .min_by_key(|journey| {
+            (
+                journey.transfer_count,
+                journey.arrival_time,
+                journey.duration_seconds,
+                journey.departure_time,
+            )
+        })
+        .map(journey_identity_key);
+    selected.sort_by_key(journey_arrival_rank);
+    selected
+        .into_iter()
         .enumerate()
         .map(|(index, mut journey)| {
             journey.id = format!("journey-{}", index + 1);
+            journey
+                .labels
+                .retain(|label| label != "nejrychlejsi" && label != "nejjednodussi");
             if index == 0 {
-                if !journey.labels.iter().any(|label| label == "nejrychlejsi") {
-                    journey.labels.push("nejrychlejsi".to_string());
-                }
-            } else {
-                journey.labels.retain(|label| label != "nejrychlejsi");
+                journey.labels.push("nejrychlejsi".to_string());
+            }
+            if simplest_key.as_ref() == Some(&journey_identity_key(&journey)) {
+                journey.labels.push("nejjednodussi".to_string());
             }
             journey
         })
         .collect()
+}
+
+fn push_ranked_journey(
+    selected: &mut Vec<Journey>,
+    selected_keys: &mut HashSet<String>,
+    journey: &Journey,
+) {
+    if selected.len() >= MAX_JOURNEY_RESULTS {
+        return;
+    }
+
+    let key = journey_identity_key(journey);
+    if selected_keys.insert(key) {
+        selected.push(journey.clone());
+    }
+}
+
+fn journey_arrival_rank(journey: &Journey) -> (u32, u32, u32, u32) {
+    (
+        journey.arrival_time,
+        journey.duration_seconds,
+        journey.transfer_count,
+        journey.departure_time,
+    )
+}
+
+fn journey_identity_key(journey: &Journey) -> String {
+    journey
+        .legs
+        .iter()
+        .map(|leg| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                leg.trip_id.as_deref().unwrap_or_default(),
+                leg.route_id.as_deref().unwrap_or_default(),
+                leg.from_stop_id,
+                leg.to_stop_id,
+                leg.departure_time,
+                leg.arrival_time
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 async fn resolve_journey_point_db(
@@ -2764,6 +2843,62 @@ mod tests {
         );
     }
 
+    fn test_journey(
+        id: &str,
+        transfer_count: u32,
+        departure_time: u32,
+        arrival_time: u32,
+    ) -> Journey {
+        let legs = if transfer_count == 0 {
+            vec![JourneyLeg {
+                from_stop_id: "praha".to_string(),
+                to_stop_id: "vsetin".to_string(),
+                route_id: Some(format!("route-{id}")),
+                trip_id: Some(format!("trip-{id}")),
+                departure_time,
+                arrival_time,
+                mode: TransportMode::Train,
+                warnings: Vec::new(),
+            }]
+        } else {
+            vec![
+                JourneyLeg {
+                    from_stop_id: "praha".to_string(),
+                    to_stop_id: format!("transfer-{id}"),
+                    route_id: Some(format!("feeder-route-{id}")),
+                    trip_id: Some(format!("feeder-trip-{id}")),
+                    departure_time,
+                    arrival_time: departure_time + 3600,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+                JourneyLeg {
+                    from_stop_id: format!("transfer-{id}"),
+                    to_stop_id: "vsetin".to_string(),
+                    route_id: Some(format!("route-{id}")),
+                    trip_id: Some(format!("trip-{id}")),
+                    departure_time: departure_time + 3900,
+                    arrival_time,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+            ]
+        };
+
+        Journey {
+            id: id.to_string(),
+            legs,
+            departure_time,
+            arrival_time,
+            duration_seconds: arrival_time.saturating_sub(departure_time),
+            transfer_count,
+            walking_distance_meters: 0,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: Vec::new(),
+        }
+    }
+
     #[test]
     fn ranked_journeys_prefer_earliest_arrival_over_earliest_departure() {
         let slow_direct = Journey {
@@ -2828,5 +2963,32 @@ mod tests {
         assert_eq!(ranked[0].transfer_count, 1);
         assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
         assert!(!ranked[1].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn ranked_journeys_keep_simplest_direct_route_when_transfers_are_faster() {
+        let mut journeys = (0..6)
+            .map(|index| {
+                test_journey(
+                    &format!("fast-transfer-{index}"),
+                    1,
+                    5 * 3600 + index * 60,
+                    8 * 3600 + index * 60,
+                )
+            })
+            .collect::<Vec<_>>();
+        journeys.push(test_journey("direct", 0, 4 * 3600, 9 * 3600));
+
+        let ranked = ranked_journey_results(journeys);
+
+        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
+        assert!(ranked.iter().any(|journey| journey.transfer_count == 0));
+        let direct = ranked
+            .iter()
+            .find(|journey| journey.transfer_count == 0)
+            .unwrap();
+        assert!(direct.labels.iter().any(|label| label == "nejjednodussi"));
+        assert_eq!(ranked[0].transfer_count, 1);
+        assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
     }
 }
