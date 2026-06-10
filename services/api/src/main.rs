@@ -46,6 +46,7 @@ const DB_STAT_TABLES: &[&str] = &[
     "offline_packages",
 ];
 const MAX_JOURNEY_RESULTS: usize = 5;
+const SERVICE_DAY_SECONDS: u32 = 24 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 
@@ -1547,30 +1548,58 @@ async fn query_journeys_db(
             .await?,
         );
     }
-    journeys = ranked_journey_results(journeys);
 
-    if journeys.is_empty() && departure_time > 0 {
-        journeys = direct_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters).await?;
+    if departure_time > 0 {
+        let mut next_service_day_journeys =
+            direct_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters).await?;
         if body.max_transfers > 0 {
-            journeys.append(
+            next_service_day_journeys.append(
                 &mut one_transfer_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters)
                     .await?,
             );
         }
-        journeys = ranked_journey_results(journeys);
-        if !journeys.is_empty() {
+        let mut next_service_day_journeys =
+            next_service_day_journey_results(next_service_day_journeys, departure_time);
+        if !next_service_day_journeys.is_empty() {
+            journeys.append(&mut next_service_day_journeys);
             warnings.push(
-                "no departures were found after the requested time; returned earliest service-day journeys"
+                "included next service-day journeys because early-morning departures occur after the requested time"
                     .to_string(),
             );
         }
     }
+    journeys = ranked_journey_results(journeys);
 
     if journeys.is_empty() {
         warnings.push("no database journeys found for the resolved stops".to_string());
     }
 
     Ok((journeys, warnings))
+}
+
+fn next_service_day_journey_results(
+    journeys: Vec<Journey>,
+    requested_departure_time: u32,
+) -> Vec<Journey> {
+    journeys
+        .into_iter()
+        .filter(|journey| journey.departure_time < requested_departure_time)
+        .map(|journey| shift_journey_service_day(journey, SERVICE_DAY_SECONDS))
+        .collect()
+}
+
+fn shift_journey_service_day(mut journey: Journey, offset_seconds: u32) -> Journey {
+    journey.departure_time = journey.departure_time.saturating_add(offset_seconds);
+    journey.arrival_time = journey.arrival_time.saturating_add(offset_seconds);
+    journey.duration_seconds = journey.arrival_time.saturating_sub(journey.departure_time);
+    if !journey.labels.iter().any(|label| label == "dalsi den") {
+        journey.labels.push("dalsi den".to_string());
+    }
+    for leg in &mut journey.legs {
+        leg.departure_time = leg.departure_time.saturating_add(offset_seconds);
+        leg.arrival_time = leg.arrival_time.saturating_add(offset_seconds);
+    }
+    journey
 }
 
 fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
@@ -1804,7 +1833,16 @@ async fn direct_journeys_db(
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH candidate_legs AS (
+        WITH latest_import_runs AS (
+          SELECT DISTINCT ON (summary->>'feed_id')
+            summary->>'feed_id' AS source_feed_id,
+            id AS import_run_id
+          FROM import_runs
+          WHERE status = 'success'
+            AND summary ? 'feed_id'
+          ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
+        ),
+        candidate_legs AS (
           SELECT
             st_from.trip_id,
             r.id AS route_id,
@@ -1812,6 +1850,7 @@ async fn direct_journeys_db(
             st_to.stop_id AS to_stop_id,
             st_from.departure_time,
             st_to.arrival_time,
+            lir.import_run_id IS NOT NULL AS from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
@@ -1827,6 +1866,9 @@ async fn direct_journeys_db(
             ON st_to.trip_id = st_from.trip_id
            AND st_to.stop_sequence > st_from.stop_sequence
           JOIN trips t ON t.id = st_from.trip_id
+          LEFT JOIN latest_import_runs lir
+            ON lir.source_feed_id = t.source_feed_id
+           AND lir.import_run_id = t.import_run_id
           JOIN routes r ON r.id = t.route_id
           WHERE st_from.stop_id = ANY($1)
             AND st_to.stop_id = ANY($2)
@@ -1845,6 +1887,12 @@ async fn direct_journeys_db(
         FROM candidate_legs
         WHERE public_mode <> 'unknown'
           AND ($4 = false OR public_mode = ANY($5))
+          AND (
+            from_latest_import
+            OR NOT EXISTS (
+              SELECT 1 FROM candidate_legs latest_candidates WHERE latest_candidates.from_latest_import
+            )
+          )
         ORDER BY arrival_time ASC, departure_time ASC
         LIMIT 5
         "#,
@@ -1897,7 +1945,16 @@ async fn one_transfer_journeys_db(
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH first_legs AS (
+        WITH latest_import_runs AS (
+          SELECT DISTINCT ON (summary->>'feed_id')
+            summary->>'feed_id' AS source_feed_id,
+            id AS import_run_id
+          FROM import_runs
+          WHERE status = 'success'
+            AND summary ? 'feed_id'
+          ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
+        ),
+        first_legs AS (
           SELECT
             st_from.trip_id AS first_trip_id,
             r.id AS first_route_id,
@@ -1908,6 +1965,7 @@ async fn one_transfer_journeys_db(
             s_mid.normalized_name AS transfer_normalized_name,
             s_mid.lat AS transfer_lat,
             s_mid.lon AS transfer_lon,
+            lir.import_run_id IS NOT NULL AS first_from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
@@ -1924,6 +1982,9 @@ async fn one_transfer_journeys_db(
            AND st_mid.stop_sequence > st_from.stop_sequence
           JOIN stops s_mid ON s_mid.id = st_mid.stop_id
           JOIN trips t ON t.id = st_from.trip_id
+          LEFT JOIN latest_import_runs lir
+            ON lir.source_feed_id = t.source_feed_id
+           AND lir.import_run_id = t.import_run_id
           JOIN routes r ON r.id = t.route_id
           WHERE st_from.stop_id = ANY($1)
             AND st_from.departure_time >= $3
@@ -1969,6 +2030,8 @@ async fn one_transfer_journeys_db(
             st_to.stop_id AS second_to_stop_id,
             st_transfer.departure_time AS second_departure_time,
             st_to.arrival_time AS second_arrival_time,
+            transfer_stops.first_from_latest_import
+              AND lir2.import_run_id IS NOT NULL AS from_latest_import,
             CASE
               WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 THEN 'tram'
@@ -1985,6 +2048,9 @@ async fn one_transfer_journeys_db(
             ON st_to.trip_id = st_transfer.trip_id
            AND st_to.stop_sequence > st_transfer.stop_sequence
           JOIN trips t2 ON t2.id = st_transfer.trip_id
+          LEFT JOIN latest_import_runs lir2
+            ON lir2.source_feed_id = t2.source_feed_id
+           AND lir2.import_run_id = t2.import_run_id
           JOIN routes r2 ON r2.id = t2.route_id
           WHERE st_to.stop_id = ANY($2)
             AND st_transfer.trip_id <> transfer_stops.first_trip_id
@@ -1997,6 +2063,12 @@ async fn one_transfer_journeys_db(
         FROM candidate_journeys
         WHERE second_mode <> 'unknown'
           AND ($4 = false OR second_mode = ANY($5))
+          AND (
+            from_latest_import
+            OR NOT EXISTS (
+              SELECT 1 FROM candidate_journeys latest_candidates WHERE latest_candidates.from_latest_import
+            )
+          )
         ORDER BY second_arrival_time ASC, first_departure_time ASC
         LIMIT 20
         "#,
@@ -2987,6 +3059,25 @@ mod tests {
         assert_eq!(ranked[0].transfer_count, 1);
         assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
         assert!(!ranked[1].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn next_service_day_journeys_shift_early_departures_after_evening_search() {
+        let next_morning = test_journey("next-morning", 0, 4 * 3600, 8 * 3600);
+        let same_evening = test_journey("same-evening", 0, 20 * 3600, 23 * 3600);
+
+        let journeys =
+            next_service_day_journey_results(vec![next_morning, same_evening], 19 * 3600 + 24 * 60);
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].departure_time, SERVICE_DAY_SECONDS + 4 * 3600);
+        assert_eq!(journeys[0].arrival_time, SERVICE_DAY_SECONDS + 8 * 3600);
+        assert_eq!(journeys[0].duration_seconds, 4 * 3600);
+        assert!(journeys[0].labels.iter().any(|label| label == "dalsi den"));
+        assert_eq!(
+            journeys[0].legs[0].departure_time,
+            SERVICE_DAY_SECONDS + 4 * 3600
+        );
     }
 
     #[test]

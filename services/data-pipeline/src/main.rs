@@ -844,6 +844,7 @@ async fn export_dataset_to_postgres(
               source_priority = EXCLUDED.source_priority,
               is_active = EXCLUDED.is_active
             WHERE (
+              stops.import_run_id,
               stops.source_feed_id,
               stops.name,
               stops.normalized_name,
@@ -856,6 +857,7 @@ async fn export_dataset_to_postgres(
               stops.source_priority,
               stops.is_active
             ) IS DISTINCT FROM (
+              EXCLUDED.import_run_id,
               EXCLUDED.source_feed_id,
               EXCLUDED.name,
               EXCLUDED.normalized_name,
@@ -953,6 +955,7 @@ async fn export_dataset_to_postgres(
               source_priority = EXCLUDED.source_priority,
               is_active = true
             WHERE (
+              routes.import_run_id,
               routes.source_feed_id,
               routes.agency_id,
               routes.short_name,
@@ -964,6 +967,7 @@ async fn export_dataset_to_postgres(
               routes.source_priority,
               routes.is_active
             ) IS DISTINCT FROM (
+              EXCLUDED.import_run_id,
               EXCLUDED.source_feed_id,
               EXCLUDED.agency_id,
               EXCLUDED.short_name,
@@ -1093,6 +1097,8 @@ async fn export_dataset_to_postgres(
         .await?;
     }
 
+    let stale_cleanup = prune_stale_feed_schedule_rows(pool, feed_id, import_run_id).await?;
+
     let summary = serde_json::json!({
         "exported": true,
         "import_run_id": import_run_id,
@@ -1110,6 +1116,7 @@ async fn export_dataset_to_postgres(
         "trips": trips.len(),
         "stop_times": inserted_stop_times,
         "skipped_stop_times": skipped_stop_times,
+        "stale_cleanup": stale_cleanup,
         "validation_issues": dataset.validation_issues.len()
     });
 
@@ -1131,6 +1138,57 @@ async fn export_dataset_to_postgres(
         "import_run_id": import_run_id,
         "summary": summary,
         "visible_stops_for_feed": visible_stops
+    }))
+}
+
+async fn prune_stale_feed_schedule_rows(
+    pool: &PgPool,
+    feed_id: &str,
+    import_run_id: Uuid,
+) -> Result<serde_json::Value> {
+    let deleted_stop_times = sqlx::query(
+        r#"
+        DELETE FROM stop_times
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_trips = sqlx::query(
+        r#"
+        DELETE FROM trips
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_routes = sqlx::query(
+        r#"
+        DELETE FROM routes
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(serde_json::json!({
+        "deleted_stop_times": deleted_stop_times,
+        "deleted_trips": deleted_trips,
+        "deleted_routes": deleted_routes
     }))
 }
 
@@ -1173,12 +1231,14 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           headsign = EXCLUDED.headsign,
           source_priority = EXCLUDED.source_priority
         WHERE (
+          trips.import_run_id,
           trips.source_feed_id,
           trips.route_id,
           trips.service_id,
           trips.headsign,
           trips.source_priority
         ) IS DISTINCT FROM (
+          EXCLUDED.import_run_id,
           EXCLUDED.source_feed_id,
           EXCLUDED.route_id,
           EXCLUDED.service_id,
@@ -1245,6 +1305,7 @@ async fn flush_stop_time_batch(
           source_feed_id = EXCLUDED.source_feed_id,
           source_priority = EXCLUDED.source_priority
         WHERE (
+          stop_times.import_run_id,
           stop_times.stop_id,
           stop_times.arrival_time,
           stop_times.departure_time,
@@ -1256,6 +1317,7 @@ async fn flush_stop_time_batch(
           stop_times.source_feed_id,
           stop_times.source_priority
         ) IS DISTINCT FROM (
+          EXCLUDED.import_run_id,
           EXCLUDED.stop_id,
           EXCLUDED.arrival_time,
           EXCLUDED.departure_time,
