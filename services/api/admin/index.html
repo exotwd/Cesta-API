@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Cesta Data Admin</title>
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/admin/assets/admin.css">
+</head>
+<body>
+  <section class="login-screen" id="login-screen">
+    <form class="login-panel" id="login-form">
+      <div class="brand-lockup">
+        <span class="brand-mark">C</span>
+        <div>
+          <strong>Cesta</strong>
+          <span>Data administration</span>
+        </div>
+      </div>
+      <div class="login-heading">
+        <h1>Administrator sign in</h1>
+        <p>Use an account with the <code>admin</code> or <code>data_admin</code> role.</p>
+      </div>
+      <label>
+        Email
+        <input id="login-email" name="email" type="email" autocomplete="username" required>
+      </label>
+      <label>
+        Password
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="button primary" type="submit">
+        <i data-lucide="log-in"></i>
+        Sign in
+      </button>
+      <p class="form-error" id="login-error" role="alert"></p>
+    </form>
+  </section>
+
+  <div class="app-shell hidden" id="app-shell">
+    <aside class="sidebar">
+      <div class="brand-lockup sidebar-brand">
+        <span class="brand-mark">C</span>
+        <div>
+          <strong>Cesta</strong>
+          <span>Data admin</span>
+        </div>
+      </div>
+      <nav class="nav-list" aria-label="Admin navigation">
+        <button class="nav-item active" data-view="dashboard">
+          <i data-lucide="layout-dashboard"></i><span>Overview</span>
+        </button>
+        <button class="nav-item" data-view="data">
+          <i data-lucide="database"></i><span>Data browser</span>
+        </button>
+        <button class="nav-item" data-view="map">
+          <i data-lucide="map"></i><span>Stop map</span>
+        </button>
+        <button class="nav-item" data-view="imports">
+          <i data-lucide="download"></i><span>Imports</span>
+        </button>
+        <button class="nav-item" data-view="quality">
+          <i data-lucide="shield-check"></i><span>Data quality</span>
+        </button>
+        <button class="nav-item" data-view="sources">
+          <i data-lucide="radio-tower"></i><span>Source feeds</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-block">
+          <span class="avatar" id="user-avatar">A</span>
+          <div>
+            <strong id="user-name">Administrator</strong>
+            <span id="user-email"></span>
+          </div>
+        </div>
+        <button class="icon-button" id="logout-button" title="Sign out" aria-label="Sign out">
+          <i data-lucide="log-out"></i>
+        </button>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="mobile-menu" title="Menu" aria-label="Open menu">
+          <i data-lucide="menu"></i>
+        </button>
+        <div>
+          <h1 id="page-title">Overview</h1>
+          <p id="page-subtitle">Transport database status and recent activity</p>
+        </div>
+        <div class="topbar-actions">
+          <span class="status-chip" id="api-status"><span></span>Connected</span>
+          <button class="icon-button" id="refresh-button" title="Refresh current view" aria-label="Refresh current view">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="view active" id="view-dashboard">
+          <div class="metric-grid" id="dashboard-metrics">
+            <div class="metric skeleton"></div>
+            <div class="metric skeleton"></div>
+            <div class="metric skeleton"></div>
+            <div class="metric skeleton"></div>
+          </div>
+          <div class="dashboard-grid">
+            <section class="panel span-2">
+              <div class="panel-header">
+                <div><h2>Database tables</h2><p>Tracked rows and storage usage</p></div>
+                <button class="text-button" data-jump="data">Open browser</button>
+              </div>
+              <div class="table-wrap compact" id="dashboard-tables"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-header">
+                <div><h2>Latest imports</h2><p>Most recent pipeline runs</p></div>
+                <button class="text-button" data-jump="imports">View all</button>
+              </div>
+              <div class="activity-list" id="dashboard-imports"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-header">
+                <div><h2>Source coverage</h2><p>Rows grouped by feed</p></div>
+                <button class="text-button" data-jump="sources">Manage</button>
+              </div>
+              <div class="source-summary" id="dashboard-sources"></div>
+            </section>
+            <section class="panel span-2">
+              <div class="panel-header">
+                <div><h2>Quality status</h2><p>Current validation and geocoding signals</p></div>
+                <button class="text-button" data-jump="quality">Inspect issues</button>
+              </div>
+              <div class="quality-strip" id="dashboard-quality"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-data">
+          <div class="toolbar">
+            <label class="field compact-field">
+              Entity
+              <select id="entity-select"></select>
+            </label>
+            <label class="search-field">
+              <i data-lucide="search"></i>
+              <input id="entity-search" type="search" placeholder="Search values">
+            </label>
+            <label class="field compact-field">
+              Rows
+              <select id="entity-page-size">
+                <option>25</option>
+                <option selected>50</option>
+                <option>100</option>
+                <option>200</option>
+              </select>
+            </label>
+            <button class="button" id="entity-reload"><i data-lucide="refresh-cw"></i>Reload</button>
+          </div>
+          <section class="panel table-panel">
+            <div class="table-summary">
+              <strong id="entity-title">Data</strong>
+              <span id="entity-count"></span>
+            </div>
+            <div class="table-wrap data-table-wrap" id="entity-table"></div>
+            <div class="pagination">
+              <button class="button" id="page-previous"><i data-lucide="chevron-left"></i>Previous</button>
+              <span id="page-status">Page 1</span>
+              <button class="button" id="page-next">Next<i data-lucide="chevron-right"></i></button>
+            </div>
+          </section>
+        </section>
+
+        <section class="view map-view" id="view-map">
+          <div class="toolbar map-toolbar">
+            <label class="search-field">
+              <i data-lucide="search"></i>
+              <input id="map-search" type="search" placeholder="Stop name, municipality or ID">
+            </label>
+            <label class="field compact-field">
+              Source
+              <select id="map-source"><option value="">All sources</option></select>
+            </label>
+            <button class="button primary" id="map-load"><i data-lucide="scan"></i>Load visible area</button>
+          </div>
+          <div class="map-layout">
+            <div id="stop-map" aria-label="Map of transport stops"></div>
+            <aside class="map-results">
+              <div class="panel-header">
+                <div><h2>Visible stops</h2><p id="map-result-count">No stops loaded</p></div>
+              </div>
+              <div class="map-result-list" id="map-result-list"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-imports">
+          <div class="section-heading">
+            <div><h2>Import history</h2><p>Pipeline runs and imported feed summaries</p></div>
+            <button class="button" id="show-import-command"><i data-lucide="terminal"></i>Import command</button>
+          </div>
+          <section class="panel table-panel">
+            <div class="table-wrap" id="imports-table"></div>
+          </section>
+        </section>
+
+        <section class="view" id="view-quality">
+          <div class="metric-grid quality-metrics" id="quality-metrics"></div>
+          <div class="dashboard-grid">
+            <section class="panel">
+              <div class="panel-header"><div><h2>Issue categories</h2><p>Grouped validation findings</p></div></div>
+              <div class="table-wrap compact" id="quality-codes"></div>
+            </section>
+            <section class="panel span-2">
+              <div class="panel-header"><div><h2>Latest validation issues</h2><p>Newest pipeline findings</p></div></div>
+              <div class="table-wrap" id="quality-issues"></div>
+            </section>
+            <section class="panel span-3">
+              <div class="panel-header">
+                <div><h2>Unresolved stops</h2><p>Missing or unresolved coordinates</p></div>
+                <button class="text-button" data-jump="map">Open map</button>
+              </div>
+              <div class="table-wrap" id="unresolved-stops"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-sources">
+          <div class="section-heading">
+            <div><h2>Source feeds</h2><p>Control enabled feeds and import priority</p></div>
+          </div>
+          <div class="source-editor-list" id="source-editor-list"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="detail-dialog">
+    <div class="dialog-header">
+      <div><h2 id="detail-title">Record details</h2><p id="detail-subtitle"></p></div>
+      <button class="icon-button" id="detail-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+    <pre id="detail-json"></pre>
+  </dialog>
+
+  <dialog id="command-dialog">
+    <div class="dialog-header">
+      <div><h2>Run a full data import</h2><p>Execute from the repository root or deployment host.</p></div>
+      <button class="icon-button" id="command-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+    <code class="command-block">docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest</code>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="/admin/assets/admin.js"></script>
+</body>
+</html>

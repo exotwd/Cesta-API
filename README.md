@@ -1,6 +1,6 @@
 # Cesta API
 
-Cesta API is an API-only backend foundation for Czech public transport data. It is designed for future mobile apps, web apps, public QR departure boards and admin tools, but this repository intentionally contains no frontend application.
+Cesta API is the backend foundation for Czech public transport data. It includes an embedded operational admin interface while keeping passenger-facing mobile and web applications outside this repository.
 
 ## What Is Implemented
 
@@ -10,6 +10,7 @@ Cesta API is an API-only backend foundation for Czech public transport data. It 
 - GTFS importer crate that parses core GTFS files from zip archives and validates common data-quality issues.
 - GGU latest downloader/import CLI foundation for `https://data.jr.ggu.cz/results/latest/`.
 - API endpoints for health, metadata, auth, user data, stops, departures, journeys, realtime status, offline packages, tickets, public boards and admin import/data-quality status.
+- Embedded administrator interface for database browsing, stop maps, import history, validation issues and source-feed management.
 - PostgreSQL/PostGIS migrations for accounts, transport data, imports, validation and offline packages.
 - Docker Compose for PostgreSQL/PostGIS, Redis, API, data pipeline and realtime worker.
 - GitHub Actions CI for formatting, tests and clippy.
@@ -85,6 +86,25 @@ Admin database stats are available after logging in:
 $login = Invoke-RestMethod -Method Post http://localhost:8070/auth/login -ContentType "application/json" -Body '{"email":"admin@example.com","password":"change-me-locally"}'
 Invoke-RestMethod http://localhost:8070/admin/database/stats -Headers @{ Authorization = "Bearer $($login.access_token)" }
 ```
+
+## Admin interface
+
+Start the API with an administrator bootstrap account configured, then open:
+
+```text
+http://localhost:8070/admin
+```
+
+The interface provides:
+
+- Database totals and table sizes.
+- Paginated, searchable views of imported and account-related entities.
+- A map of active stops with source and viewport filtering.
+- Import history and validation issue details.
+- Unresolved-stop and duplicate-group indicators.
+- Source-feed enablement, URL and priority management.
+
+Password hashes and refresh-token hashes are redacted from administrator data-browser responses.
 
 ## Example Calls
 

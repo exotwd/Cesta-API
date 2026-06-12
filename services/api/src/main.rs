@@ -12,9 +12,9 @@ use argon2::{
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
 use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
@@ -51,6 +51,49 @@ const MAX_TRANSFER_JOURNEY_CANDIDATES: i64 = 40;
 const SERVICE_DAY_SECONDS: u32 = 24 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
+const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
+const ADMIN_MAX_PAGE_SIZE: usize = 200;
+const ADMIN_MAX_MAP_STOPS: usize = 5000;
+
+struct AdminEntitySpec {
+    key: &'static str,
+    table: &'static str,
+    label: &'static str,
+    row_expression: &'static str,
+    order_by: &'static str,
+    map_available: bool,
+}
+
+#[rustfmt::skip]
+const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
+    AdminEntitySpec { key: "import_runs", table: "import_runs", label: "Import runs", row_expression: "to_jsonb(t)", order_by: "started_at DESC", map_available: false },
+    AdminEntitySpec { key: "source_feeds", table: "source_feeds", label: "Source feeds", row_expression: "to_jsonb(t)", order_by: "priority ASC, id ASC", map_available: false },
+    AdminEntitySpec { key: "agencies", table: "agencies", label: "Agencies", row_expression: "to_jsonb(t)", order_by: "name ASC, id ASC", map_available: false },
+    AdminEntitySpec { key: "operators", table: "operators", label: "Operators", row_expression: "to_jsonb(t)", order_by: "name ASC, id ASC", map_available: false },
+    AdminEntitySpec { key: "stop_areas", table: "stop_areas", label: "Stop areas", row_expression: "to_jsonb(t) - 'geom'", order_by: "name ASC, id ASC", map_available: true },
+    AdminEntitySpec { key: "stops", table: "stops", label: "Stops", row_expression: "to_jsonb(t) - 'geom'", order_by: "name ASC, platform_code ASC NULLS FIRST, id ASC", map_available: true },
+    AdminEntitySpec { key: "stop_source_ids", table: "stop_source_ids", label: "Stop source IDs", row_expression: "to_jsonb(t)", order_by: "stop_id ASC, priority ASC", map_available: false },
+    AdminEntitySpec { key: "routes", table: "routes", label: "Routes", row_expression: "to_jsonb(t)", order_by: "source_priority ASC, short_name ASC NULLS LAST, id ASC", map_available: false },
+    AdminEntitySpec { key: "trips", table: "trips", label: "Trips", row_expression: "to_jsonb(t)", order_by: "source_priority ASC, id ASC", map_available: false },
+    AdminEntitySpec { key: "stop_times", table: "stop_times", label: "Stop times", row_expression: "to_jsonb(t)", order_by: "trip_id ASC, stop_sequence ASC", map_available: false },
+    AdminEntitySpec { key: "calendars", table: "calendars", label: "Calendars", row_expression: "to_jsonb(t)", order_by: "service_id ASC", map_available: false },
+    AdminEntitySpec { key: "calendar_dates", table: "calendar_dates", label: "Calendar exceptions", row_expression: "to_jsonb(t)", order_by: "date DESC, service_id ASC", map_available: false },
+    AdminEntitySpec { key: "transfers", table: "transfers", label: "Transfers", row_expression: "to_jsonb(t)", order_by: "from_stop_id ASC, to_stop_id ASC", map_available: false },
+    AdminEntitySpec { key: "shapes", table: "shapes", label: "Shapes", row_expression: "to_jsonb(t) - 'geom'", order_by: "shape_id ASC, shape_pt_sequence ASC", map_available: true },
+    AdminEntitySpec { key: "realtime_updates", table: "realtime_updates", label: "Realtime updates", row_expression: "to_jsonb(t) - 'vehicle_position'", order_by: "fetched_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "manual_stop_matches", table: "manual_stop_matches", label: "Manual stop matches", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: true },
+    AdminEntitySpec { key: "validation_issues", table: "validation_issues", label: "Validation issues", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "offline_packages", table: "offline_packages", label: "Offline packages", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id ASC", map_available: false },
+    AdminEntitySpec { key: "ticket_products_mock", table: "ticket_products_mock", label: "Mock ticket products", row_expression: "to_jsonb(t)", order_by: "id ASC", map_available: false },
+    AdminEntitySpec { key: "users", table: "users", label: "Users", row_expression: "to_jsonb(t) - 'password_hash'", order_by: "created_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "user_profiles", table: "user_profiles", label: "User profiles", row_expression: "to_jsonb(t)", order_by: "user_id ASC", map_available: false },
+    AdminEntitySpec { key: "saved_places", table: "saved_places", label: "Saved places", row_expression: "to_jsonb(t)", order_by: "updated_at DESC, id DESC", map_available: true },
+    AdminEntitySpec { key: "favorite_stops", table: "favorite_stops", label: "Favorite stops", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "favorite_routes", table: "favorite_routes", label: "Favorite routes", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "notification_preferences", table: "notification_preferences", label: "Notification preferences", row_expression: "to_jsonb(t)", order_by: "user_id ASC, type ASC", map_available: false },
+    AdminEntitySpec { key: "user_sessions", table: "user_sessions", label: "User sessions", row_expression: "to_jsonb(t) - 'refresh_token_hash'", order_by: "created_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "user_roles", table: "user_roles", label: "User roles", row_expression: "to_jsonb(t)", order_by: "user_id ASC, role ASC", map_available: false },
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -220,6 +263,33 @@ struct JourneyPoint {
     lon: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AdminDataQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminMapQuery {
+    q: Option<String>,
+    source_feed_id: Option<String>,
+    min_lat: Option<f64>,
+    min_lon: Option<f64>,
+    max_lat: Option<f64>,
+    max_lon: Option<f64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSourceFeedPatch {
+    name: Option<String>,
+    url: Option<String>,
+    mode_scope: Option<String>,
+    priority: Option<i32>,
+    enabled: Option<bool>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -355,6 +425,13 @@ fn build_router(state: AppState) -> Router {
         .route("/offline/packages/{id}/delta", get(offline_package_delta))
         .route("/tickets/recommendation", get(ticket_recommendation))
         .route("/tickets/quote", post(ticket_quote))
+        .route("/admin", get(admin_app))
+        .route("/admin/", get(admin_app))
+        .route("/admin/assets/admin.css", get(admin_css))
+        .route("/admin/assets/admin.js", get(admin_js))
+        .route("/admin/data", get(admin_entities))
+        .route("/admin/data/{entity}", get(admin_entity_rows))
+        .route("/admin/map/stops", get(admin_map_stops))
         .route("/admin/imports", get(admin_imports))
         .route("/admin/imports/{id}", get(admin_import))
         .route("/admin/imports/latest", get(admin_import_latest))
@@ -406,8 +483,32 @@ async fn openapi() -> Json<Value> {
                 "summary": "Search journeys",
                 "description": "Returns ranked direct and one-transfer journey candidates with related stops, routes, trips, stop times, agencies, source feeds and query context."
             }},
+            "/admin": {"get": {
+                "summary": "Cesta data administration interface",
+                "description": "Serves the embedded administrator interface. Admin JSON endpoints require an admin or data_admin access token."
+            }},
+            "/admin/data": {"get": {"summary": "List available administrator data entities"}},
+            "/admin/data/{entity}": {"get": {
+                "summary": "Browse a paginated administrator data entity",
+                "parameters": [
+                    {"name": "entity", "in": "path", "required": true, "schema": {"type": "string"}},
+                    {"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1, "default": 1}},
+                    {"name": "page_size", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}},
+                    {"name": "q", "in": "query", "schema": {"type": "string"}}
+                ]
+            }},
+            "/admin/map/stops": {"get": {
+                "summary": "List active stops for the administrator map",
+                "description": "Returns at most 5000 stops filtered by source, search text and optional map bounds."
+            }},
+            "/admin/imports": {"get": {"summary": "List import runs"}},
+            "/admin/imports/{id}": {"get": {"summary": "Get an import run and its validation issues"}},
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
             "/admin/database/stats": {"get": {"summary": "Database row counts and table sizes"}},
+            "/admin/data-quality": {"get": {"summary": "Validation, duplicate and unresolved-stop metrics"}},
+            "/admin/unmatched-stops": {"get": {"summary": "List active stops with unresolved coordinates"}},
+            "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
+            "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
         }
     }))
@@ -1051,14 +1152,246 @@ async fn ticket_quote() -> Json<Value> {
     Json(json!({"quote": mock_ticket(), "mock": true, "payment_enabled": false}))
 }
 
+async fn admin_app() -> Html<&'static str> {
+    Html(include_str!("../admin/index.html"))
+}
+
+async fn admin_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../admin/admin.css"),
+    )
+}
+
+async fn admin_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../admin/admin.js"),
+    )
+}
+
+async fn admin_entities(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(json!({
+        "entities": ADMIN_ENTITY_SPECS
+            .iter()
+            .map(|entity| json!({
+                "key": entity.key,
+                "label": entity.label,
+                "map_available": entity.map_available
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+async fn admin_entity_rows(
+    Path(entity_key): Path<String>,
+    Query(query): Query<AdminDataQuery>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let entity = ADMIN_ENTITY_SPECS
+        .iter()
+        .find(|entity| entity.key == entity_key)
+        .ok_or_else(not_found)?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "entity": entity.key,
+            "label": entity.label,
+            "rows": [],
+            "pagination": {"page": 1, "page_size": 0, "total_rows": 0, "total_pages": 0},
+            "database_available": false
+        })));
+    };
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query
+        .page_size
+        .unwrap_or(ADMIN_DEFAULT_PAGE_SIZE)
+        .clamp(1, ADMIN_MAX_PAGE_SIZE);
+    let offset = (page - 1).saturating_mul(page_size);
+    let search = query.q.unwrap_or_default().trim().to_string();
+
+    let (total_rows, rows) = if search.is_empty() {
+        let count_sql = format!("SELECT COUNT(*) FROM {}", entity.table);
+        let total_rows = sqlx::query_scalar::<_, i64>(&count_sql)
+            .fetch_one(pool)
+            .await
+            .map_err(internal_error)?;
+        let rows_sql = format!(
+            "SELECT {} AS row FROM {} t ORDER BY {} LIMIT $1 OFFSET $2",
+            entity.row_expression, entity.table, entity.order_by
+        );
+        let rows = sqlx::query(&rows_sql)
+            .bind(page_size as i64)
+            .bind(offset as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(internal_error)?;
+        (total_rows, rows)
+    } else {
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {} t WHERE ({})::text ILIKE $1",
+            entity.table, entity.row_expression
+        );
+        let rows_sql = format!(
+            "SELECT {} AS row FROM {} t WHERE ({})::text ILIKE $1 ORDER BY {} LIMIT $2 OFFSET $3",
+            entity.row_expression, entity.table, entity.row_expression, entity.order_by
+        );
+        let search_pattern = format!("%{search}%");
+        let total_rows = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(&search_pattern)
+            .fetch_one(pool)
+            .await
+            .map_err(internal_error)?;
+        let rows = sqlx::query(&rows_sql)
+            .bind(&search_pattern)
+            .bind(page_size as i64)
+            .bind(offset as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(internal_error)?;
+        (total_rows, rows)
+    };
+
+    let total_pages = if total_rows == 0 {
+        0
+    } else {
+        (total_rows as usize).div_ceil(page_size)
+    };
+    Ok(Json(json!({
+        "entity": entity.key,
+        "label": entity.label,
+        "rows": rows
+            .into_iter()
+            .map(|row| row.get::<Value, _>("row"))
+            .collect::<Vec<_>>(),
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages
+        },
+        "database_available": true
+    })))
+}
+
+async fn admin_map_stops(
+    Query(query): Query<AdminMapQuery>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "stops": [],
+            "database_available": false,
+            "truncated": false
+        })));
+    };
+
+    let search = query.q.unwrap_or_default().trim().to_string();
+    let search_pattern = format!("%{search}%");
+    let limit = query
+        .limit
+        .unwrap_or(ADMIN_MAX_MAP_STOPS)
+        .clamp(1, ADMIN_MAX_MAP_STOPS);
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority
+        FROM stops
+        WHERE is_active = true
+          AND lat IS NOT NULL
+          AND lon IS NOT NULL
+          AND ($1::text IS NULL OR source_feed_id = $1)
+          AND (
+            $2 = ''
+            OR id ILIKE $3
+            OR name ILIKE $3
+            OR normalized_name ILIKE $3
+            OR municipality ILIKE $3
+          )
+          AND ($4::double precision IS NULL OR lat >= $4)
+          AND ($5::double precision IS NULL OR lon >= $5)
+          AND ($6::double precision IS NULL OR lat <= $6)
+          AND ($7::double precision IS NULL OR lon <= $7)
+        ORDER BY source_priority ASC, name ASC, platform_code ASC NULLS FIRST
+        LIMIT $8
+        "#,
+    )
+    .bind(query.source_feed_id)
+    .bind(&search)
+    .bind(&search_pattern)
+    .bind(query.min_lat)
+    .bind(query.min_lon)
+    .bind(query.max_lat)
+    .bind(query.max_lon)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+
+    let stops = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+                "name": row.get::<String, _>("name"),
+                "normalized_name": row.get::<String, _>("normalized_name"),
+                "municipality": row.get::<Option<String>, _>("municipality"),
+                "region": row.get::<Option<String>, _>("region"),
+                "lat": row.get::<f64, _>("lat"),
+                "lon": row.get::<f64, _>("lon"),
+                "coordinate_confidence": row.get::<String, _>("coordinate_confidence"),
+                "coordinate_source": row.get::<Option<String>, _>("coordinate_source"),
+                "stop_area_id": row.get::<Option<String>, _>("stop_area_id"),
+                "platform_code": row.get::<Option<String>, _>("platform_code"),
+                "modes": row.get::<Vec<String>, _>("modes"),
+                "source_priority": row.get::<i32, _>("source_priority")
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "truncated": stops.len() == limit,
+        "limit": limit,
+        "stops": stops,
+        "database_available": true
+    })))
+}
+
 async fn admin_imports(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(
-        json!({"imports": [], "warning": "database import run repository is pending"}),
-    ))
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({"imports": [], "database_available": false})));
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source, status, started_at, finished_at, summary
+        FROM import_runs
+        ORDER BY started_at DESC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(json!({
+        "imports": rows.into_iter().map(import_run_row_json).collect::<Vec<_>>(),
+        "database_available": true
+    })))
 }
 
 async fn admin_import(
@@ -1067,7 +1400,40 @@ async fn admin_import(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"id": id, "status": "unknown"})))
+    let import_id = Uuid::parse_str(&id).map_err(|_| not_found())?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({"id": id, "database_available": false})));
+    };
+    let row = sqlx::query(
+        r#"
+        SELECT id, source, status, started_at, finished_at, summary
+        FROM import_runs
+        WHERE id = $1
+        "#,
+    )
+    .bind(import_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+    let issue_rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, severity, code, message, source_file,
+               affected_entity, raw_payload, created_at
+        FROM validation_issues
+        WHERE import_run_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 500
+        "#,
+    )
+    .bind(import_id)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(json!({
+        "import": import_run_row_json(row),
+        "validation_issues": issue_rows.into_iter().map(validation_issue_row_json).collect::<Vec<_>>()
+    })))
 }
 
 async fn admin_import_latest(
@@ -1075,9 +1441,24 @@ async fn admin_import_latest(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(
-        json!({"latest": null, "warning": "run data is produced by data-pipeline summarize latest"}),
-    ))
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({"latest": null, "database_available": false})));
+    };
+    let row = sqlx::query(
+        r#"
+        SELECT id, source, status, started_at, finished_at, summary
+        FROM import_runs
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(json!({
+        "latest": row.map(import_run_row_json),
+        "database_available": true
+    })))
 }
 
 async fn admin_import_start(
@@ -1115,12 +1496,89 @@ async fn admin_data_quality(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "database_available": false,
+            "mock": state.use_mock_data
+        })));
+    };
+
+    let severity_rows = sqlx::query(
+        r#"
+        SELECT severity, COUNT(*) AS count
+        FROM validation_issues
+        GROUP BY severity
+        ORDER BY severity
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let code_rows = sqlx::query(
+        r#"
+        SELECT code, severity, COUNT(*) AS count
+        FROM validation_issues
+        GROUP BY code, severity
+        ORDER BY count DESC, code ASC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let latest_issue_rows = sqlx::query(
+        r#"
+        SELECT id, import_run_id, source_feed_id, severity, code, message,
+               source_file, affected_entity, raw_payload, created_at
+        FROM validation_issues
+        ORDER BY created_at DESC, id DESC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let unresolved_stops: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM stops
+        WHERE is_active = true
+          AND (lat IS NULL OR lon IS NULL OR coordinate_confidence = 'unresolved')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(internal_error)?;
+    let duplicate_groups: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM (
+          SELECT normalized_name, round(lat::numeric, 5), round(lon::numeric, 5)
+          FROM stops
+          WHERE is_active = true AND lat IS NOT NULL AND lon IS NOT NULL
+          GROUP BY normalized_name, round(lat::numeric, 5), round(lon::numeric, 5)
+          HAVING COUNT(*) > 1
+        ) duplicates
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(internal_error)?;
+
     Ok(Json(json!({
-        "validation_issue_counts": {"warning": 0, "error": 0},
-        "unmatched_stops": 0,
-        "duplicate_candidates": 0,
-        "latest_log_summary": null,
-        "mock": state.use_mock_data
+        "database_available": true,
+        "validation_issue_counts": severity_rows.into_iter().map(|row| json!({
+            "severity": row.get::<String, _>("severity"),
+            "count": row.get::<i64, _>("count")
+        })).collect::<Vec<_>>(),
+        "issue_codes": code_rows.into_iter().map(|row| json!({
+            "code": row.get::<String, _>("code"),
+            "severity": row.get::<String, _>("severity"),
+            "count": row.get::<i64, _>("count")
+        })).collect::<Vec<_>>(),
+        "unresolved_stops": unresolved_stops,
+        "duplicate_stop_groups": duplicate_groups,
+        "latest_issues": latest_issue_rows.into_iter().map(validation_issue_row_json).collect::<Vec<_>>()
     })))
 }
 
@@ -1129,7 +1587,35 @@ async fn admin_unmatched_stops(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"stops": []})))
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({"stops": [], "database_available": false})));
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority, is_active
+        FROM stops
+        WHERE is_active = true
+          AND (lat IS NULL OR lon IS NULL OR coordinate_confidence = 'unresolved')
+        ORDER BY source_priority ASC, name ASC, id ASC
+        LIMIT 1000
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let stops = rows
+        .into_iter()
+        .map(stop_from_row)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal_error)?;
+    let truncated = stops.len() == 1000;
+    Ok(Json(json!({
+        "stops": stops,
+        "database_available": true,
+        "truncated": truncated
+    })))
 }
 
 async fn admin_manual_stop_match(
@@ -1147,16 +1633,62 @@ async fn admin_source_feeds(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(sources().await)
+    let Some(pool) = &state.db else {
+        return Ok(sources().await);
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT id, name, url, type, mode_scope, priority, enabled, created_at
+        FROM source_feeds
+        ORDER BY priority ASC, id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(json!({
+        "sources": rows.into_iter().map(source_feed_row_json).collect::<Vec<_>>(),
+        "database_available": true
+    })))
 }
 
 async fn admin_source_feed_patch(
     Path(id): Path<String>,
     headers: HeaderMap,
     State(state): State<AppState>,
+    Json(body): Json<AdminSourceFeedPatch>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(json!({"id": id, "status":"not_implemented"})))
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({"id": id, "database_available": false})));
+    };
+    let row = sqlx::query(
+        r#"
+        UPDATE source_feeds
+        SET
+          name = COALESCE($2, name),
+          url = COALESCE($3, url),
+          mode_scope = CASE WHEN $4::text IS NULL THEN mode_scope ELSE NULLIF($4, '') END,
+          priority = COALESCE($5, priority),
+          enabled = COALESCE($6, enabled)
+        WHERE id = $1
+        RETURNING id, name, url, type, mode_scope, priority, enabled, created_at
+        "#,
+    )
+    .bind(&id)
+    .bind(body.name.filter(|value| !value.trim().is_empty()))
+    .bind(body.url.filter(|value| !value.trim().is_empty()))
+    .bind(body.mode_scope)
+    .bind(body.priority)
+    .bind(body.enabled)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+    Ok(Json(json!({
+        "source": source_feed_row_json(row),
+        "status": "updated"
+    })))
 }
 
 async fn public_board(Path(stop_id): Path<String>) -> Json<Value> {
@@ -1307,6 +1839,45 @@ fn package_by_id(id: &str) -> Result<OfflinePackage, ApiError> {
         .into_iter()
         .find(|package| package.id == id)
         .ok_or_else(not_found)
+}
+
+fn import_run_row_json(row: sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "source": row.get::<String, _>("source"),
+        "status": row.get::<String, _>("status"),
+        "started_at": row.get::<chrono::DateTime<Utc>, _>("started_at"),
+        "finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
+        "summary": row.get::<Value, _>("summary")
+    })
+}
+
+fn validation_issue_row_json(row: sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": row.get::<Uuid, _>("id"),
+        "import_run_id": row.get::<Option<Uuid>, _>("import_run_id"),
+        "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+        "severity": row.get::<String, _>("severity"),
+        "code": row.get::<String, _>("code"),
+        "message": row.get::<String, _>("message"),
+        "source_file": row.get::<Option<String>, _>("source_file"),
+        "affected_entity": row.get::<Option<String>, _>("affected_entity"),
+        "raw_payload": row.get::<Option<Value>, _>("raw_payload"),
+        "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at")
+    })
+}
+
+fn source_feed_row_json(row: sqlx::postgres::PgRow) -> Value {
+    json!({
+        "id": row.get::<String, _>("id"),
+        "name": row.get::<String, _>("name"),
+        "url": row.get::<String, _>("url"),
+        "type": row.get::<String, _>("type"),
+        "mode_scope": row.get::<Option<String>, _>("mode_scope"),
+        "priority": row.get::<i32, _>("priority"),
+        "enabled": row.get::<bool, _>("enabled"),
+        "created_at": row.get::<chrono::DateTime<Utc>, _>("created_at")
+    })
 }
 
 async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
@@ -3256,6 +3827,42 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_interface_is_served_for_login() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Administrator sign in"));
+        assert!(html.contains("/admin/assets/admin.js"));
+    }
+
+    #[tokio::test]
+    async fn admin_data_endpoint_requires_admin_token() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
