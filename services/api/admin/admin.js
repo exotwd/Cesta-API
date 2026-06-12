@@ -10,14 +10,45 @@
     entityPage: 1,
     entityPages: 0,
     entityPageSize: 50,
+    entityTotalRows: 0,
+    entityRows: [],
+    detailRecord: null,
     map: null,
-    mapLayer: null,
     mapStops: [],
     sources: []
   };
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => [...document.querySelectorAll(selector)];
+  const ENTITY_UI = {
+    import_runs: { group: "Imports", description: "Import executions, status and source summaries.", columns: ["source", "status", "started_at", "finished_at", "id"] },
+    source_feeds: { group: "Sources", description: "Configured timetable and realtime data sources.", columns: ["name", "type", "mode_scope", "priority", "enabled", "id"] },
+    agencies: { group: "Sources", description: "Transport agencies supplied by imported feeds.", columns: ["name", "timezone", "source_feed_id", "source_id", "id"] },
+    operators: { group: "Sources", description: "Operators linked to imported services.", columns: ["name", "source_feed_id", "source_id", "id"] },
+    stop_areas: { group: "Network", description: "Parent station and interchange areas.", columns: ["name", "id", "created_at"] },
+    stops: { group: "Network", description: "Stops, stations, platforms, coordinates and source ownership.", columns: ["name", "municipality", "platform_code", "modes", "coordinate_confidence", "source_feed_id", "id"] },
+    stop_source_ids: { group: "Network", description: "Original feed identifiers retained for each stop.", columns: ["stop_id", "source_feed_id", "original_source_id", "priority", "confidence"] },
+    routes: { group: "Schedule", description: "Public transport routes and their mode and operator metadata.", columns: ["short_name", "long_name", "mode", "source_feed_id", "source_id", "is_active", "id"] },
+    trips: { group: "Schedule", description: "Scheduled vehicle journeys associated with routes and services.", columns: ["headsign", "route_id", "service_id", "source_feed_id", "source_id", "id"] },
+    stop_times: { group: "Schedule", description: "Ordered arrival and departure times for every trip.", columns: ["trip_id", "stop_sequence", "stop_id", "arrival_time", "departure_time", "platform"] },
+    calendars: { group: "Schedule", description: "Regular service-day calendars and validity ranges.", columns: ["service_id", "start_date", "end_date", "monday", "friday", "saturday", "sunday"] },
+    calendar_dates: { group: "Schedule", description: "Service additions and removals on specific dates.", columns: ["service_id", "date", "exception_type", "source_feed_id"] },
+    transfers: { group: "Network", description: "Walking and interchange links between stops.", columns: ["from_stop_id", "to_stop_id", "min_transfer_seconds", "distance_meters", "confidence", "source"] },
+    shapes: { group: "Network", description: "Geographic points defining route paths.", columns: ["shape_id", "shape_pt_sequence", "source_feed_id"] },
+    realtime_updates: { group: "Realtime", description: "Latest delays, cancellations, platforms and vehicle updates.", columns: ["trip_id", "route_id", "stop_id", "delay_seconds", "cancellation_status", "source", "fetched_at"] },
+    manual_stop_matches: { group: "Quality", description: "Administrator-reviewed stop coordinate and identity matches.", columns: ["stop_id", "target_stop_id", "confidence", "note", "created_at", "id"] },
+    validation_issues: { group: "Quality", description: "Importer and database validation findings.", columns: ["severity", "code", "message", "affected_entity", "source_feed_id", "created_at"] },
+    offline_packages: { group: "Distribution", description: "Generated offline transport data packages.", columns: ["name_cs", "version", "valid_from", "valid_until", "size_bytes", "id"] },
+    ticket_products_mock: { group: "Development", description: "Clearly separated mock ticket products used for development.", columns: ["name_cs", "provider", "mock", "id"] },
+    users: { group: "Accounts", description: "User accounts without password hashes.", columns: ["email", "display_name", "status", "created_at", "id"] },
+    user_profiles: { group: "Accounts", description: "User preferences and profile attributes.", columns: ["user_id", "locale", "created_at", "updated_at"] },
+    saved_places: { group: "Accounts", description: "Locations saved by users.", columns: ["name", "type", "user_id", "updated_at", "id"] },
+    favorite_stops: { group: "Accounts", description: "Stops saved as user favorites.", columns: ["user_id", "stop_id", "created_at"] },
+    favorite_routes: { group: "Accounts", description: "Routes saved as user favorites.", columns: ["user_id", "route_id", "created_at"] },
+    notification_preferences: { group: "Accounts", description: "Per-user notification settings.", columns: ["user_id", "type", "enabled", "updated_at"] },
+    user_sessions: { group: "Accounts", description: "Active and revoked account sessions without token hashes.", columns: ["user_id", "device_name", "expires_at", "revoked_at", "created_at", "id"] },
+    user_roles: { group: "Accounts", description: "Roles assigned to user accounts.", columns: ["user_id", "role", "created_at"] }
+  };
 
   function iconRefresh() {
     if (window.lucide) window.lucide.createIcons();
@@ -104,6 +135,49 @@
     return String(value);
   }
 
+  function humanizeField(value) {
+    return String(value)
+      .replaceAll("_", " ")
+      .replace(/\b\w/g, (character) => character.toUpperCase());
+  }
+
+  function formatServiceTime(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds)) return String(value);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = seconds % 60;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}${remaining ? `:${String(remaining).padStart(2, "0")}` : ""}`;
+  }
+
+  function renderCellValue(column, value) {
+    if (value === null || value === undefined || value === "") {
+      return '<span class="missing-value">Missing</span>';
+    }
+    if (typeof value === "boolean") return badge(value ? "Yes" : "No");
+    if (Array.isArray(value)) {
+      if (!value.length) return '<span class="muted-value">None</span>';
+      return `<span class="value-list">${value.slice(0, 3).map((item) => `<span>${escapeHtml(item)}</span>`).join("")}${value.length > 3 ? `<small>+${value.length - 3}</small>` : ""}</span>`;
+    }
+    if (typeof value === "object") {
+      const keys = Object.keys(value);
+      return `<span class="object-value" title="${escapeHtml(JSON.stringify(value))}">${formatNumber(keys.length)} fields</span>`;
+    }
+    if (["arrival_time", "departure_time", "min_transfer_seconds", "duration_seconds"].includes(column) && Number.isFinite(Number(value))) {
+      return `<span class="time-value" title="${escapeHtml(String(value))} seconds">${escapeHtml(formatServiceTime(value))}</span>`;
+    }
+    const text = compactValue(value);
+    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+      return `<span class="cell-value" title="${escapeHtml(value)}">${escapeHtml(formatDate(value))}</span>`;
+    }
+    if (column === "color" || column === "text_color") {
+      const color = String(value).replace(/^#/, "");
+      return `<span class="color-value"><span style="background:#${escapeHtml(color)}"></span>${escapeHtml(color)}</span>`;
+    }
+    const className = column === "id" || column.endsWith("_id") || column === "source_id" ? "cell-value id-value" : "cell-value";
+    return `<span class="${className}" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
+  }
+
   function badge(value) {
     const normalized = String(value || "").toLowerCase();
     const type = ["success", "complete", "completed", "enabled", "ok"].some((item) => normalized.includes(item))
@@ -125,7 +199,7 @@
     const selectedColumns = columns?.length ? columns : Object.keys(rows[0]);
     target.innerHTML = `
       <table>
-        <thead><tr>${selectedColumns.map((column) => `<th>${escapeHtml(column.replaceAll("_", " "))}</th>`).join("")}</tr></thead>
+        <thead><tr>${selectedColumns.map((column) => `<th>${escapeHtml(humanizeField(column))}</th>`).join("")}${options.rowAction ? '<th class="row-action-heading">Record</th>' : ""}</tr></thead>
         <tbody>
           ${rows.map((row, index) => `
             <tr class="${options.clickable ? "clickable-row" : ""}" data-row-index="${index}">
@@ -134,23 +208,33 @@
                 const text = compactValue(value);
                 const display = options.badgeColumns?.includes(column)
                   ? badge(text)
-                  : `<span class="cell-value" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
+                  : renderCellValue(column, value);
                 return `<td>${display}</td>`;
               }).join("")}
+              ${options.rowAction ? '<td class="row-action"><button class="text-button record-view" type="button">View</button></td>' : ""}
             </tr>
           `).join("")}
         </tbody>
       </table>`;
     if (options.clickable) {
       target.querySelectorAll("tbody tr").forEach((rowElement) => {
-        rowElement.addEventListener("click", () => openDetail(options.title || "Record", rows[Number(rowElement.dataset.rowIndex)]));
+        rowElement.addEventListener("click", () => {
+          const record = rows[Number(rowElement.dataset.rowIndex)];
+          openDetail(options.title || "Record", record, record.name || record.short_name || record.id || "");
+        });
       });
     }
   }
 
   function openDetail(title, record, subtitle = "") {
+    state.detailRecord = record;
     $("#detail-title").textContent = title;
     $("#detail-subtitle").textContent = subtitle;
+    $("#detail-fields").innerHTML = Object.entries(record).map(([key, value]) => `
+      <div class="record-field">
+        <span>${escapeHtml(humanizeField(key))}</span>
+        <div>${renderCellValue(key, value)}</div>
+      </div>`).join("");
     $("#detail-json").textContent = JSON.stringify(record, null, 2);
     $("#detail-dialog").showModal();
   }
@@ -159,8 +243,45 @@
     const payload = await api("/admin/data");
     state.entities = payload.entities || [];
     const select = $("#entity-select");
-    select.innerHTML = state.entities.map((entity) => `<option value="${escapeHtml(entity.key)}">${escapeHtml(entity.label)}</option>`).join("");
+    const groups = new Map();
+    state.entities.forEach((entity) => {
+      const group = ENTITY_UI[entity.key]?.group || "Other";
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(entity);
+    });
+    select.innerHTML = [...groups.entries()].map(([group, entities]) => `
+      <optgroup label="${escapeHtml(group)}">
+        ${entities.map((entity) => `<option value="${escapeHtml(entity.key)}">${escapeHtml(entity.label)}</option>`).join("")}
+      </optgroup>`).join("");
     if (state.entities.some((entity) => entity.key === state.entity)) select.value = state.entity;
+    updateEntityContext();
+  }
+
+  function updateEntityContext() {
+    state.entity = $("#entity-select").value || state.entity;
+    const entity = state.entities.find((item) => item.key === state.entity);
+    const ui = ENTITY_UI[state.entity] || {};
+    $("#entity-description").textContent = ui.description || "Browse imported and application records.";
+    $("#entity-search").placeholder = `Search ${String(entity?.label || state.entity).toLowerCase()} by any value`;
+    $("#entity-open-map").classList.toggle("hidden", entity?.key !== "stops");
+  }
+
+  function entityColumns(rows) {
+    const available = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+    if ($("#entity-column-mode").value === "all") return available;
+    const preferred = ENTITY_UI[state.entity]?.columns || ["id", "name", "source_feed_id", "status", "type", "created_at"];
+    const selected = preferred.filter((column) => available.includes(column));
+    return selected.length ? selected : available.slice(0, 8);
+  }
+
+  function renderEntityRows(label = $("#entity-title").textContent) {
+    renderTable("#entity-table", state.entityRows, entityColumns(state.entityRows), {
+      clickable: true,
+      rowAction: true,
+      title: label,
+      badgeColumns: ["status", "severity", "coordinate_confidence", "confidence"],
+      empty: $("#entity-search").value.trim() ? "No records match this search" : "No records are available"
+    });
   }
 
   async function loadDashboard() {
@@ -214,6 +335,7 @@
   async function loadEntityRows(resetPage = false) {
     if (resetPage) state.entityPage = 1;
     state.entity = $("#entity-select").value || state.entity;
+    updateEntityContext();
     state.entityPageSize = Number($("#entity-page-size").value || 50);
     const query = new URLSearchParams({
       page: String(state.entityPage),
@@ -223,82 +345,288 @@
     $("#entity-table").innerHTML = '<div class="loading-state">Loading records…</div>';
     const payload = await api(`/admin/data/${encodeURIComponent(state.entity)}?${query}`);
     state.entityPages = payload.pagination?.total_pages || 0;
+    state.entityTotalRows = payload.pagination?.total_rows || 0;
     $("#entity-title").textContent = payload.label || state.entity;
-    $("#entity-count").textContent = `${formatNumber(payload.pagination?.total_rows)} records`;
+    $("#entity-count").textContent = `${formatNumber(state.entityTotalRows)} records`;
     $("#page-status").textContent = state.entityPages ? `Page ${state.entityPage} of ${state.entityPages}` : "No pages";
     $("#page-previous").disabled = state.entityPage <= 1;
     $("#page-next").disabled = !state.entityPages || state.entityPage >= state.entityPages;
-    const rows = payload.rows || [];
-    const preferred = ["id", "name", "source_feed_id", "source_id", "status", "type", "mode", "short_name", "trip_id", "stop_id", "created_at"];
-    const available = [...new Set(rows.flatMap((row) => Object.keys(row)))];
-    const columns = [...preferred.filter((column) => available.includes(column)), ...available.filter((column) => !preferred.includes(column))].slice(0, 10);
-    renderTable("#entity-table", rows, columns, { clickable: true, title: payload.label, empty: "No matching records" });
+    $("#page-first").disabled = state.entityPage <= 1;
+    $("#page-last").disabled = !state.entityPages || state.entityPage >= state.entityPages;
+    state.entityRows = payload.rows || [];
+    const rangeStart = state.entityRows.length ? (state.entityPage - 1) * state.entityPageSize + 1 : 0;
+    const rangeEnd = state.entityRows.length ? rangeStart + state.entityRows.length - 1 : 0;
+    $("#entity-range").textContent = state.entityRows.length
+      ? `${formatNumber(rangeStart)}-${formatNumber(rangeEnd)} of ${formatNumber(state.entityTotalRows)}`
+      : "No records";
+    $("#entity-search-clear").classList.toggle("hidden", !$("#entity-search").value);
+    renderEntityRows(payload.label || state.entity);
+  }
+
+  function projectCoordinate(lat, lon, zoom) {
+    const worldSize = 256 * (2 ** zoom);
+    const latitude = Math.max(-85.051129, Math.min(85.051129, Number(lat)));
+    const sinLatitude = Math.sin(latitude * Math.PI / 180);
+    return {
+      x: ((Number(lon) + 180) / 360) * worldSize,
+      y: (0.5 - Math.log((1 + sinLatitude) / (1 - sinLatitude)) / (4 * Math.PI)) * worldSize
+    };
+  }
+
+  function unprojectCoordinate(x, y, zoom) {
+    const worldSize = 256 * (2 ** zoom);
+    const longitude = (x / worldSize) * 360 - 180;
+    const latitude = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / worldSize))) * 180 / Math.PI;
+    return { lat: latitude, lon: longitude };
+  }
+
+  function resizeMapCanvas() {
+    if (!state.map) return false;
+    const rect = state.map.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.round(rect.width);
+    const height = Math.round(rect.height);
+    if (state.map.width !== width || state.map.height !== height || state.map.pixelRatio !== pixelRatio) {
+      state.map.width = width;
+      state.map.height = height;
+      state.map.pixelRatio = pixelRatio;
+      state.map.canvas.width = Math.round(width * pixelRatio);
+      state.map.canvas.height = Math.round(height * pixelRatio);
+    }
+    state.map.context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    return true;
+  }
+
+  function mapBounds() {
+    if (!state.map || !resizeMapCanvas()) return null;
+    const center = projectCoordinate(state.map.centerLat, state.map.centerLon, state.map.zoom);
+    const northWest = unprojectCoordinate(center.x - state.map.width / 2, center.y - state.map.height / 2, state.map.zoom);
+    const southEast = unprojectCoordinate(center.x + state.map.width / 2, center.y + state.map.height / 2, state.map.zoom);
+    return {
+      minLat: southEast.lat,
+      minLon: northWest.lon,
+      maxLat: northWest.lat,
+      maxLon: southEast.lon
+    };
+  }
+
+  function loadMapTile(zoom, x, y) {
+    if (!state.map) return null;
+    const tileCount = 2 ** zoom;
+    if (y < 0 || y >= tileCount) return null;
+    const normalizedX = ((x % tileCount) + tileCount) % tileCount;
+    const key = `${zoom}/${normalizedX}/${y}`;
+    if (state.map.tiles.has(key)) return state.map.tiles.get(key);
+    const image = new Image();
+    const tile = { image, loaded: false, failed: false };
+    state.map.tiles.set(key, tile);
+    image.onload = () => {
+      tile.loaded = true;
+      renderMap();
+    };
+    image.onerror = () => {
+      tile.failed = true;
+    };
+    image.src = `https://tile.openstreetmap.org/${zoom}/${normalizedX}/${y}.png`;
+    return tile;
+  }
+
+  function positionMapPopup(stop) {
+    const popup = $("#map-popup");
+    if (!stop || !state.map || stop._mapX === undefined) {
+      popup.classList.add("hidden");
+      return;
+    }
+    popup.innerHTML = `
+      <div class="popup-title">${escapeHtml(stop.name)}</div>
+      <div class="popup-meta">
+        ${escapeHtml(stop.municipality || stop.region || "")}<br>
+        ${stop.platform_code ? `Platform ${escapeHtml(stop.platform_code)}<br>` : ""}
+        ${escapeHtml(stop.source_feed_id || "Unknown source")}<br>
+        ${escapeHtml(stop.id)}
+      </div>`;
+    popup.classList.remove("hidden");
+    const popupWidth = Math.min(280, Math.max(210, popup.offsetWidth));
+    const popupHeight = popup.offsetHeight;
+    popup.style.left = `${Math.max(8, Math.min(state.map.width - popupWidth - 8, stop._mapX + 10))}px`;
+    popup.style.top = `${Math.max(8, Math.min(state.map.height - popupHeight - 8, stop._mapY - popupHeight - 10))}px`;
+  }
+
+  function renderMap() {
+    if (!state.map || !resizeMapCanvas()) return;
+    const { context, width, height, zoom } = state.map;
+    const center = projectCoordinate(state.map.centerLat, state.map.centerLon, zoom);
+    const originX = center.x - width / 2;
+    const originY = center.y - height / 2;
+
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "#dce5e9";
+    context.fillRect(0, 0, width, height);
+
+    const minTileX = Math.floor(originX / 256);
+    const maxTileX = Math.floor((originX + width) / 256);
+    const minTileY = Math.floor(originY / 256);
+    const maxTileY = Math.floor((originY + height) / 256);
+    for (let tileY = minTileY; tileY <= maxTileY; tileY += 1) {
+      for (let tileX = minTileX; tileX <= maxTileX; tileX += 1) {
+        const screenX = tileX * 256 - originX;
+        const screenY = tileY * 256 - originY;
+        const tile = loadMapTile(zoom, tileX, tileY);
+        if (tile?.loaded) {
+          context.drawImage(tile.image, screenX, screenY, 256, 256);
+        } else {
+          context.strokeStyle = "rgba(91, 107, 122, 0.16)";
+          context.strokeRect(Math.round(screenX), Math.round(screenY), 256, 256);
+        }
+      }
+    }
+
+    state.mapStops.forEach((stop) => {
+      const point = projectCoordinate(stop.lat, stop.lon, zoom);
+      stop._mapX = point.x - originX;
+      stop._mapY = point.y - originY;
+      if (stop._mapX < -10 || stop._mapX > width + 10 || stop._mapY < -10 || stop._mapY > height + 10) return;
+      const radius = stop.platform_code ? 4 : 6;
+      context.beginPath();
+      context.arc(stop._mapX, stop._mapY, radius, 0, Math.PI * 2);
+      context.fillStyle = stop.coordinate_confidence === "unresolved" ? "#b42318" : "#1261a0";
+      context.fill();
+      context.lineWidth = 1.5;
+      context.strokeStyle = "#ffffff";
+      context.stroke();
+    });
+    positionMapPopup(state.map.selectedStop);
+  }
+
+  function showMapStop(stop) {
+    if (!stop || !state.map) return;
+    state.map.centerLat = Number(stop.lat);
+    state.map.centerLon = Number(stop.lon);
+    state.map.zoom = Math.max(state.map.zoom, 14);
+    state.map.selectedStop = stop;
+    renderMap();
   }
 
   function ensureMap() {
-    if (state.map || !window.L) return;
-    state.map = L.map("stop-map", { preferCanvas: true }).setView([49.82, 15.48], 7);
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors"
-    }).addTo(state.map);
-    state.mapLayer = L.layerGroup().addTo(state.map);
+    if (state.map) return;
+    const canvas = $("#map-canvas");
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    state.map = {
+      canvas,
+      context,
+      centerLat: 49.82,
+      centerLon: 15.48,
+      zoom: 7,
+      width: 0,
+      height: 0,
+      pixelRatio: 1,
+      tiles: new Map(),
+      selectedStop: null,
+      drag: null
+    };
+
+    canvas.addEventListener("pointerdown", (event) => {
+      const center = projectCoordinate(state.map.centerLat, state.map.centerLon, state.map.zoom);
+      state.map.drag = { x: event.clientX, y: event.clientY, center, moved: false };
+      canvas.setPointerCapture(event.pointerId);
+      canvas.classList.add("dragging");
+    });
+    canvas.addEventListener("pointermove", (event) => {
+      if (!state.map.drag) return;
+      const deltaX = event.clientX - state.map.drag.x;
+      const deltaY = event.clientY - state.map.drag.y;
+      if (Math.abs(deltaX) + Math.abs(deltaY) > 3) state.map.drag.moved = true;
+      const center = unprojectCoordinate(
+        state.map.drag.center.x - deltaX,
+        state.map.drag.center.y - deltaY,
+        state.map.zoom
+      );
+      state.map.centerLat = center.lat;
+      state.map.centerLon = center.lon;
+      state.map.selectedStop = null;
+      renderMap();
+    });
+    canvas.addEventListener("pointerup", (event) => {
+      state.map.justDragged = state.map.drag?.moved || false;
+      state.map.drag = null;
+      canvas.releasePointerCapture(event.pointerId);
+      canvas.classList.remove("dragging");
+    });
+    canvas.addEventListener("click", (event) => {
+      if (state.map.justDragged) {
+        state.map.justDragged = false;
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const stop = state.mapStops
+        .filter((item) => item._mapX !== undefined && Math.hypot(item._mapX - x, item._mapY - y) <= 10)
+        .sort((a, b) => Math.hypot(a._mapX - x, a._mapY - y) - Math.hypot(b._mapX - x, b._mapY - y))[0];
+      state.map.selectedStop = stop || null;
+      renderMap();
+    });
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      state.map.zoom = Math.max(3, Math.min(18, state.map.zoom + (event.deltaY < 0 ? 1 : -1)));
+      state.map.selectedStop = null;
+      renderMap();
+    }, { passive: false });
+    window.addEventListener("resize", renderMap);
+    renderMap();
   }
 
   async function loadMapStops() {
     ensureMap();
-    if (!state.map) {
-      toast("The map library could not be loaded.", "error");
-      return;
-    }
-    const bounds = state.map.getBounds();
+    $("#map-result-count").textContent = "Loading stops...";
+    $("#map-result-list").innerHTML = '<div class="loading-state">Loading stops...</div>';
+    const search = $("#map-search").value.trim();
     const query = new URLSearchParams({
-      q: $("#map-search").value.trim(),
+      q: search,
       source_feed_id: $("#map-source").value,
-      min_lat: String(bounds.getSouth()),
-      min_lon: String(bounds.getWest()),
-      max_lat: String(bounds.getNorth()),
-      max_lon: String(bounds.getEast()),
       limit: "5000"
     });
-    const payload = await api(`/admin/map/stops?${query}`);
-    state.mapStops = payload.stops || [];
-    state.mapLayer.clearLayers();
-    const renderer = L.canvas({ padding: 0.5 });
-    state.mapStops.forEach((stop) => {
-      const marker = L.circleMarker([stop.lat, stop.lon], {
-        renderer,
-        radius: stop.platform_code ? 4 : 6,
-        weight: 1,
-        color: "#ffffff",
-        fillColor: stop.coordinate_confidence === "unresolved" ? "#b42318" : "#1261a0",
-        fillOpacity: 0.82
-      }).bindPopup(`
-        <div class="popup-title">${escapeHtml(stop.name)}</div>
-        <div class="popup-meta">
-          ${escapeHtml(stop.municipality || stop.region || "")}<br>
-          ${stop.platform_code ? `Platform ${escapeHtml(stop.platform_code)}<br>` : ""}
-          ${escapeHtml(stop.source_feed_id || "Unknown source")}<br>
-          ${escapeHtml(stop.id)}
-        </div>`);
-      marker.stopRecord = stop;
-      marker.addTo(state.mapLayer);
-    });
-    $("#map-result-count").textContent = `${formatNumber(state.mapStops.length)} stops${payload.truncated ? " · result limit reached" : ""}`;
-    $("#map-result-list").innerHTML = state.mapStops.slice(0, 250).map((stop, index) => `
-      <button class="map-result" data-index="${index}">
-        <strong>${escapeHtml(stop.name)}${stop.platform_code ? ` · ${escapeHtml(stop.platform_code)}` : ""}</strong>
-        <span>${escapeHtml(stop.municipality || stop.region || stop.source_feed_id || "")}</span>
-      </button>`).join("") || '<div class="empty-state">No stops in the visible area</div>';
-    $$("#map-result-list .map-result").forEach((button) => {
-      button.addEventListener("click", () => {
-        const stop = state.mapStops[Number(button.dataset.index)];
-        state.map.setView([stop.lat, stop.lon], Math.max(state.map.getZoom(), 14));
-        state.mapLayer.eachLayer((layer) => {
-          if (layer.stopRecord?.id === stop.id) layer.openPopup();
-        });
+    const bounds = mapBounds();
+    if (bounds && !search) {
+      query.set("min_lat", String(bounds.minLat));
+      query.set("min_lon", String(bounds.minLon));
+      query.set("max_lat", String(bounds.maxLat));
+      query.set("max_lon", String(bounds.maxLon));
+    }
+
+    try {
+      const payload = await api(`/admin/map/stops?${query}`);
+      if (payload.database_available === false) {
+        state.mapStops = [];
+        renderMap();
+        $("#map-result-count").textContent = "Database unavailable";
+        $("#map-result-list").innerHTML = '<div class="empty-state">Connect the API to its transport database to load stops.</div>';
+        return;
+      }
+      state.mapStops = payload.stops || [];
+      if (state.map) state.map.selectedStop = null;
+      if (search && state.mapStops.length && state.map) {
+        state.map.centerLat = Number(state.mapStops[0].lat);
+        state.map.centerLon = Number(state.mapStops[0].lon);
+        state.map.zoom = Math.max(state.map.zoom, 12);
+      }
+      renderMap();
+      $("#map-result-count").textContent = `${formatNumber(state.mapStops.length)} stops${payload.truncated ? " - result limit reached" : ""}`;
+      $("#map-result-list").innerHTML = state.mapStops.slice(0, 250).map((stop, index) => `
+        <button class="map-result" data-index="${index}">
+          <strong>${escapeHtml(stop.name)}${stop.platform_code ? ` - ${escapeHtml(stop.platform_code)}` : ""}</strong>
+          <span>${escapeHtml(stop.municipality || stop.region || stop.source_feed_id || "")}</span>
+        </button>`).join("") || '<div class="empty-state">No stops in the visible area</div>';
+      $$("#map-result-list .map-result").forEach((button) => {
+        button.addEventListener("click", () => showMapStop(state.mapStops[Number(button.dataset.index)]));
       });
-    });
+    } catch (error) {
+      $("#map-result-count").textContent = "Stops could not be loaded";
+      $("#map-result-list").innerHTML = `<div class="empty-state">${escapeHtml(error.message)}</div>`;
+      throw error;
+    }
   }
 
   async function loadImports() {
@@ -321,7 +649,63 @@
     }
   }
 
-  async function loadQuality() {
+  function renderValidationResults(validation) {
+    if (!validation) {
+      $("#validation-last-run").textContent = "No manual database validation has been recorded.";
+      $("#validation-summary-badge").className = "badge";
+      $("#validation-summary-badge").textContent = "Not run";
+      $("#validation-checks").innerHTML = '<div class="empty-state compact-empty">Run validation to check missing data, source tracking and schedule consistency.</div>';
+      return;
+    }
+    const failed = Number(validation.checks_failed || 0);
+    const affected = Number(validation.affected_records || 0);
+    $("#validation-last-run").textContent = `Last run ${formatDate(validation.finished_at)} · ${formatNumber(validation.checks_total)} checks · ${formatNumber(affected)} affected records`;
+    $("#validation-summary-badge").className = `badge ${failed ? "danger" : "success"}`;
+    $("#validation-summary-badge").textContent = failed ? `${failed} failed` : "All passed";
+    const results = validation.results || [];
+    $("#validation-checks").innerHTML = results.map((check) => `
+      <button class="validation-check ${check.status === "passed" ? "passed" : "failed"}" type="button" data-entity="${escapeHtml(check.entity)}" data-code="${escapeHtml(check.code)}">
+        <span class="validation-check-icon"><i data-lucide="${check.status === "passed" ? "check" : "alert-triangle"}"></i></span>
+        <span class="validation-check-copy">
+          <strong>${escapeHtml(check.description)}</strong>
+          <small>${escapeHtml(humanizeField(check.entity))} · ${escapeHtml(check.code)}</small>
+        </span>
+        <span class="validation-check-count">${check.status === "passed" ? "Passed" : `${formatNumber(check.count)} records`}</span>
+      </button>`).join("") || '<div class="empty-state compact-empty">No check results were returned.</div>';
+    $$("#validation-checks .validation-check.failed").forEach((button) => {
+      button.addEventListener("click", () => {
+        $("#entity-select").value = "validation_issues";
+        $("#entity-search").value = button.dataset.code;
+        navigate("data");
+      });
+    });
+    iconRefresh();
+  }
+
+  async function runDataValidation() {
+    const button = $("#run-validation");
+    const original = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<i data-lucide="loader-circle"></i>Validating...';
+    button.classList.add("loading-button");
+    iconRefresh();
+    try {
+      const payload = await api("/admin/data-quality/validate", { method: "POST" });
+      if (payload.database_available === false) throw new Error(payload.message || "Database is unavailable");
+      renderValidationResults(payload.validation);
+      toast(`Validation complete: ${formatNumber(payload.validation?.checks_failed)} failed checks`);
+      await loadQuality(payload.validation);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      button.disabled = false;
+      button.innerHTML = original;
+      button.classList.remove("loading-button");
+      iconRefresh();
+    }
+  }
+
+  async function loadQuality(currentValidation = null) {
     const [quality, unresolved] = await Promise.all([
       api("/admin/data-quality"),
       api("/admin/unmatched-stops")
@@ -330,8 +714,10 @@
     $("#quality-metrics").innerHTML = [
       metric("Errors", severity.error || 0, "Validation errors"),
       metric("Warnings", severity.warning || 0, "Validation warnings"),
-      metric("Unresolved stops", quality.unresolved_stops || 0, "Active stops needing coordinates")
+      metric("Unresolved stops", quality.unresolved_stops || 0, "Active stops needing coordinates"),
+      metric("Duplicate groups", quality.duplicate_stop_groups || 0, "Same-name stops at one coordinate")
     ].join("");
+    renderValidationResults(currentValidation || quality.last_database_validation);
     renderTable("#quality-codes", quality.issue_codes || [], ["code", "severity", "count"], { badgeColumns: ["severity"] });
     renderTable("#quality-issues", quality.latest_issues || [], ["severity", "code", "message", "source_feed_id", "created_at"], {
       clickable: true,
@@ -394,7 +780,7 @@
       }
       if (view === "map") {
         ensureMap();
-        setTimeout(() => state.map?.invalidateSize(), 20);
+        setTimeout(renderMap, 20);
         if (!state.sources.length) await loadSources();
         if (!state.mapStops.length) await loadMapStops();
       }
@@ -467,15 +853,37 @@
     $$(".nav-item").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
     $$("[data-jump]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.jump)));
     $("#refresh-button").addEventListener("click", () => loadView(state.view));
-    $("#entity-select").addEventListener("change", () => loadEntityRows(true));
+    $("#entity-select").addEventListener("change", () => {
+      $("#entity-search").value = "";
+      loadEntityRows(true);
+    });
+    $("#entity-column-mode").addEventListener("change", () => renderEntityRows());
     $("#entity-page-size").addEventListener("change", () => loadEntityRows(true));
     $("#entity-reload").addEventListener("click", () => loadEntityRows());
     $("#entity-search").addEventListener("input", debounce(() => loadEntityRows(true), 350));
+    $("#entity-search-clear").addEventListener("click", () => {
+      $("#entity-search").value = "";
+      loadEntityRows(true);
+      $("#entity-search").focus();
+    });
+    $("#entity-open-map").addEventListener("click", () => {
+      $("#map-search").value = $("#entity-search").value;
+      navigate("map");
+    });
+    $("#page-first").addEventListener("click", () => {
+      state.entityPage = 1;
+      loadEntityRows();
+    });
     $("#page-previous").addEventListener("click", () => {
       if (state.entityPage > 1) {
         state.entityPage -= 1;
         loadEntityRows();
       }
+    });
+    $("#page-last").addEventListener("click", () => {
+      if (!state.entityPages) return;
+      state.entityPage = state.entityPages;
+      loadEntityRows();
     });
     $("#page-next").addEventListener("click", () => {
       if (state.entityPage < state.entityPages) {
@@ -484,10 +892,34 @@
       }
     });
     $("#map-load").addEventListener("click", loadMapStops);
+    $("#map-zoom-in").addEventListener("click", () => {
+      ensureMap();
+      if (!state.map) return;
+      state.map.zoom = Math.min(18, state.map.zoom + 1);
+      state.map.selectedStop = null;
+      renderMap();
+    });
+    $("#map-zoom-out").addEventListener("click", () => {
+      ensureMap();
+      if (!state.map) return;
+      state.map.zoom = Math.max(3, state.map.zoom - 1);
+      state.map.selectedStop = null;
+      renderMap();
+    });
     $("#map-search").addEventListener("keydown", (event) => {
       if (event.key === "Enter") loadMapStops();
     });
     $("#map-source").addEventListener("change", loadMapStops);
+    $("#run-validation").addEventListener("click", runDataValidation);
+    $("#detail-copy").addEventListener("click", async () => {
+      if (!state.detailRecord) return;
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(state.detailRecord, null, 2));
+        toast("Record JSON copied");
+      } catch {
+        toast("Could not copy record JSON", "error");
+      }
+    });
     $("#detail-close").addEventListener("click", () => $("#detail-dialog").close());
     $("#command-close").addEventListener("click", () => $("#command-dialog").close());
     $("#show-import-command").addEventListener("click", () => $("#command-dialog").showModal());

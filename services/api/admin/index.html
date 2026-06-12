@@ -5,8 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Cesta Data Admin</title>
-  <link rel="preconnect" href="https://unpkg.com">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <link rel="stylesheet" href="/admin/assets/admin.css">
 </head>
 <body>
@@ -142,15 +140,23 @@
         <section class="view" id="view-data">
           <div class="toolbar">
             <label class="field compact-field">
-              Entity
+              Data type
               <select id="entity-select"></select>
             </label>
             <label class="search-field">
               <i data-lucide="search"></i>
-              <input id="entity-search" type="search" placeholder="Search values">
+              <input id="entity-search" type="search" placeholder="Search records">
+              <button class="search-clear hidden" id="entity-search-clear" type="button" aria-label="Clear search"><i data-lucide="x"></i></button>
+            </label>
+            <label class="field compact-field column-mode-field">
+              Columns
+              <select id="entity-column-mode">
+                <option value="essential" selected>Essential</option>
+                <option value="all">All fields</option>
+              </select>
             </label>
             <label class="field compact-field">
-              Rows
+              Per page
               <select id="entity-page-size">
                 <option>25</option>
                 <option selected>50</option>
@@ -159,17 +165,24 @@
               </select>
             </label>
             <button class="button" id="entity-reload"><i data-lucide="refresh-cw"></i>Reload</button>
+            <button class="button hidden" id="entity-open-map"><i data-lucide="map"></i>View map</button>
           </div>
           <section class="panel table-panel">
             <div class="table-summary">
-              <strong id="entity-title">Data</strong>
+              <div>
+                <strong id="entity-title">Data</strong>
+                <span id="entity-description">Select a data type to browse its records.</span>
+              </div>
               <span id="entity-count"></span>
             </div>
             <div class="table-wrap data-table-wrap" id="entity-table"></div>
             <div class="pagination">
+              <span id="entity-range"></span>
+              <button class="button page-button" id="page-first" title="First page"><i data-lucide="chevrons-left"></i>First</button>
               <button class="button" id="page-previous"><i data-lucide="chevron-left"></i>Previous</button>
               <span id="page-status">Page 1</span>
               <button class="button" id="page-next">Next<i data-lucide="chevron-right"></i></button>
+              <button class="button page-button" id="page-last" title="Last page">Last<i data-lucide="chevrons-right"></i></button>
             </div>
           </section>
         </section>
@@ -187,7 +200,15 @@
             <button class="button primary" id="map-load"><i data-lucide="scan"></i>Load visible area</button>
           </div>
           <div class="map-layout">
-            <div id="stop-map" aria-label="Map of transport stops"></div>
+            <div id="stop-map" aria-label="Map of transport stops">
+              <canvas id="map-canvas"></canvas>
+              <div class="map-controls">
+                <button class="map-control" id="map-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+                <button class="map-control" id="map-zoom-out" title="Zoom out" aria-label="Zoom out">-</button>
+              </div>
+              <div class="map-popup hidden" id="map-popup"></div>
+              <div class="map-attribution">Map data &copy; OpenStreetMap contributors</div>
+            </div>
             <aside class="map-results">
               <div class="panel-header">
                 <div><h2>Visible stops</h2><p id="map-result-count">No stops loaded</p></div>
@@ -208,8 +229,22 @@
         </section>
 
         <section class="view" id="view-quality">
+          <div class="section-heading quality-heading">
+            <div>
+              <h2>Database validation</h2>
+              <p id="validation-last-run">Run an audit to check imported records for missing and inconsistent data.</p>
+            </div>
+            <button class="button primary" id="run-validation"><i data-lucide="shield-check"></i>Run validation</button>
+          </div>
           <div class="metric-grid quality-metrics" id="quality-metrics"></div>
           <div class="dashboard-grid">
+            <section class="panel span-3">
+              <div class="panel-header">
+                <div><h2>Validation checks</h2><p>Latest manual audit across transport data and source tracking</p></div>
+                <span class="badge" id="validation-summary-badge">Not run</span>
+              </div>
+              <div class="validation-check-list" id="validation-checks"></div>
+            </section>
             <section class="panel">
               <div class="panel-header"><div><h2>Issue categories</h2><p>Grouped validation findings</p></div></div>
               <div class="table-wrap compact" id="quality-codes"></div>
@@ -241,9 +276,16 @@
   <dialog id="detail-dialog">
     <div class="dialog-header">
       <div><h2 id="detail-title">Record details</h2><p id="detail-subtitle"></p></div>
-      <button class="icon-button" id="detail-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+      <div class="dialog-actions">
+        <button class="button" id="detail-copy"><i data-lucide="copy"></i>Copy JSON</button>
+        <button class="icon-button" id="detail-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+      </div>
     </div>
-    <pre id="detail-json"></pre>
+    <div class="record-detail-grid" id="detail-fields"></div>
+    <details class="raw-record">
+      <summary>Raw JSON</summary>
+      <pre id="detail-json"></pre>
+    </details>
   </dialog>
 
   <dialog id="command-dialog">
@@ -256,7 +298,6 @@
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="/admin/assets/admin.js"></script>
 </body>
 </html>

@@ -54,6 +54,7 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
+const ADMIN_VALIDATION_SOURCE_FILE: &str = "admin_database_validation";
 
 struct AdminEntitySpec {
     key: &'static str,
@@ -62,6 +63,16 @@ struct AdminEntitySpec {
     row_expression: &'static str,
     order_by: &'static str,
     map_available: bool,
+}
+
+struct DataValidationCheck {
+    code: &'static str,
+    severity: &'static str,
+    entity: &'static str,
+    description: &'static str,
+    table: &'static str,
+    id_expression: &'static str,
+    predicate: &'static str,
 }
 
 #[rustfmt::skip]
@@ -93,6 +104,24 @@ const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
     AdminEntitySpec { key: "notification_preferences", table: "notification_preferences", label: "Notification preferences", row_expression: "to_jsonb(t)", order_by: "user_id ASC, type ASC", map_available: false },
     AdminEntitySpec { key: "user_sessions", table: "user_sessions", label: "User sessions", row_expression: "to_jsonb(t) - 'refresh_token_hash'", order_by: "created_at DESC, id DESC", map_available: false },
     AdminEntitySpec { key: "user_roles", table: "user_roles", label: "User roles", row_expression: "to_jsonb(t)", order_by: "user_id ASC, role ASC", map_available: false },
+];
+
+#[rustfmt::skip]
+const DATA_VALIDATION_CHECKS: &[DataValidationCheck] = &[
+    DataValidationCheck { code: "stop_missing_name", severity: "error", entity: "stops", description: "Active stops must have a name and normalized name", table: "stops", id_expression: "id", predicate: "is_active = true AND (btrim(name) = '' OR btrim(normalized_name) = '')" },
+    DataValidationCheck { code: "stop_missing_coordinates", severity: "warning", entity: "stops", description: "Active stops should have latitude and longitude", table: "stops", id_expression: "id", predicate: "is_active = true AND (lat IS NULL OR lon IS NULL)" },
+    DataValidationCheck { code: "stop_invalid_coordinates", severity: "error", entity: "stops", description: "Stop coordinates must be within valid latitude and longitude ranges", table: "stops", id_expression: "id", predicate: "lat IS NOT NULL AND lon IS NOT NULL AND (lat < -90 OR lat > 90 OR lon < -180 OR lon > 180)" },
+    DataValidationCheck { code: "stop_missing_source_tracking", severity: "error", entity: "stops", description: "Active stops must retain their source feed and original source identifier", table: "stops", id_expression: "id", predicate: "is_active = true AND (source_feed_id IS NULL OR NOT EXISTS (SELECT 1 FROM stop_source_ids source_ids WHERE source_ids.stop_id = stops.id))" },
+    DataValidationCheck { code: "route_missing_name", severity: "warning", entity: "routes", description: "Active routes should have a short or long public name", table: "routes", id_expression: "id", predicate: "is_active = true AND COALESCE(btrim(short_name), '') = '' AND COALESCE(btrim(long_name), '') = ''" },
+    DataValidationCheck { code: "route_missing_source_tracking", severity: "error", entity: "routes", description: "Routes must retain their source feed and source identifier", table: "routes", id_expression: "id", predicate: "source_feed_id IS NULL OR btrim(source_id) = ''" },
+    DataValidationCheck { code: "route_without_trips", severity: "warning", entity: "routes", description: "Active routes should contain at least one trip", table: "routes", id_expression: "id", predicate: "is_active = true AND NOT EXISTS (SELECT 1 FROM trips WHERE trips.route_id = routes.id)" },
+    DataValidationCheck { code: "trip_missing_source_tracking", severity: "error", entity: "trips", description: "Trips must retain their source feed, source identifier and service identifier", table: "trips", id_expression: "id", predicate: "source_feed_id IS NULL OR btrim(source_id) = '' OR btrim(service_id) = ''" },
+    DataValidationCheck { code: "trip_without_stop_times", severity: "error", entity: "trips", description: "Trips must contain at least one stop time", table: "trips", id_expression: "id", predicate: "NOT EXISTS (SELECT 1 FROM stop_times WHERE stop_times.trip_id = trips.id)" },
+    DataValidationCheck { code: "trip_without_service_calendar", severity: "warning", entity: "trips", description: "Trip service identifiers should exist in calendars or calendar exceptions", table: "trips", id_expression: "id", predicate: "NOT EXISTS (SELECT 1 FROM calendars WHERE calendars.service_id = trips.service_id) AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE calendar_dates.service_id = trips.service_id)" },
+    DataValidationCheck { code: "stop_time_invalid_time", severity: "error", entity: "stop_times", description: "Stop times must be non-negative, ordered and within a two-day service window", table: "stop_times", id_expression: "trip_id || ':' || stop_sequence::text", predicate: "arrival_time < 0 OR departure_time < arrival_time OR arrival_time > 172800 OR departure_time > 172800" },
+    DataValidationCheck { code: "stop_time_missing_source_tracking", severity: "warning", entity: "stop_times", description: "Stop times should retain their source feed and import run", table: "stop_times", id_expression: "trip_id || ':' || stop_sequence::text", predicate: "source_feed_id IS NULL OR import_run_id IS NULL" },
+    DataValidationCheck { code: "calendar_invalid_range", severity: "error", entity: "calendars", description: "Calendars must have a valid date range and at least one active weekday", table: "calendars", id_expression: "service_id", predicate: "end_date < start_date OR NOT (monday OR tuesday OR wednesday OR thursday OR friday OR saturday OR sunday)" },
+    DataValidationCheck { code: "enabled_source_without_successful_import", severity: "warning", entity: "source_feeds", description: "Enabled source feeds should have a successful import", table: "source_feeds", id_expression: "id", predicate: "enabled = true AND NOT EXISTS (SELECT 1 FROM import_runs WHERE import_runs.status = 'success' AND import_runs.summary->>'feed_id' = source_feeds.id)" },
 ];
 
 #[derive(Clone)]
@@ -438,6 +467,10 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/imports/ggu-latest/start", post(admin_import_start))
         .route("/admin/database/stats", get(admin_database_stats))
         .route("/admin/data-quality", get(admin_data_quality))
+        .route(
+            "/admin/data-quality/validate",
+            post(admin_run_data_validation),
+        )
         .route("/admin/unmatched-stops", get(admin_unmatched_stops))
         .route("/admin/manual-stop-match", post(admin_manual_stop_match))
         .route("/admin/source-feeds", get(admin_source_feeds))
@@ -506,6 +539,10 @@ async fn openapi() -> Json<Value> {
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
             "/admin/database/stats": {"get": {"summary": "Database row counts and table sizes"}},
             "/admin/data-quality": {"get": {"summary": "Validation, duplicate and unresolved-stop metrics"}},
+            "/admin/data-quality/validate": {"post": {
+                "summary": "Run administrator database validation",
+                "description": "Checks imported transport data for missing, invalid and disconnected records. Replaces only findings from the previous administrator validation run."
+            }},
             "/admin/unmatched-stops": {"get": {"summary": "List active stops with unresolved coordinates"}},
             "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
             "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
@@ -1507,6 +1544,7 @@ async fn admin_data_quality(
         r#"
         SELECT severity, COUNT(*) AS count
         FROM validation_issues
+        WHERE code <> 'database_validation_completed'
         GROUP BY severity
         ORDER BY severity
         "#,
@@ -1518,6 +1556,7 @@ async fn admin_data_quality(
         r#"
         SELECT code, severity, COUNT(*) AS count
         FROM validation_issues
+        WHERE code <> 'database_validation_completed'
         GROUP BY code, severity
         ORDER BY count DESC, code ASC
         LIMIT 100
@@ -1531,6 +1570,7 @@ async fn admin_data_quality(
         SELECT id, import_run_id, source_feed_id, severity, code, message,
                source_file, affected_entity, raw_payload, created_at
         FROM validation_issues
+        WHERE code <> 'database_validation_completed'
         ORDER BY created_at DESC, id DESC
         LIMIT 100
         "#,
@@ -1564,6 +1604,21 @@ async fn admin_data_quality(
     .fetch_one(pool)
     .await
     .map_err(internal_error)?;
+    let last_database_validation = sqlx::query_scalar::<_, Option<Value>>(
+        r#"
+        SELECT raw_payload
+        FROM validation_issues
+        WHERE source_file = $1
+          AND code = 'database_validation_completed'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(ADMIN_VALIDATION_SOURCE_FILE)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal_error)?
+    .flatten();
 
     Ok(Json(json!({
         "database_available": true,
@@ -1578,7 +1633,131 @@ async fn admin_data_quality(
         })).collect::<Vec<_>>(),
         "unresolved_stops": unresolved_stops,
         "duplicate_stop_groups": duplicate_groups,
+        "last_database_validation": last_database_validation,
         "latest_issues": latest_issue_rows.into_iter().map(validation_issue_row_json).collect::<Vec<_>>()
+    })))
+}
+
+async fn admin_run_data_validation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "database_available": false,
+            "message": "Database validation requires a configured transport database"
+        })));
+    };
+
+    let validation_run_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let mut transaction = pool.begin().await.map_err(internal_error)?;
+    sqlx::query("DELETE FROM validation_issues WHERE source_file = $1")
+        .bind(ADMIN_VALIDATION_SOURCE_FILE)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_error)?;
+
+    let mut results = Vec::with_capacity(DATA_VALIDATION_CHECKS.len());
+    let mut affected_records = 0_i64;
+    let mut failed_checks = 0_usize;
+
+    for check in DATA_VALIDATION_CHECKS {
+        let query = format!(
+            r#"
+            WITH invalid AS (
+              SELECT ({})::text AS identifier
+              FROM {}
+              WHERE {}
+            ),
+            samples AS (
+              SELECT identifier
+              FROM invalid
+              ORDER BY identifier
+              LIMIT 20
+            )
+            SELECT
+              (SELECT COUNT(*) FROM invalid) AS count,
+              COALESCE((SELECT array_agg(identifier) FROM samples), ARRAY[]::text[]) AS sample_ids
+            "#,
+            check.id_expression, check.table, check.predicate
+        );
+        let row = sqlx::query(&query)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+        let count = row.get::<i64, _>("count");
+        let sample_ids = row.get::<Vec<String>, _>("sample_ids");
+        let status = if count == 0 { "passed" } else { "failed" };
+        let result = json!({
+            "code": check.code,
+            "severity": check.severity,
+            "entity": check.entity,
+            "description": check.description,
+            "status": status,
+            "count": count,
+            "sample_ids": sample_ids
+        });
+
+        if count > 0 {
+            affected_records += count;
+            failed_checks += 1;
+            sqlx::query(
+                r#"
+                INSERT INTO validation_issues (
+                  import_run_id, source_feed_id, severity, code, message,
+                  source_file, affected_entity, raw_payload
+                )
+                VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(check.severity)
+            .bind(check.code)
+            .bind(format!("{count} records failed: {}", check.description))
+            .bind(ADMIN_VALIDATION_SOURCE_FILE)
+            .bind(check.entity)
+            .bind(&result)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+        }
+        results.push(result);
+    }
+
+    let finished_at = Utc::now();
+    let summary = json!({
+        "validation_run_id": validation_run_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "checks_total": DATA_VALIDATION_CHECKS.len(),
+        "checks_passed": DATA_VALIDATION_CHECKS.len() - failed_checks,
+        "checks_failed": failed_checks,
+        "affected_records": affected_records,
+        "results": results
+    });
+    sqlx::query(
+        r#"
+        INSERT INTO validation_issues (
+          import_run_id, source_feed_id, severity, code, message,
+          source_file, affected_entity, raw_payload
+        )
+        VALUES (NULL, NULL, 'info', 'database_validation_completed', $1, $2, 'database', $3)
+        "#,
+    )
+    .bind(format!(
+        "Database validation completed with {failed_checks} failed checks and {affected_records} affected records"
+    ))
+    .bind(ADMIN_VALIDATION_SOURCE_FILE)
+    .bind(&summary)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "database_available": true,
+        "validation": summary
     })))
 }
 
@@ -3864,6 +4043,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_validation_endpoint_requires_admin_token() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/data-quality/validate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn database_validation_covers_core_schedule_and_source_tracking() {
+        let codes = DATA_VALIDATION_CHECKS
+            .iter()
+            .map(|check| check.code)
+            .collect::<HashSet<_>>();
+
+        for required in [
+            "stop_missing_coordinates",
+            "stop_missing_source_tracking",
+            "route_without_trips",
+            "trip_without_stop_times",
+            "trip_without_service_calendar",
+            "stop_time_invalid_time",
+            "calendar_invalid_range",
+            "enabled_source_without_successful_import",
+        ] {
+            assert!(
+                codes.contains(required),
+                "missing validation check {required}"
+            );
+        }
     }
 
     #[tokio::test]
