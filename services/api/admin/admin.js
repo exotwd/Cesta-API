@@ -13,6 +13,9 @@
     entityTotalRows: 0,
     entityRows: [],
     detailRecord: null,
+    detailContext: null,
+    detailHistory: [],
+    detailRequestId: 0,
     map: null,
     mapStops: [],
     sources: []
@@ -163,7 +166,7 @@
       const keys = Object.keys(value);
       return `<span class="object-value" title="${escapeHtml(JSON.stringify(value))}">${formatNumber(keys.length)} fields</span>`;
     }
-    if (["arrival_time", "departure_time", "min_transfer_seconds", "duration_seconds"].includes(column) && Number.isFinite(Number(value))) {
+    if (["arrival_time", "departure_time", "first_service_time", "last_service_time", "min_transfer_seconds", "duration_seconds"].includes(column) && Number.isFinite(Number(value))) {
       return `<span class="time-value" title="${escapeHtml(String(value))} seconds">${escapeHtml(formatServiceTime(value))}</span>`;
     }
     const text = compactValue(value);
@@ -220,23 +223,193 @@
       target.querySelectorAll("tbody tr").forEach((rowElement) => {
         rowElement.addEventListener("click", () => {
           const record = rows[Number(rowElement.dataset.rowIndex)];
-          openDetail(options.title || "Record", record, record.name || record.short_name || record.id || "");
+          if (options.onRow) {
+            options.onRow(record);
+          } else {
+            openDetail(
+              options.title || "Record",
+              record,
+              record.name || record.short_name || record.headsign || record.id || "",
+              options.entity || ""
+            );
+          }
         });
       });
     }
   }
 
-  function openDetail(title, record, subtitle = "") {
+  function renderDetailFields(record) {
     state.detailRecord = record;
-    $("#detail-title").textContent = title;
-    $("#detail-subtitle").textContent = subtitle;
     $("#detail-fields").innerHTML = Object.entries(record).map(([key, value]) => `
       <div class="record-field">
         <span>${escapeHtml(humanizeField(key))}</span>
         <div>${renderCellValue(key, value)}</div>
       </div>`).join("");
     $("#detail-json").textContent = JSON.stringify(record, null, 2);
+  }
+
+  function relatedEntityTitle(entity) {
+    return state.entities.find((item) => item.key === entity)?.label
+      || humanizeField(entity.replace(/s$/, ""));
+  }
+
+  function recordSubtitle(record) {
+    return record.name
+      || record.short_name
+      || record.headsign
+      || record.stop_name
+      || record.id
+      || record.stop_id
+      || "";
+  }
+
+  function openDetail(title, record, subtitle = "", entity = "") {
+    state.detailHistory = [];
+    showDetailContext({ title, record, subtitle, entity });
     $("#detail-dialog").showModal();
+  }
+
+  function showDetailContext(context) {
+    state.detailContext = context;
+    $("#detail-title").textContent = context.title;
+    $("#detail-subtitle").textContent = context.subtitle || recordSubtitle(context.record);
+    $("#detail-back").classList.toggle("hidden", !state.detailHistory.length);
+    $("#detail-summary").classList.add("hidden");
+    $("#detail-summary").innerHTML = "";
+    renderDetailFields(context.record);
+    loadRelatedData(context);
+    iconRefresh();
+  }
+
+  function openRelatedRecord(entity, record, idField = "id") {
+    const id = record[idField];
+    if (!entity || !id) return;
+    if (state.detailContext) state.detailHistory.push(state.detailContext);
+    showDetailContext({
+      title: relatedEntityTitle(entity),
+      record: { ...record, id: record.id || id },
+      subtitle: recordSubtitle(record),
+      entity
+    });
+  }
+
+  function renderRelatedTimeline(section, target) {
+    target.innerHTML = `
+      <div class="stop-timeline">
+        ${(section.rows || []).map((stop, index) => `
+          <button class="timeline-stop" type="button" data-index="${index}">
+            <span class="timeline-marker">${escapeHtml(stop.stop_sequence)}</span>
+            <span class="timeline-time">
+              <strong>${escapeHtml(formatServiceTime(stop.departure_time))}</strong>
+              ${stop.arrival_time !== stop.departure_time ? `<small>arr. ${escapeHtml(formatServiceTime(stop.arrival_time))}</small>` : ""}
+            </span>
+            <span class="timeline-place">
+              <strong>${escapeHtml(stop.stop_name || stop.stop_id)}</strong>
+              <small>${escapeHtml([stop.municipality, stop.platform || stop.platform_code ? `Platform ${stop.platform || stop.platform_code}` : ""].filter(Boolean).join(" · "))}</small>
+            </span>
+            <span class="timeline-link"><i data-lucide="chevron-right"></i></span>
+          </button>`).join("")}
+      </div>`;
+    target.querySelectorAll(".timeline-stop").forEach((button) => {
+      button.addEventListener("click", () => openRelatedRecord("stops", section.rows[Number(button.dataset.index)], "stop_id"));
+    });
+  }
+
+  function renderRelatedCalendar(section, target) {
+    const calendar = section.calendar;
+    const weekdays = calendar
+      ? ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+      : [];
+    target.innerHTML = `
+      ${calendar ? `
+        <div class="service-calendar">
+          <div class="calendar-range"><span>Valid from</span><strong>${escapeHtml(calendar.start_date)}</strong></div>
+          <div class="calendar-range"><span>Valid until</span><strong>${escapeHtml(calendar.end_date)}</strong></div>
+          <div class="weekday-list">
+            ${weekdays.map((day) => `<span class="${calendar[day] ? "active" : ""}">${escapeHtml(day.slice(0, 3))}</span>`).join("")}
+          </div>
+        </div>` : '<div class="related-empty compact-empty">No regular calendar record.</div>'}
+      ${(section.calendar_dates || []).length ? `
+        <div class="calendar-exceptions">
+          <strong>Calendar exceptions</strong>
+          <div>${section.calendar_dates.map((item) => `<span>${escapeHtml(item.date)} · ${item.exception_type === 1 ? "Added" : "Removed"}</span>`).join("")}</div>
+        </div>` : ""}`;
+  }
+
+  function renderRelatedData(payload) {
+    const summary = $("#detail-summary");
+    const summaryItems = payload.summary || [];
+    summary.classList.toggle("hidden", !summaryItems.length);
+    summary.innerHTML = summaryItems.map((item) => `
+      <div><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(compactValue(item.value))}</strong></div>`).join("");
+
+    const target = $("#detail-related");
+    const sections = payload.sections || [];
+    if (!sections.length) {
+      target.innerHTML = '<div class="related-empty">No related records were found.</div>';
+      return;
+    }
+    target.innerHTML = sections.map((section, index) => `
+      <section class="related-section">
+        <div class="related-section-header">
+          <div>
+            <h3>${escapeHtml(section.label)}</h3>
+            <p>${escapeHtml(section.description || "")}</p>
+          </div>
+          <span>${formatNumber(section.total)}${section.truncated ? "+" : ""}</span>
+        </div>
+        <div class="related-section-body" data-section-index="${index}"></div>
+      </section>`).join("");
+    sections.forEach((section, index) => {
+      const sectionTarget = target.querySelector(`[data-section-index="${index}"]`);
+      if (section.display === "timeline") {
+        renderRelatedTimeline(section, sectionTarget);
+      } else if (section.display === "calendar") {
+        renderRelatedCalendar(section, sectionTarget);
+      } else {
+        renderTable(sectionTarget, section.rows || [], section.columns || [], {
+          clickable: Boolean(section.entity),
+          rowAction: Boolean(section.entity),
+          entity: section.entity,
+          title: section.label,
+          onRow: section.entity
+            ? (record) => openRelatedRecord(section.entity, record, section.id_field || "id")
+            : null,
+          empty: "No related records"
+        });
+      }
+    });
+    iconRefresh();
+  }
+
+  async function loadRelatedData(context) {
+    const target = $("#detail-related");
+    const id = context.record.id;
+    if (!["stops", "routes", "trips"].includes(context.entity) || !id) {
+      target.innerHTML = '<div class="related-empty">Related data is available for stops, routes and trips.</div>';
+      return;
+    }
+    const requestId = ++state.detailRequestId;
+    target.innerHTML = '<div class="related-loading"><i data-lucide="loader-circle"></i><span>Loading related data...</span></div>';
+    iconRefresh();
+    try {
+      const payload = await api(`/admin/related/${encodeURIComponent(context.entity)}/${encodeURIComponent(id)}`);
+      if (requestId !== state.detailRequestId || state.detailContext !== context) return;
+      if (payload.database_available === false) {
+        target.innerHTML = '<div class="related-empty">The transport database is unavailable.</div>';
+        return;
+      }
+      if (payload.record) {
+        context.record = payload.record;
+        context.subtitle = recordSubtitle(payload.record);
+        $("#detail-subtitle").textContent = context.subtitle;
+        renderDetailFields(payload.record);
+      }
+      renderRelatedData(payload);
+    } catch (error) {
+      if (requestId !== state.detailRequestId) return;
+      target.innerHTML = `<div class="related-empty error-state">${escapeHtml(error.message)}</div>`;
+    }
   }
 
   async function loadEntities() {
@@ -279,6 +452,7 @@
       clickable: true,
       rowAction: true,
       title: label,
+      entity: state.entity,
       badgeColumns: ["status", "severity", "coordinate_confidence", "confidence"],
       empty: $("#entity-search").value.trim() ? "No records match this search" : "No records are available"
     });
@@ -920,7 +1094,16 @@
         toast("Could not copy record JSON", "error");
       }
     });
-    $("#detail-close").addEventListener("click", () => $("#detail-dialog").close());
+    $("#detail-back").addEventListener("click", () => {
+      const previous = state.detailHistory.pop();
+      if (previous) showDetailContext(previous);
+    });
+    $("#detail-close").addEventListener("click", () => {
+      state.detailRequestId += 1;
+      state.detailHistory = [];
+      state.detailContext = null;
+      $("#detail-dialog").close();
+    });
     $("#command-close").addEventListener("click", () => $("#command-dialog").close());
     $("#show-import-command").addEventListener("click", () => $("#command-dialog").showModal());
   }

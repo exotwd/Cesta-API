@@ -273,19 +273,30 @@
     </div>
   </div>
 
-  <dialog id="detail-dialog">
+  <dialog id="detail-dialog" class="record-inspector">
     <div class="dialog-header">
-      <div><h2 id="detail-title">Record details</h2><p id="detail-subtitle"></p></div>
+      <div class="inspector-heading">
+        <button class="icon-button hidden inspector-symbol" id="detail-back" title="Back to previous record" aria-label="Back to previous record">&larr;</button>
+        <div><h2 id="detail-title">Record details</h2><p id="detail-subtitle"></p></div>
+      </div>
       <div class="dialog-actions">
         <button class="button" id="detail-copy"><i data-lucide="copy"></i>Copy JSON</button>
-        <button class="icon-button" id="detail-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+        <button class="icon-button inspector-symbol" id="detail-close" title="Close" aria-label="Close">&times;</button>
       </div>
     </div>
-    <div class="record-detail-grid" id="detail-fields"></div>
-    <details class="raw-record">
-      <summary>Raw JSON</summary>
-      <pre id="detail-json"></pre>
-    </details>
+    <div class="inspector-content">
+      <section class="inspector-overview">
+        <div class="related-summary hidden" id="detail-summary"></div>
+        <div class="record-detail-grid" id="detail-fields"></div>
+        <details class="raw-record">
+          <summary>Raw JSON</summary>
+          <pre id="detail-json"></pre>
+        </details>
+      </section>
+      <section class="related-data" id="detail-related">
+        <div class="related-empty">Related data is available for stops, routes and trips.</div>
+      </section>
+    </div>
   </dialog>
 
   <dialog id="command-dialog">

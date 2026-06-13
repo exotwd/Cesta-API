@@ -460,6 +460,7 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/assets/admin.js", get(admin_js))
         .route("/admin/data", get(admin_entities))
         .route("/admin/data/{entity}", get(admin_entity_rows))
+        .route("/admin/related/{entity}/{id}", get(admin_related_data))
         .route("/admin/map/stops", get(admin_map_stops))
         .route("/admin/imports", get(admin_imports))
         .route("/admin/imports/{id}", get(admin_import))
@@ -528,6 +529,14 @@ async fn openapi() -> Json<Value> {
                     {"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1, "default": 1}},
                     {"name": "page_size", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}},
                     {"name": "q", "in": "query", "schema": {"type": "string"}}
+                ]
+            }},
+            "/admin/related/{entity}/{id}": {"get": {
+                "summary": "Get linked administrator data for a stop, route or trip",
+                "description": "Returns the selected record plus entity-aware linked routes, trips, stops and service data.",
+                "parameters": [
+                    {"name": "entity", "in": "path", "required": true, "schema": {"type": "string", "enum": ["stops", "routes", "trips"]}},
+                    {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
                 ]
             }},
             "/admin/map/stops": {"get": {
@@ -1317,6 +1326,490 @@ async fn admin_entity_rows(
             "total_pages": total_pages
         },
         "database_available": true
+    })))
+}
+
+async fn admin_related_data(
+    Path((entity, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "database_available": false,
+            "entity": entity,
+            "id": id,
+            "sections": []
+        })));
+    };
+
+    let payload = match entity.as_str() {
+        "stops" => admin_stop_related_data(pool, &id).await,
+        "routes" => admin_route_related_data(pool, &id).await,
+        "trips" => admin_trip_related_data(pool, &id).await,
+        _ => {
+            return Ok(Json(json!({
+                "database_available": true,
+                "supported": false,
+                "entity": entity,
+                "id": id,
+                "sections": []
+            })));
+        }
+    }
+    .map_err(internal_error)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(payload))
+}
+
+async fn admin_stop_related_data(pool: &PgPool, id: &str) -> Result<Option<Value>, sqlx::Error> {
+    let record =
+        sqlx::query_scalar::<_, Value>("SELECT to_jsonb(stops) - 'geom' FROM stops WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+
+    let station_stops_sql = r#"
+        WITH selected AS (
+          SELECT id, stop_area_id, normalized_name, lat, lon
+          FROM stops
+          WHERE id = $1
+        )
+        SELECT s.id, s.name, s.municipality, s.platform_code, s.modes,
+               s.coordinate_confidence, s.source_feed_id, s.is_active
+        FROM stops s
+        CROSS JOIN selected
+        WHERE s.id = selected.id
+           OR (
+             selected.stop_area_id IS NOT NULL
+             AND s.stop_area_id = selected.stop_area_id
+           )
+           OR (
+             selected.stop_area_id IS NULL
+             AND selected.lat IS NOT NULL
+             AND selected.lon IS NOT NULL
+             AND s.normalized_name = selected.normalized_name
+             AND s.lat IS NOT NULL
+             AND s.lon IS NOT NULL
+             AND abs(s.lat - selected.lat) < 0.00005
+             AND abs(s.lon - selected.lon) < 0.00005
+           )
+        ORDER BY s.name ASC, s.platform_code ASC NULLS FIRST, s.id ASC
+    "#;
+    let station_stop_rows = sqlx::query(station_stops_sql)
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
+    let station_stop_ids = station_stop_rows
+        .iter()
+        .map(|row| row.get::<String, _>("id"))
+        .collect::<Vec<_>>();
+    let station_stops = station_stop_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "municipality": row.get::<Option<String>, _>("municipality"),
+                "platform_code": row.get::<Option<String>, _>("platform_code"),
+                "modes": row.get::<Vec<String>, _>("modes"),
+                "coordinate_confidence": row.get::<String, _>("coordinate_confidence"),
+                "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+                "is_active": row.get::<bool, _>("is_active")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let route_rows = sqlx::query(
+        r#"
+        SELECT r.id, r.source_feed_id, r.source_id, r.agency_id, r.operator_id,
+               r.short_name, r.long_name, r.mode, r.gtfs_route_type, r.color,
+               r.text_color, r.source_priority, r.is_active,
+               COUNT(DISTINCT t.id) AS trip_count,
+               MIN(st.arrival_time) AS first_service_time,
+               MAX(st.departure_time) AS last_service_time
+        FROM stop_times st
+        JOIN trips t ON t.id = st.trip_id
+        JOIN routes r ON r.id = t.route_id
+        WHERE st.stop_id = ANY($1)
+          AND r.is_active = true
+        GROUP BY r.id
+        ORDER BY r.source_priority ASC, r.short_name ASC NULLS LAST, r.long_name ASC NULLS LAST, r.id ASC
+        LIMIT 1000
+        "#,
+    )
+    .bind(&station_stop_ids)
+    .fetch_all(pool)
+    .await?;
+    let routes = route_rows
+        .into_iter()
+        .map(|row| {
+            let mut route = route_row_json(&row);
+            route["trip_count"] = json!(row.get::<i64, _>("trip_count"));
+            route["first_service_time"] = json!(row.get::<Option<i32>, _>("first_service_time"));
+            route["last_service_time"] = json!(row.get::<Option<i32>, _>("last_service_time"));
+            route
+        })
+        .collect::<Vec<_>>();
+
+    let trip_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(DISTINCT st.trip_id)
+        FROM stop_times st
+        JOIN trips t ON t.id = st.trip_id
+        JOIN routes r ON r.id = t.route_id
+        WHERE st.stop_id = ANY($1)
+          AND r.is_active = true
+        "#,
+    )
+    .bind(&station_stop_ids)
+    .fetch_one(pool)
+    .await?;
+    let trip_rows = sqlx::query(
+        r#"
+        SELECT t.id, t.route_id, t.service_id, t.headsign, t.direction_id,
+               t.source_feed_id, r.short_name, r.long_name, r.mode,
+               MIN(st.arrival_time) AS arrival_time,
+               MIN(st.departure_time) AS departure_time,
+               MIN(st.platform) AS platform
+        FROM stop_times st
+        JOIN trips t ON t.id = st.trip_id
+        JOIN routes r ON r.id = t.route_id
+        WHERE st.stop_id = ANY($1)
+          AND r.is_active = true
+        GROUP BY t.id, r.id
+        ORDER BY MIN(st.departure_time) ASC, r.short_name ASC NULLS LAST, t.id ASC
+        LIMIT 250
+        "#,
+    )
+    .bind(&station_stop_ids)
+    .fetch_all(pool)
+    .await?;
+    let trips = trip_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "route_id": row.get::<String, _>("route_id"),
+                "route_name": row.get::<Option<String>, _>("short_name")
+                    .or_else(|| row.get::<Option<String>, _>("long_name")),
+                "mode": row.get::<String, _>("mode"),
+                "headsign": row.get::<Option<String>, _>("headsign"),
+                "service_id": row.get::<String, _>("service_id"),
+                "direction_id": row.get::<Option<i16>, _>("direction_id"),
+                "arrival_time": row.get::<Option<i32>, _>("arrival_time"),
+                "departure_time": row.get::<Option<i32>, _>("departure_time"),
+                "platform": row.get::<Option<String>, _>("platform"),
+                "source_feed_id": row.get::<Option<String>, _>("source_feed_id")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(json!({
+        "database_available": true,
+        "supported": true,
+        "entity": "stops",
+        "id": id,
+        "record": record,
+        "summary": [
+            {"label": "Station stops", "value": station_stops.len()},
+            {"label": "Routes", "value": routes.len()},
+            {"label": "Trips", "value": trip_count}
+        ],
+        "sections": [
+            {
+                "key": "routes",
+                "label": "Routes through this stop",
+                "description": "Routes serving this station, including equivalent platform records.",
+                "entity": "routes",
+                "id_field": "id",
+                "columns": ["short_name", "long_name", "mode", "trip_count", "first_service_time", "last_service_time"],
+                "rows": routes,
+                "total": routes.len(),
+                "truncated": routes.len() == 1000
+            },
+            {
+                "key": "trips",
+                "label": "Trips serving this stop",
+                "description": "First 250 scheduled trips ordered by time at this station.",
+                "entity": "trips",
+                "id_field": "id",
+                "columns": ["departure_time", "route_name", "headsign", "platform", "service_id"],
+                "rows": trips,
+                "total": trip_count,
+                "truncated": trip_count > trips.len() as i64
+            },
+            {
+                "key": "station_stops",
+                "label": "Station and platform records",
+                "description": "Stop records grouped by stop area or matching station coordinates.",
+                "entity": "stops",
+                "id_field": "id",
+                "columns": ["name", "platform_code", "modes", "coordinate_confidence", "source_feed_id"],
+                "rows": station_stops,
+                "total": station_stops.len(),
+                "truncated": false
+            }
+        ]
+    })))
+}
+
+async fn admin_trip_related_data(pool: &PgPool, id: &str) -> Result<Option<Value>, sqlx::Error> {
+    let trip_row = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, source_id, route_id, service_id, headsign,
+               direction_id, shape_id, restrictions, raw_source_metadata, source_priority
+        FROM trips
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(trip_row) = trip_row else {
+        return Ok(None);
+    };
+    let record = trip_row_json(&trip_row);
+    let route_id = trip_row.get::<String, _>("route_id");
+    let service_id = trip_row.get::<String, _>("service_id");
+
+    let route = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, source_id, agency_id, operator_id, short_name, long_name,
+               mode, gtfs_route_type, color, text_color, source_priority, is_active
+        FROM routes
+        WHERE id = $1
+        "#,
+    )
+    .bind(&route_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|row| route_row_json(&row));
+
+    let stop_rows = sqlx::query(
+        r#"
+        SELECT st.trip_id, st.stop_id, st.stop_sequence, st.arrival_time, st.departure_time,
+               st.pickup_type, st.drop_off_type, st.timepoint, st.platform, st.raw_notes,
+               st.source_feed_id, st.source_priority,
+               s.name AS stop_name, s.municipality, s.platform_code, s.stop_area_id
+        FROM stop_times st
+        JOIN stops s ON s.id = st.stop_id
+        WHERE st.trip_id = $1
+        ORDER BY st.stop_sequence ASC
+        "#,
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let stops = stop_rows
+        .into_iter()
+        .map(|row| {
+            let mut stop_time = stop_time_row_json(&row);
+            stop_time["stop_name"] = json!(row.get::<String, _>("stop_name"));
+            stop_time["municipality"] = json!(row.get::<Option<String>, _>("municipality"));
+            stop_time["platform_code"] = json!(row.get::<Option<String>, _>("platform_code"));
+            stop_time["stop_area_id"] = json!(row.get::<Option<String>, _>("stop_area_id"));
+            stop_time
+        })
+        .collect::<Vec<_>>();
+
+    let calendar = sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(calendars) FROM calendars WHERE service_id = $1",
+    )
+    .bind(&service_id)
+    .fetch_optional(pool)
+    .await?;
+    let calendar_dates = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT to_jsonb(calendar_dates)
+        FROM calendar_dates
+        WHERE service_id = $1
+        ORDER BY date ASC
+        LIMIT 200
+        "#,
+    )
+    .bind(&service_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(Some(json!({
+        "database_available": true,
+        "supported": true,
+        "entity": "trips",
+        "id": id,
+        "record": record,
+        "summary": [
+            {"label": "Stops", "value": stops.len()},
+            {"label": "Route", "value": route.as_ref().and_then(|value| value.get("short_name")).cloned().unwrap_or(json!(route_id))},
+            {"label": "Service", "value": service_id}
+        ],
+        "sections": [
+            {
+                "key": "stop_sequence",
+                "label": "Stop sequence",
+                "description": "Complete ordered calling pattern for this trip.",
+                "entity": "stops",
+                "id_field": "stop_id",
+                "columns": ["stop_sequence", "arrival_time", "departure_time", "stop_name", "platform"],
+                "rows": stops,
+                "total": stops.len(),
+                "truncated": false,
+                "display": "timeline"
+            },
+            {
+                "key": "route",
+                "label": "Route",
+                "description": "The route used by this trip.",
+                "entity": "routes",
+                "id_field": "id",
+                "columns": ["short_name", "long_name", "mode", "source_feed_id"],
+                "rows": route.into_iter().collect::<Vec<_>>(),
+                "total": 1,
+                "truncated": false
+            },
+            {
+                "key": "service",
+                "label": "Service calendar",
+                "description": "Regular calendar and date-specific exceptions for this trip.",
+                "entity": null,
+                "id_field": null,
+                "columns": [],
+                "rows": [],
+                "total": calendar_dates.len() + usize::from(calendar.is_some()),
+                "truncated": calendar_dates.len() == 200,
+                "display": "calendar",
+                "calendar": calendar,
+                "calendar_dates": calendar_dates
+            }
+        ]
+    })))
+}
+
+async fn admin_route_related_data(pool: &PgPool, id: &str) -> Result<Option<Value>, sqlx::Error> {
+    let route_row = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, source_id, agency_id, operator_id, short_name, long_name,
+               mode, gtfs_route_type, color, text_color, source_priority, is_active
+        FROM routes
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(route_row) = route_row else {
+        return Ok(None);
+    };
+    let record = route_row_json(&route_row);
+
+    let trip_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE route_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    let trip_rows = sqlx::query(
+        r#"
+        SELECT t.id, t.source_feed_id, t.source_id, t.route_id, t.service_id, t.headsign,
+               t.direction_id, t.shape_id, t.restrictions, t.raw_source_metadata,
+               t.source_priority, COUNT(st.stop_id) AS stop_count,
+               MIN(st.departure_time) AS departure_time,
+               MAX(st.arrival_time) AS arrival_time
+        FROM trips t
+        LEFT JOIN stop_times st ON st.trip_id = t.id
+        WHERE t.route_id = $1
+        GROUP BY t.id
+        ORDER BY MIN(st.departure_time) ASC NULLS LAST, t.headsign ASC NULLS LAST, t.id ASC
+        LIMIT 300
+        "#,
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let trips = trip_rows
+        .into_iter()
+        .map(|row| {
+            let mut trip = trip_row_json(&row);
+            trip["stop_count"] = json!(row.get::<i64, _>("stop_count"));
+            trip["departure_time"] = json!(row.get::<Option<i32>, _>("departure_time"));
+            trip["arrival_time"] = json!(row.get::<Option<i32>, _>("arrival_time"));
+            trip
+        })
+        .collect::<Vec<_>>();
+
+    let stop_rows = sqlx::query(
+        r#"
+        SELECT s.id, s.name, s.municipality, s.platform_code, s.modes,
+               s.coordinate_confidence, s.source_feed_id,
+               COUNT(DISTINCT st.trip_id) AS trip_count,
+               MIN(st.stop_sequence) AS first_sequence
+        FROM trips t
+        JOIN stop_times st ON st.trip_id = t.id
+        JOIN stops s ON s.id = st.stop_id
+        WHERE t.route_id = $1
+        GROUP BY s.id
+        ORDER BY MIN(st.stop_sequence) ASC, s.name ASC, s.platform_code ASC NULLS FIRST
+        LIMIT 1000
+        "#,
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    let stops = stop_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "municipality": row.get::<Option<String>, _>("municipality"),
+                "platform_code": row.get::<Option<String>, _>("platform_code"),
+                "modes": row.get::<Vec<String>, _>("modes"),
+                "coordinate_confidence": row.get::<String, _>("coordinate_confidence"),
+                "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+                "trip_count": row.get::<i64, _>("trip_count"),
+                "first_sequence": row.get::<i32, _>("first_sequence")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(json!({
+        "database_available": true,
+        "supported": true,
+        "entity": "routes",
+        "id": id,
+        "record": record,
+        "summary": [
+            {"label": "Trips", "value": trip_count},
+            {"label": "Served stops", "value": stops.len()},
+            {"label": "Mode", "value": record.get("mode").cloned().unwrap_or(Value::Null)}
+        ],
+        "sections": [
+            {
+                "key": "trips",
+                "label": "Trips on this route",
+                "description": "First 300 trips ordered by their first departure.",
+                "entity": "trips",
+                "id_field": "id",
+                "columns": ["departure_time", "arrival_time", "headsign", "service_id", "stop_count"],
+                "rows": trips,
+                "total": trip_count,
+                "truncated": trip_count > trips.len() as i64
+            },
+            {
+                "key": "stops",
+                "label": "Stops served",
+                "description": "Distinct stops served by trips assigned to this route.",
+                "entity": "stops",
+                "id_field": "id",
+                "columns": ["first_sequence", "name", "municipality", "platform_code", "trip_count"],
+                "rows": stops,
+                "total": stops.len(),
+                "truncated": stops.len() == 1000
+            }
+        ]
     })))
 }
 
@@ -4053,6 +4546,22 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/admin/data-quality/validate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_related_data_endpoint_requires_admin_token() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/related/stops/stop-praha-hl-n")
                     .body(Body::empty())
                     .unwrap(),
             )
