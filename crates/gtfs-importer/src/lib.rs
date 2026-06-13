@@ -366,13 +366,13 @@ fn parse_stop_times<R: Read + Seek>(
 
 pub fn map_gtfs_route_type(route_type: Option<i32>) -> TransportMode {
     match route_type {
-        Some(0) => TransportMode::Tram,
+        Some(0) | Some(900..=999) => TransportMode::Tram,
         Some(1) => TransportMode::Metro,
-        Some(2) => TransportMode::Train,
-        Some(3) => TransportMode::Bus,
-        Some(4) => TransportMode::Ferry,
-        Some(5) => TransportMode::CableCar,
-        Some(11) => TransportMode::Trolleybus,
+        Some(2) | Some(100..=199) | Some(400..=499) => TransportMode::Train,
+        Some(3) | Some(200..=299) | Some(700..=799) => TransportMode::Bus,
+        Some(4) | Some(1000..=1099) => TransportMode::Ferry,
+        Some(5) | Some(1300..=1399) => TransportMode::CableCar,
+        Some(11) | Some(800..=899) => TransportMode::Trolleybus,
         _ => TransportMode::Unknown,
     }
 }
@@ -472,5 +472,17 @@ mod tests {
         file.write_all(b"cesta").unwrap();
         let checksum = sha256_file(file.path()).unwrap();
         assert_eq!(checksum.len(), 64);
+    }
+
+    #[test]
+    fn maps_extended_gtfs_route_types() {
+        assert_eq!(map_gtfs_route_type(Some(101)), TransportMode::Train);
+        assert_eq!(map_gtfs_route_type(Some(401)), TransportMode::Train);
+        assert_eq!(map_gtfs_route_type(Some(201)), TransportMode::Bus);
+        assert_eq!(map_gtfs_route_type(Some(701)), TransportMode::Bus);
+        assert_eq!(map_gtfs_route_type(Some(800)), TransportMode::Trolleybus);
+        assert_eq!(map_gtfs_route_type(Some(900)), TransportMode::Tram);
+        assert_eq!(map_gtfs_route_type(Some(1000)), TransportMode::Ferry);
+        assert_eq!(map_gtfs_route_type(Some(1300)), TransportMode::CableCar);
     }
 }

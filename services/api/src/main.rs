@@ -3020,19 +3020,44 @@ fn public_route_key(route_id: Option<&str>) -> String {
 }
 
 fn canonical_journey_stop_id(stop_id: &str) -> String {
-    let Some((base, suffix)) = stop_id.rsplit_once('-') else {
-        return stop_id.to_string();
-    };
+    railway_station_stop_base(stop_id).unwrap_or_else(|| stop_id.to_string())
+}
 
-    let looks_like_platform = stop_id.contains("SR70S-CZ-")
-        && suffix.len() <= 4
-        && suffix.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        && suffix.chars().all(|ch| ch.is_ascii_alphanumeric());
-    if looks_like_platform {
-        base.to_string()
-    } else {
-        stop_id.to_string()
+fn railway_station_stop_base(stop_id: &str) -> Option<String> {
+    let marker_index = stop_id.rfind("SR70S-CZ-")?;
+    let marker_end = marker_index + "SR70S-CZ-".len();
+    let station_and_platform = &stop_id[marker_end..];
+    let mut parts = station_and_platform.split('-');
+    let station_code = parts.next()?;
+    if station_code.is_empty() || !station_code.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
     }
+
+    if let Some(platform) = parts.next() {
+        let looks_like_platform = parts.next().is_none()
+            && !platform.is_empty()
+            && platform.len() <= 4
+            && platform
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+            && platform.chars().all(|ch| ch.is_ascii_alphanumeric());
+        if !looks_like_platform {
+            return None;
+        }
+    }
+
+    Some(format!("{}{}", &stop_id[..marker_end], station_code))
+}
+
+fn escaped_like_prefix(value: &str) -> String {
+    format!(
+        "{}%",
+        value
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
 }
 
 async fn resolve_journey_point_db(
@@ -3080,7 +3105,31 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         .fetch_all(pool)
         .await?;
         ids.append(&mut area_ids);
-    } else if let Some((lat, lon)) = stop.lat.zip(stop.lon) {
+    }
+
+    if let Some(station_base) = railway_station_stop_base(&stop.id) {
+        let station_prefix = escaped_like_prefix(&format!("{station_base}-"));
+        let station_ids = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT id
+            FROM stops
+            WHERE is_active = true
+              AND (id = $1 OR id LIKE $2 ESCAPE '\')
+            LIMIT 250
+            "#,
+        )
+        .bind(&station_base)
+        .bind(station_prefix)
+        .fetch_all(pool)
+        .await?;
+        ids.extend(
+            station_ids.into_iter().filter(|id| {
+                railway_station_stop_base(id).as_deref() == Some(station_base.as_str())
+            }),
+        );
+    }
+
+    if let Some((lat, lon)) = stop.lat.zip(stop.lon) {
         let mut sibling_ids = sqlx::query_scalar::<_, String>(
             r#"
             SELECT id
@@ -3089,8 +3138,8 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
               AND normalized_name = $1
               AND lat IS NOT NULL
               AND lon IS NOT NULL
-              AND abs(lat - $2) < 0.00005
-              AND abs(lon - $3) < 0.00005
+              AND abs(lat - $2) < 0.0005
+              AND abs(lon - $3) < 0.0005
             LIMIT 250
             "#,
         )
@@ -3149,13 +3198,13 @@ async fn direct_journeys_db(
             st_to.arrival_time,
             lir.import_run_id IS NOT NULL AS from_latest_import,
             CASE
-              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 OR r.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
               WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
-              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
-              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
-              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
+              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 OR r.gtfs_route_type BETWEEN 200 AND 299 OR r.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
+              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 OR r.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
+              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 OR r.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
+              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 OR r.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
               ELSE 'unknown'
             END AS public_mode
           FROM stop_times st_from
@@ -3270,7 +3319,56 @@ async fn one_transfer_journeys_db(
           ) ranked_route_variants
           WHERE route_variant_rank = 1
         ),
-        second_legs AS (
+        first_legs AS MATERIALIZED (
+          SELECT
+            st_from.trip_id AS first_trip_id,
+            r.id AS first_route_id,
+            st_from.stop_id AS first_from_stop_id,
+            st_mid.stop_id AS transfer_arrival_stop_id,
+            st_from.departure_time AS first_departure_time,
+            st_mid.arrival_time AS first_arrival_time,
+            s_mid.normalized_name AS transfer_normalized_name,
+            s_mid.lat AS transfer_lat,
+            s_mid.lon AS transfer_lon,
+            lir.import_run_id IS NOT NULL AS first_from_latest_import,
+            CASE
+              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 OR r.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
+              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 OR r.gtfs_route_type BETWEEN 200 AND 299 OR r.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
+              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 OR r.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
+              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 OR r.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
+              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 OR r.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS first_mode
+          FROM stop_times st_from
+          JOIN stop_times st_mid
+            ON st_mid.trip_id = st_from.trip_id
+           AND st_mid.stop_sequence > st_from.stop_sequence
+          JOIN stops s_mid
+            ON s_mid.id = st_mid.stop_id
+           AND s_mid.is_active = true
+          JOIN trips t ON t.id = st_from.trip_id
+          LEFT JOIN latest_import_runs lir
+            ON lir.source_feed_id = t.source_feed_id
+           AND lir.import_run_id = t.import_run_id
+          JOIN routes r ON r.id = t.route_id
+          WHERE st_from.stop_id = ANY($1)
+            AND st_from.departure_time >= $3
+            AND (
+              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
+              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+            )
+            AND COALESCE(st_from.pickup_type, 0) = 0
+            AND COALESCE(st_mid.drop_off_type, 0) = 0
+        ),
+        filtered_first_legs AS MATERIALIZED (
+          SELECT *
+          FROM first_legs
+          WHERE first_mode <> 'unknown'
+            AND ($4 = false OR first_mode = ANY($5))
+        ),
+        second_legs AS MATERIALIZED (
           SELECT
             st_transfer.trip_id AS second_trip_id,
             r2.id AS second_route_id,
@@ -3283,13 +3381,13 @@ async fn one_transfer_journeys_db(
             s_transfer.lon AS transfer_lon,
             lir2.import_run_id IS NOT NULL AS second_from_latest_import,
             CASE
-              WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 THEN 'tram'
+              WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR r2.gtfs_route_type BETWEEN 100 AND 199 OR r2.gtfs_route_type BETWEEN 400 AND 499 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 OR r2.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
               WHEN lower(r2.mode) = 'metro' OR r2.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(r2.mode) = 'bus' OR r2.gtfs_route_type = 3 THEN 'bus'
-              WHEN lower(r2.mode) = 'ferry' OR r2.gtfs_route_type = 4 THEN 'ferry'
-              WHEN lower(r2.mode) IN ('cable_car', 'cablecar') OR r2.gtfs_route_type = 5 THEN 'cable_car'
-              WHEN lower(r2.mode) = 'trolleybus' OR r2.gtfs_route_type = 11 THEN 'trolleybus'
+              WHEN lower(r2.mode) = 'bus' OR r2.gtfs_route_type = 3 OR r2.gtfs_route_type BETWEEN 200 AND 299 OR r2.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
+              WHEN lower(r2.mode) = 'ferry' OR r2.gtfs_route_type = 4 OR r2.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
+              WHEN lower(r2.mode) IN ('cable_car', 'cablecar') OR r2.gtfs_route_type = 5 OR r2.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
+              WHEN lower(r2.mode) = 'trolleybus' OR r2.gtfs_route_type = 11 OR r2.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
               ELSE 'unknown'
             END AS second_mode
           FROM stop_times st_to
@@ -3313,7 +3411,7 @@ async fn one_transfer_journeys_db(
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
         ),
-        filtered_second_legs AS (
+        filtered_second_legs AS MATERIALIZED (
           SELECT *
           FROM second_legs
           WHERE second_mode <> 'unknown'
@@ -3321,66 +3419,52 @@ async fn one_transfer_journeys_db(
         ),
         candidate_journeys AS (
           SELECT
-            st_from.trip_id AS first_trip_id,
-            r.id AS first_route_id,
-            st_from.stop_id AS first_from_stop_id,
-            st_mid.stop_id AS transfer_arrival_stop_id,
-            st_from.departure_time AS first_departure_time,
-            st_mid.arrival_time AS first_arrival_time,
-            CASE
-              WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 THEN 'tram'
-              WHEN lower(r.mode) = 'metro' OR r.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(r.mode) = 'bus' OR r.gtfs_route_type = 3 THEN 'bus'
-              WHEN lower(r.mode) = 'ferry' OR r.gtfs_route_type = 4 THEN 'ferry'
-              WHEN lower(r.mode) IN ('cable_car', 'cablecar') OR r.gtfs_route_type = 5 THEN 'cable_car'
-              WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 THEN 'trolleybus'
-              ELSE 'unknown'
-            END AS first_mode,
-            filtered_second_legs.second_trip_id,
-            filtered_second_legs.second_route_id,
-            filtered_second_legs.transfer_departure_stop_id,
-            filtered_second_legs.second_to_stop_id,
-            filtered_second_legs.second_departure_time,
-            filtered_second_legs.second_arrival_time,
-            filtered_second_legs.second_mode,
-            lir.import_run_id IS NOT NULL
-              AND filtered_second_legs.second_from_latest_import AS from_latest_import
-          FROM filtered_second_legs
-          JOIN stops s_mid
-            ON s_mid.is_active = true
+            first_legs.first_trip_id,
+            first_legs.first_route_id,
+            first_legs.first_from_stop_id,
+            first_legs.transfer_arrival_stop_id,
+            first_legs.first_departure_time,
+            first_legs.first_arrival_time,
+            first_legs.first_mode,
+            second_legs.second_trip_id,
+            second_legs.second_route_id,
+            second_legs.transfer_departure_stop_id,
+            second_legs.second_to_stop_id,
+            second_legs.second_departure_time,
+            second_legs.second_arrival_time,
+            second_legs.second_mode,
+            first_legs.first_from_latest_import
+              AND second_legs.second_from_latest_import AS from_latest_import
+          FROM filtered_first_legs first_legs
+          JOIN filtered_second_legs second_legs
+            ON first_legs.first_trip_id <> second_legs.second_trip_id
+           AND second_legs.second_departure_time >= first_legs.first_arrival_time + $6
+           AND second_legs.second_departure_time <= first_legs.first_arrival_time + $7
            AND (
-             s_mid.id = filtered_second_legs.transfer_departure_stop_id
+             first_legs.transfer_arrival_stop_id = second_legs.transfer_departure_stop_id
              OR (
-               s_mid.normalized_name = filtered_second_legs.transfer_normalized_name
-               AND s_mid.lat IS NOT NULL
-               AND s_mid.lon IS NOT NULL
-               AND filtered_second_legs.transfer_lat IS NOT NULL
-               AND filtered_second_legs.transfer_lon IS NOT NULL
-               AND abs(s_mid.lat - filtered_second_legs.transfer_lat) < 0.00005
-               AND abs(s_mid.lon - filtered_second_legs.transfer_lon) < 0.00005
+               first_legs.transfer_normalized_name = second_legs.transfer_normalized_name
+               AND first_legs.transfer_lat IS NOT NULL
+               AND first_legs.transfer_lon IS NOT NULL
+               AND second_legs.transfer_lat IS NOT NULL
+               AND second_legs.transfer_lon IS NOT NULL
+               AND abs(first_legs.transfer_lat - second_legs.transfer_lat) < 0.0005
+               AND abs(first_legs.transfer_lon - second_legs.transfer_lon) < 0.0005
+             )
+             OR (
+               first_legs.transfer_arrival_stop_id LIKE '%SR70S-CZ-%'
+               AND second_legs.transfer_departure_stop_id LIKE '%SR70S-CZ-%'
+               AND regexp_replace(
+                 first_legs.transfer_arrival_stop_id,
+                 '-[0-9][[:alnum:]]{0,3}$',
+                 ''
+               ) = regexp_replace(
+                 second_legs.transfer_departure_stop_id,
+                 '-[0-9][[:alnum:]]{0,3}$',
+                 ''
+               )
              )
            )
-          JOIN stop_times st_mid ON st_mid.stop_id = s_mid.id
-          JOIN stop_times st_from
-            ON st_from.trip_id = st_mid.trip_id
-           AND st_mid.stop_sequence > st_from.stop_sequence
-          JOIN trips t ON t.id = st_from.trip_id
-          LEFT JOIN latest_import_runs lir
-            ON lir.source_feed_id = t.source_feed_id
-           AND lir.import_run_id = t.import_run_id
-          JOIN routes r ON r.id = t.route_id
-          WHERE st_from.stop_id = ANY($1)
-            AND st_from.departure_time >= $3
-            AND st_from.trip_id <> filtered_second_legs.second_trip_id
-            AND filtered_second_legs.second_departure_time >= st_mid.arrival_time + $6
-            AND filtered_second_legs.second_departure_time <= st_mid.arrival_time + $7
-            AND (
-              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
-              OR r.id IN (SELECT route_id FROM current_train_route_variants)
-            )
-            AND COALESCE(st_from.pickup_type, 0) = 0
-            AND COALESCE(st_mid.drop_off_type, 0) = 0
         )
         SELECT *
         FROM candidate_journeys
@@ -4656,6 +4740,41 @@ mod tests {
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].id, "stop-praha-hl-n");
+    }
+
+    #[test]
+    fn railway_platform_ids_resolve_to_the_same_station_base() {
+        let station = "ggu_czptt_gtfs_latest:-SR70S-CZ-35442";
+        assert_eq!(railway_station_stop_base(station).as_deref(), Some(station));
+        assert_eq!(
+            railway_station_stop_base("ggu_czptt_gtfs_latest:-SR70S-CZ-35442-4b").as_deref(),
+            Some(station)
+        );
+        assert_eq!(
+            canonical_journey_stop_id("ggu_czptt_gtfs_latest:-SR70S-CZ-35442-2"),
+            station
+        );
+    }
+
+    #[test]
+    fn railway_station_base_rejects_unrelated_or_malformed_ids() {
+        assert_eq!(railway_station_stop_base("ordinary-stop-2"), None);
+        assert_eq!(
+            railway_station_stop_base("ggu_czptt_gtfs_latest:-SR70S-CZ-station-2"),
+            None
+        );
+        assert_eq!(
+            canonical_journey_stop_id("ordinary-stop-2"),
+            "ordinary-stop-2"
+        );
+    }
+
+    #[test]
+    fn station_prefix_escapes_sql_like_wildcards() {
+        assert_eq!(
+            escaped_like_prefix("ggu_czptt_100%-SR70S-CZ-35442"),
+            "ggu\\_czptt\\_100\\%-SR70S-CZ-35442%"
+        );
     }
 
     #[tokio::test]
