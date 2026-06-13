@@ -49,8 +49,10 @@ const MAX_JOURNEY_RESULTS: usize = 5;
 const MAX_DIRECT_JOURNEY_CANDIDATES: i64 = 20;
 const MAX_TRANSFER_JOURNEY_CANDIDATES: i64 = 40;
 const SERVICE_DAY_SECONDS: u32 = 24 * 3600;
+const NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS: u32 = 18 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
+const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
@@ -2792,34 +2794,43 @@ async fn query_journeys_db(
         .iter()
         .filter_map(transport_mode_to_db)
         .collect::<Vec<_>>();
-    let mut journeys = direct_journeys_db(
+    let current_service_day_search = service_day_journeys_db(
         pool,
         &from_stop_ids,
         &to_stop_ids,
         departure_time,
         &mode_filters,
-    )
-    .await?;
-    if body.max_transfers > 0 {
-        journeys.append(
-            &mut one_transfer_journeys_db(
-                pool,
-                &from_stop_ids,
-                &to_stop_ids,
-                departure_time,
-                &mode_filters,
-            )
-            .await?,
+        body.max_transfers,
+    );
+    let include_next_service_day = should_search_next_service_day(departure_time);
+    let (current_service_day_result, next_service_day_result) = if include_next_service_day {
+        let next_service_day_search = service_day_journeys_db(
+            pool,
+            &from_stop_ids,
+            &to_stop_ids,
+            0,
+            &mode_filters,
+            body.max_transfers,
+        );
+        let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
+        (current, Some(next))
+    } else {
+        (current_service_day_search.await, None)
+    };
+
+    let (mut journeys, transfer_search_timed_out) = current_service_day_result?;
+    if transfer_search_timed_out {
+        warnings.push(
+            "transfer search exceeded the response deadline; direct journeys are still included"
+                .to_string(),
         );
     }
 
-    if departure_time > 0 {
-        let mut next_service_day_journeys =
-            direct_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters).await?;
-        if body.max_transfers > 0 {
-            next_service_day_journeys.append(
-                &mut one_transfer_journeys_db(pool, &from_stop_ids, &to_stop_ids, 0, &mode_filters)
-                    .await?,
+    if let Some(next_service_day_result) = next_service_day_result {
+        let (next_service_day_journeys, next_transfer_search_timed_out) = next_service_day_result?;
+        if next_transfer_search_timed_out {
+            warnings.push(
+                "next service-day transfer search exceeded the response deadline".to_string(),
             );
         }
         let mut next_service_day_journeys =
@@ -2843,6 +2854,54 @@ async fn query_journeys_db(
         journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids);
 
     Ok((journeys, warnings, related))
+}
+
+async fn service_day_journeys_db(
+    pool: &PgPool,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    departure_time: u32,
+    mode_filters: &[String],
+    max_transfers: u32,
+) -> Result<(Vec<Journey>, bool), sqlx::Error> {
+    let direct_search = direct_journeys_db(
+        pool,
+        from_stop_ids,
+        to_stop_ids,
+        departure_time,
+        mode_filters,
+    );
+    let transfer_search = async {
+        if max_transfers == 0 {
+            return Ok((Vec::new(), false));
+        }
+
+        match time::timeout(
+            std::time::Duration::from_secs(TRANSFER_SEARCH_TIMEOUT_SECONDS),
+            one_transfer_journeys_db(
+                pool,
+                from_stop_ids,
+                to_stop_ids,
+                departure_time,
+                mode_filters,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result.map(|journeys| (journeys, false)),
+            Err(_) => Ok((Vec::new(), true)),
+        }
+    };
+
+    let (direct_result, transfer_result) = tokio::join!(direct_search, transfer_search);
+    let mut journeys = direct_result?;
+    let (mut transfer_journeys, transfer_search_timed_out) = transfer_result?;
+    journeys.append(&mut transfer_journeys);
+    Ok((journeys, transfer_search_timed_out))
+}
+
+fn should_search_next_service_day(departure_time: u32) -> bool {
+    departure_time >= NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS
 }
 
 fn journey_query_context(
@@ -3327,9 +3386,13 @@ async fn one_transfer_journeys_db(
             st_mid.stop_id AS transfer_arrival_stop_id,
             st_from.departure_time AS first_departure_time,
             st_mid.arrival_time AS first_arrival_time,
-            s_mid.normalized_name AS transfer_normalized_name,
-            s_mid.lat AS transfer_lat,
-            s_mid.lon AS transfer_lon,
+            CASE
+              WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
+                THEN 'rail:' || regexp_replace(s_mid.id, '-[0-9][[:alnum:]]{0,3}$', '')
+              WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_mid.id
+              WHEN s_mid.stop_area_id IS NOT NULL THEN 'area:' || s_mid.stop_area_id
+              ELSE 'stop:' || s_mid.id
+            END AS transfer_key,
             lir.import_run_id IS NOT NULL AS first_from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
@@ -3362,7 +3425,7 @@ async fn one_transfer_journeys_db(
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_mid.drop_off_type, 0) = 0
         ),
-        filtered_first_legs AS MATERIALIZED (
+        filtered_first_legs AS (
           SELECT *
           FROM first_legs
           WHERE first_mode <> 'unknown'
@@ -3376,9 +3439,13 @@ async fn one_transfer_journeys_db(
             st_to.stop_id AS second_to_stop_id,
             st_transfer.departure_time AS second_departure_time,
             st_to.arrival_time AS second_arrival_time,
-            s_transfer.normalized_name AS transfer_normalized_name,
-            s_transfer.lat AS transfer_lat,
-            s_transfer.lon AS transfer_lon,
+            CASE
+              WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
+                THEN 'rail:' || regexp_replace(s_transfer.id, '-[0-9][[:alnum:]]{0,3}$', '')
+              WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_transfer.id
+              WHEN s_transfer.stop_area_id IS NOT NULL THEN 'area:' || s_transfer.stop_area_id
+              ELSE 'stop:' || s_transfer.id
+            END AS transfer_key,
             lir2.import_run_id IS NOT NULL AS second_from_latest_import,
             CASE
               WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR r2.gtfs_route_type BETWEEN 100 AND 199 OR r2.gtfs_route_type BETWEEN 400 AND 499 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
@@ -3411,7 +3478,7 @@ async fn one_transfer_journeys_db(
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
         ),
-        filtered_second_legs AS MATERIALIZED (
+        filtered_second_legs AS (
           SELECT *
           FROM second_legs
           WHERE second_mode <> 'unknown'
@@ -3440,31 +3507,7 @@ async fn one_transfer_journeys_db(
             ON first_legs.first_trip_id <> second_legs.second_trip_id
            AND second_legs.second_departure_time >= first_legs.first_arrival_time + $6
            AND second_legs.second_departure_time <= first_legs.first_arrival_time + $7
-           AND (
-             first_legs.transfer_arrival_stop_id = second_legs.transfer_departure_stop_id
-             OR (
-               first_legs.transfer_normalized_name = second_legs.transfer_normalized_name
-               AND first_legs.transfer_lat IS NOT NULL
-               AND first_legs.transfer_lon IS NOT NULL
-               AND second_legs.transfer_lat IS NOT NULL
-               AND second_legs.transfer_lon IS NOT NULL
-               AND abs(first_legs.transfer_lat - second_legs.transfer_lat) < 0.0005
-               AND abs(first_legs.transfer_lon - second_legs.transfer_lon) < 0.0005
-             )
-             OR (
-               first_legs.transfer_arrival_stop_id LIKE '%SR70S-CZ-%'
-               AND second_legs.transfer_departure_stop_id LIKE '%SR70S-CZ-%'
-               AND regexp_replace(
-                 first_legs.transfer_arrival_stop_id,
-                 '-[0-9][[:alnum:]]{0,3}$',
-                 ''
-               ) = regexp_replace(
-                 second_legs.transfer_departure_stop_id,
-                 '-[0-9][[:alnum:]]{0,3}$',
-                 ''
-               )
-             )
-           )
+           AND first_legs.transfer_key = second_legs.transfer_key
         )
         SELECT *
         FROM candidate_journeys
@@ -4995,6 +5038,13 @@ mod tests {
             journeys[0].legs[0].departure_time,
             SERVICE_DAY_SECONDS + 4 * 3600
         );
+    }
+
+    #[test]
+    fn next_service_day_query_only_runs_for_evening_departures() {
+        assert!(!should_search_next_service_day(17 * 3600 + 59 * 60));
+        assert!(should_search_next_service_day(18 * 3600));
+        assert!(should_search_next_service_day(19 * 3600 + 24 * 60));
     }
 
     #[test]
