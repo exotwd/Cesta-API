@@ -14,7 +14,7 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tokio::{fs, io::AsyncWriteExt};
-use transit_model::TransportMode;
+use transit_model::{TransportMode, normalize_czech_name};
 use uuid::Uuid;
 
 const GGU_FILES: &[(&str, &str, i32)] = &[
@@ -30,6 +30,8 @@ const GGU_FILES: &[(&str, &str, i32)] = &[
 
 const TRIP_BATCH_SIZE: usize = 10_000;
 const STOP_TIME_BATCH_SIZE: usize = 10_000;
+const DEFAULT_CZ_CITIES_URL: &str =
+    "https://raw.githubusercontent.com/33bcdd/souradnice-mest/master/souradnice.csv";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -205,6 +207,10 @@ enum Command {
     Summarize {
         target: Target,
     },
+    ImportCities {
+        #[arg(long, default_value = DEFAULT_CZ_CITIES_URL)]
+        source_url: String,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -271,8 +277,175 @@ async fn main() -> Result<()> {
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             summarize(&run_dir)?;
         }
+        Command::ImportCities { source_url } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for import-cities")?;
+            import_czech_cities(database_url, &source_url).await?;
+        }
     }
     Ok(())
+}
+
+async fn import_czech_cities(database_url: &str, source_url: &str) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(database_url)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0005_cities.sql"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let csv_bytes = reqwest::get(source_url)
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_bytes.as_ref());
+    let mut ids = Vec::new();
+    let mut official_ids = Vec::new();
+    let mut names = Vec::new();
+    let mut normalized_names = Vec::new();
+    let mut regions = Vec::new();
+    let mut lats = Vec::new();
+    let mut lons = Vec::new();
+    let mut importances = Vec::new();
+
+    for row in reader.records() {
+        let row = row?;
+        let name = row
+            .get(0)
+            .context("city row is missing municipality name")?;
+        let official_id = row
+            .get(1)
+            .context("city row is missing official municipality ID")?;
+        let region = row.get(4).context("city row is missing region")?;
+        let lat = row
+            .get(7)
+            .context("city row is missing latitude")?
+            .parse::<f64>()?;
+        let lon = row
+            .get(8)
+            .context("city row is missing longitude")?
+            .parse::<f64>()?;
+        ids.push(format!("city:CZ:{official_id}"));
+        official_ids.push(official_id.to_string());
+        normalized_names.push(normalize_czech_name(name));
+        importances.push(czech_city_importance(name));
+        names.push(name.to_string());
+        regions.push(region.to_string());
+        lats.push(lat);
+        lons.push(lon);
+    }
+
+    let imported: i64 = sqlx::query_scalar(
+        r#"
+        WITH imported AS (
+          INSERT INTO cities (
+            id, official_municipality_id, name, normalized_name, region,
+            country_code, lat, lon, importance, source_url, source_reference_date
+          )
+          SELECT
+            city.id, city.official_id, city.name, city.normalized_name,
+            city.region, 'CZ', city.lat, city.lon, city.importance, $9, DATE '2018-01-01'
+          FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[],
+            $5::text[], $6::double precision[], $7::double precision[], $8::integer[]
+          ) AS city(
+            id, official_id, name, normalized_name, region, lat, lon, importance
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            official_municipality_id = EXCLUDED.official_municipality_id,
+            name = EXCLUDED.name,
+            normalized_name = EXCLUDED.normalized_name,
+            region = EXCLUDED.region,
+            lat = EXCLUDED.lat,
+            lon = EXCLUDED.lon,
+            importance = EXCLUDED.importance,
+            source_url = EXCLUDED.source_url,
+            source_reference_date = EXCLUDED.source_reference_date
+          RETURNING 1
+        )
+        SELECT COUNT(*) FROM imported
+        "#,
+    )
+    .bind(&ids)
+    .bind(&official_ids)
+    .bind(&names)
+    .bind(&normalized_names)
+    .bind(&regions)
+    .bind(&lats)
+    .bind(&lons)
+    .bind(&importances)
+    .bind(source_url)
+    .fetch_one(&pool)
+    .await?;
+
+    let assigned_stops = sqlx::query(
+        r#"
+        UPDATE stops AS stop
+        SET
+          city_id = (
+            SELECT city.id
+            FROM cities AS city
+            WHERE city.country_code = 'CZ'
+              AND (
+                trim(regexp_replace(lower(unaccent(stop.name)), '[^a-z0-9]+', ' ', 'g')) = city.normalized_name
+                OR trim(regexp_replace(lower(unaccent(stop.name)), '[^a-z0-9]+', ' ', 'g')) LIKE city.normalized_name || ' %'
+              )
+            ORDER BY
+              CASE
+                WHEN stop.lat IS NOT NULL AND stop.lon IS NOT NULL
+                  THEN power(stop.lat - city.lat, 2) + power(stop.lon - city.lon, 2)
+                ELSE 1
+              END,
+              length(city.normalized_name) DESC,
+              city.importance DESC
+            LIMIT 1
+          ),
+          city_assignment_source = 'name_fallback'
+        WHERE city_assignment_source IS DISTINCT FROM 'official'
+          AND EXISTS (
+            SELECT 1
+            FROM cities AS city
+            WHERE city.country_code = 'CZ'
+              AND (
+                trim(regexp_replace(lower(unaccent(stop.name)), '[^a-z0-9]+', ' ', 'g')) = city.normalized_name
+                OR trim(regexp_replace(lower(unaccent(stop.name)), '[^a-z0-9]+', ' ', 'g')) LIKE city.normalized_name || ' %'
+              )
+          )
+        "#,
+    )
+    .execute(&pool)
+    .await?
+    .rows_affected();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source_url": source_url,
+            "cities_imported": imported,
+            "stops_assigned": assigned_stops
+        }))?
+    );
+    Ok(())
+}
+
+fn czech_city_importance(name: &str) -> i32 {
+    match normalize_czech_name(name).as_str() {
+        "praha" => 100,
+        "brno" => 90,
+        "ostrava" => 85,
+        "plzen" => 80,
+        "liberec" | "olomouc" => 75,
+        "ceske budejovice" | "hradec kralove" | "pardubice" => 70,
+        _ => 0,
+    }
 }
 
 async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathBuf> {
@@ -746,6 +919,12 @@ async fn export_dataset_to_postgres(
     manifest_entry: Option<&ManifestEntry>,
     checksum: Option<&str>,
 ) -> Result<serde_json::Value> {
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0005_cities.sql"
+    ))
+    .execute(pool)
+    .await?;
+
     let source = format!("{feed_id}:{file_name}");
     let import_run_id: Uuid = sqlx::query_scalar(
         "INSERT INTO import_runs (source, status, summary) VALUES ($1, 'running', $2) RETURNING id",
@@ -815,20 +994,58 @@ async fn export_dataset_to_postgres(
         let modes = stop.modes.iter().map(mode_to_db).collect::<Vec<_>>();
         sqlx::query(
             r#"
+            WITH resolved_city AS (
+              SELECT COALESCE(
+                (
+                  SELECT city.id
+                  FROM cities AS city
+                  WHERE city.country_code = 'CZ'
+                    AND city.normalized_name = $18
+                  ORDER BY
+                    CASE
+                      WHEN $9::double precision IS NOT NULL AND $10::double precision IS NOT NULL
+                        THEN power($9 - city.lat, 2) + power($10 - city.lon, 2)
+                      ELSE 1
+                    END,
+                    city.importance DESC
+                  LIMIT 1
+                ),
+                (
+                  SELECT city.id
+                  FROM cities AS city
+                  WHERE city.country_code = 'CZ'
+                    AND (
+                      $5 = city.normalized_name
+                      OR $5 LIKE city.normalized_name || ' %'
+                    )
+                  ORDER BY
+                    CASE
+                      WHEN $9::double precision IS NOT NULL AND $10::double precision IS NOT NULL
+                        THEN power($9 - city.lat, 2) + power($10 - city.lon, 2)
+                      ELSE 1
+                    END,
+                    length(city.normalized_name) DESC,
+                    city.importance DESC
+                  LIMIT 1
+                )
+              ) AS id
+            )
             INSERT INTO stops (
               id, import_run_id, source_feed_id, name, normalized_name, municipality, district, region,
               lat, lon, geom, coordinate_confidence, coordinate_source, stop_area_id, platform_code,
-              modes, source_priority, is_active
+              modes, source_priority, is_active, city_id, city_assignment_source
             )
-            VALUES (
+            SELECT
               $1, $2, $3, $4, $5, $6, $7, $8,
               $9, $10,
               CASE WHEN $9::double precision IS NULL OR $10::double precision IS NULL
                 THEN NULL
                 ELSE ST_SetSRID(ST_MakePoint($10, $9), 4326)::geography
               END,
-              $11, $12, $13, $14, $15, $16, $17
-            )
+              $11, $12, $13, $14, $15, $16, $17,
+              resolved_city.id,
+              CASE WHEN resolved_city.id IS NULL THEN NULL ELSE 'name_fallback' END
+            FROM resolved_city
             ON CONFLICT (id) DO UPDATE SET
               import_run_id = EXCLUDED.import_run_id,
               source_feed_id = EXCLUDED.source_feed_id,
@@ -842,7 +1059,9 @@ async fn export_dataset_to_postgres(
               platform_code = EXCLUDED.platform_code,
               modes = EXCLUDED.modes,
               source_priority = EXCLUDED.source_priority,
-              is_active = EXCLUDED.is_active
+              is_active = EXCLUDED.is_active,
+              city_id = EXCLUDED.city_id,
+              city_assignment_source = EXCLUDED.city_assignment_source
             WHERE (
               stops.import_run_id,
               stops.source_feed_id,
@@ -855,7 +1074,9 @@ async fn export_dataset_to_postgres(
               stops.platform_code,
               stops.modes,
               stops.source_priority,
-              stops.is_active
+              stops.is_active,
+              stops.city_id,
+              stops.city_assignment_source
             ) IS DISTINCT FROM (
               EXCLUDED.import_run_id,
               EXCLUDED.source_feed_id,
@@ -868,7 +1089,9 @@ async fn export_dataset_to_postgres(
               EXCLUDED.platform_code,
               EXCLUDED.modes,
               EXCLUDED.source_priority,
-              EXCLUDED.is_active
+              EXCLUDED.is_active,
+              EXCLUDED.city_id,
+              EXCLUDED.city_assignment_source
             )
             "#,
         )
@@ -889,6 +1112,12 @@ async fn export_dataset_to_postgres(
         .bind(&modes)
         .bind(priority)
         .bind(stop.is_active)
+        .bind(
+            stop.municipality
+                .as_deref()
+                .map(normalize_czech_name)
+                .unwrap_or_default(),
+        )
         .execute(pool)
         .await?;
 

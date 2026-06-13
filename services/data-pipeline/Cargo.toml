@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+csv.workspace = true
 futures-util.workspace = true
 gtfs-importer = { path = "../../crates/gtfs-importer" }
 reqwest.workspace = true

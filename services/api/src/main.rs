@@ -35,6 +35,7 @@ const DB_STAT_TABLES: &[&str] = &[
     "import_runs",
     "source_feeds",
     "agencies",
+    "cities",
     "stops",
     "stop_source_ids",
     "routes",
@@ -83,6 +84,7 @@ const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
     AdminEntitySpec { key: "source_feeds", table: "source_feeds", label: "Source feeds", row_expression: "to_jsonb(t)", order_by: "priority ASC, id ASC", map_available: false },
     AdminEntitySpec { key: "agencies", table: "agencies", label: "Agencies", row_expression: "to_jsonb(t)", order_by: "name ASC, id ASC", map_available: false },
     AdminEntitySpec { key: "operators", table: "operators", label: "Operators", row_expression: "to_jsonb(t)", order_by: "name ASC, id ASC", map_available: false },
+    AdminEntitySpec { key: "cities", table: "cities", label: "Cities", row_expression: "to_jsonb(t)", order_by: "importance DESC, name ASC, id ASC", map_available: false },
     AdminEntitySpec { key: "stop_areas", table: "stop_areas", label: "Stop areas", row_expression: "to_jsonb(t) - 'geom'", order_by: "name ASC, id ASC", map_available: true },
     AdminEntitySpec { key: "stops", table: "stops", label: "Stops", row_expression: "to_jsonb(t) - 'geom'", order_by: "name ASC, platform_code ASC NULLS FIRST, id ASC", map_available: true },
     AdminEntitySpec { key: "stop_source_ids", table: "stop_source_ids", label: "Stop source IDs", row_expression: "to_jsonb(t)", order_by: "stop_id ASC, priority ASC", map_available: false },
@@ -110,7 +112,10 @@ const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
 
 #[rustfmt::skip]
 const DATA_VALIDATION_CHECKS: &[DataValidationCheck] = &[
+    DataValidationCheck { code: "city_missing_required_data", severity: "error", entity: "cities", description: "Cities must retain a stable official municipality identifier, country and normalized name", table: "cities", id_expression: "id", predicate: "btrim(official_municipality_id) = '' OR btrim(country_code) = '' OR btrim(name) = '' OR btrim(normalized_name) = ''" },
+    DataValidationCheck { code: "city_invalid_coordinates", severity: "error", entity: "cities", description: "City coordinates must be within valid latitude and longitude ranges", table: "cities", id_expression: "id", predicate: "lat IS NOT NULL AND lon IS NOT NULL AND (lat < -90 OR lat > 90 OR lon < -180 OR lon > 180)" },
     DataValidationCheck { code: "stop_missing_name", severity: "error", entity: "stops", description: "Active stops must have a name and normalized name", table: "stops", id_expression: "id", predicate: "is_active = true AND (btrim(name) = '' OR btrim(normalized_name) = '')" },
+    DataValidationCheck { code: "stop_missing_city", severity: "warning", entity: "stops", description: "Active stops should be assigned to a stable city identifier", table: "stops", id_expression: "id", predicate: "is_active = true AND city_id IS NULL" },
     DataValidationCheck { code: "stop_missing_coordinates", severity: "warning", entity: "stops", description: "Active stops should have latitude and longitude", table: "stops", id_expression: "id", predicate: "is_active = true AND (lat IS NULL OR lon IS NULL)" },
     DataValidationCheck { code: "stop_invalid_coordinates", severity: "error", entity: "stops", description: "Stop coordinates must be within valid latitude and longitude ranges", table: "stops", id_expression: "id", predicate: "lat IS NOT NULL AND lon IS NOT NULL AND (lat < -90 OR lat > 90 OR lon < -180 OR lon > 180)" },
     DataValidationCheck { code: "stop_missing_source_tracking", severity: "error", entity: "stops", description: "Active stops must retain their source feed and original source identifier", table: "stops", id_expression: "id", predicate: "is_active = true AND (source_feed_id IS NULL OR NOT EXISTS (SELECT 1 FROM stop_source_ids source_ids WHERE source_ids.stop_id = stops.id))" },
@@ -133,9 +138,22 @@ struct AppState {
     saved_places: Arc<RwLock<HashMap<Uuid, Vec<SavedPlace>>>>,
     favorite_stops: Arc<RwLock<HashMap<Uuid, Vec<FavoriteStop>>>>,
     stops: Arc<Vec<Stop>>,
+    cities: Arc<Vec<City>>,
     db: Option<PgPool>,
     jwt_secret: String,
     use_mock_data: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct City {
+    id: String,
+    name: String,
+    normalized_name: String,
+    region: Option<String>,
+    country_code: String,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    importance: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +273,8 @@ struct FavoriteStop {
 struct StopSearchQuery {
     q: Option<String>,
     limit: Option<usize>,
+    #[serde(rename = "includeCities", default)]
+    include_cities: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,6 +376,7 @@ async fn app_state() -> anyhow::Result<AppState> {
         saved_places: Arc::new(RwLock::new(HashMap::new())),
         favorite_stops: Arc::new(RwLock::new(HashMap::new())),
         stops: Arc::new(fixture_stops()),
+        cities: Arc::new(fixture_cities()),
         db,
         jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-change-me".to_string()),
         use_mock_data,
@@ -382,7 +403,21 @@ async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPoo
     let mut last_error = None;
     for attempt in 1..=30 {
         match PgPool::connect(database_url).await {
-            Ok(pool) => return Ok(pool),
+            Ok(pool) => {
+                match sqlx::raw_sql(include_str!(
+                    "../../../infra/postgres/migrations/0005_cities.sql"
+                ))
+                .execute(&pool)
+                .await
+                {
+                    Ok(_) => return Ok(pool),
+                    Err(error) => {
+                        tracing::warn!(attempt, %error, "database schema is not ready yet");
+                        last_error = Some(error);
+                        time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(attempt, %error, "database is not ready yet");
                 last_error = Some(error);
@@ -507,17 +542,40 @@ async fn openapi() -> Json<Value> {
             "/auth/register": {"post": {"summary": "Register user"}},
             "/auth/login": {"post": {"summary": "Login user"}},
             "/stops/search": {"get": {
-                "summary": "Search stops",
-                "description": "Returns closest ranked stop suggestions using normalized, abbreviation and typo-tolerant matching, plus related source IDs, stop areas and routes.",
+                "summary": "Search stops and cities",
+                "description": "Returns ranked stop suggestions. When includeCities is true, cities and stops are returned together in results and separately for backwards compatibility.",
                 "parameters": [
                     {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}},
-                    {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}
-                ]
+                    {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}},
+                    {"name": "includeCities", "in": "query", "required": false, "schema": {"type": "boolean", "default": false}}
+                ],
+                "responses": {"200": {
+                    "description": "Ranked place suggestions",
+                    "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PlaceSearchResponse"}}}
+                }}
             }},
             "/departures": {"get": {"summary": "Stop departures"}},
             "/journeys/search": {"post": {
                 "summary": "Search journeys",
-                "description": "Returns ranked direct and one-transfer journey candidates with related stops, routes, trips, stop times, agencies, source feeds and query context."
+                "description": "Returns ranked journey candidates. City points expand to their assigned active physical stops.",
+                "requestBody": {
+                    "required": true,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["from", "to", "datetime", "mode", "transport_modes", "max_transfers", "walking_speed", "prefer_reliable_transfers", "offline_compatible"],
+                        "properties": {
+                            "from": {"$ref": "#/components/schemas/JourneyPoint"},
+                            "to": {"$ref": "#/components/schemas/JourneyPoint"},
+                            "datetime": {"type": "string"},
+                            "mode": {"type": "string"},
+                            "transport_modes": {"type": "array", "items": {"type": "string"}},
+                            "max_transfers": {"type": "integer", "minimum": 0},
+                            "walking_speed": {"type": "string"},
+                            "prefer_reliable_transfers": {"type": "boolean"},
+                            "offline_compatible": {"type": "boolean"}
+                        }
+                    }}}
+                }
             }},
             "/admin": {"get": {
                 "summary": "Cesta data administration interface",
@@ -558,6 +616,67 @@ async fn openapi() -> Json<Value> {
             "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
             "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
+        },
+        "components": {
+            "schemas": {
+                "PlaceType": {
+                    "type": "string",
+                    "enum": ["city", "railway_station", "railway_stop", "bus_station", "bus_stop", "tram_stop", "metro_station", "ferry_terminal", "airport", "stop"]
+                },
+                "CitySearchResult": {
+                    "type": "object",
+                    "required": ["id", "name", "place_type", "country_code", "modes"],
+                    "properties": {
+                        "id": {"type": "string", "pattern": "^city:[A-Z]{2}:.+$"},
+                        "name": {"type": "string"},
+                        "place_type": {"type": "string", "enum": ["city"]},
+                        "region": {"type": ["string", "null"]},
+                        "country_code": {"type": "string"},
+                        "lat": {"type": ["number", "null"]},
+                        "lon": {"type": ["number", "null"]},
+                        "modes": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "StopSearchResult": {
+                    "type": "object",
+                    "required": ["id", "name", "place_type", "modes"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                        "place_type": {"$ref": "#/components/schemas/PlaceType"},
+                        "municipality": {"type": ["string", "null"]},
+                        "region": {"type": ["string", "null"]},
+                        "lat": {"type": ["number", "null"]},
+                        "lon": {"type": ["number", "null"]},
+                        "modes": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "PlaceSearchResponse": {
+                    "type": "object",
+                    "required": ["stops"],
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {"oneOf": [
+                                {"$ref": "#/components/schemas/CitySearchResult"},
+                                {"$ref": "#/components/schemas/StopSearchResult"}
+                            ]}
+                        },
+                        "cities": {"type": "array", "items": {"$ref": "#/components/schemas/CitySearchResult"}},
+                        "stops": {"type": "array", "items": {"$ref": "#/components/schemas/StopSearchResult"}}
+                    }
+                },
+                "JourneyPoint": {
+                    "type": "object",
+                    "required": ["type", "id"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["stop", "city"]},
+                        "id": {"type": "string"},
+                        "lat": {"type": ["number", "null"]},
+                        "lon": {"type": ["number", "null"]}
+                    }
+                }
+            }
         }
     }))
 }
@@ -852,33 +971,122 @@ async fn search_stops(
     let normalized = normalize_search_text(&q);
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
     if let Some(pool) = &state.db {
-        return match search_stops_db(pool, &q, &normalized, limit).await {
+        return match search_stops_db(pool, &q, &normalized, 50).await {
             Ok(stops) => {
-                let related = stop_search_related_data_db(pool, &stops)
+                let cities = if query.include_cities {
+                    search_cities_db(pool, &q, &normalized, 50)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let (results, visible_cities, visible_stops) =
+                    ranked_place_suggestions(&cities, &stops, &normalized, limit);
+                let related = stop_search_related_data_db(pool, &visible_stops)
                     .await
                     .unwrap_or_else(|error| {
                         json!({"warnings": [format!("database stop related data failed: {error}")]})
                     });
-                Json(json!({
-                    "stops": stops,
-                    "related": related,
-                    "data_status": database_data_status()
-                }))
+                if query.include_cities {
+                    Json(json!({
+                        "results": results,
+                        "cities": visible_cities.into_iter().map(|city| city_search_json(&city)).collect::<Vec<_>>(),
+                        "stops": visible_stops.iter().map(stop_search_json).collect::<Vec<_>>(),
+                        "related": related,
+                        "data_status": database_data_status()
+                    }))
+                } else {
+                    Json(json!({
+                        "stops": visible_stops.iter().map(stop_search_json).collect::<Vec<_>>(),
+                        "related": related,
+                        "data_status": database_data_status()
+                    }))
+                }
             }
-            Err(error) => Json(json!({
-                "stops": [],
-                "data_status": {
+            Err(error) => {
+                let data_status = json!({
                     "source": "database",
                     "schedule": "unknown",
                     "realtime": "unavailable",
                     "warnings": [format!("database stop search failed: {error}")]
+                });
+                if query.include_cities {
+                    Json(json!({
+                        "results": [],
+                        "cities": [],
+                        "stops": [],
+                        "data_status": data_status
+                    }))
+                } else {
+                    Json(json!({"stops": [], "data_status": data_status}))
                 }
-            })),
+            }
         };
     }
 
     let stops = ranked_stop_suggestions(state.stops.iter(), &normalized, limit);
-    Json(json!({"stops": stops, "data_status": mock_status(state.use_mock_data)}))
+    if query.include_cities {
+        let cities = ranked_city_suggestions(state.cities.iter(), &normalized, 50);
+        let (results, visible_cities, visible_stops) =
+            ranked_place_suggestions(&cities, &stops, &normalized, limit);
+        Json(json!({
+            "results": results,
+            "cities": visible_cities.into_iter().map(|city| city_search_json(&city)).collect::<Vec<_>>(),
+            "stops": visible_stops.iter().map(stop_search_json).collect::<Vec<_>>(),
+            "data_status": mock_status(state.use_mock_data)
+        }))
+    } else {
+        Json(json!({
+            "stops": stops.iter().map(stop_search_json).collect::<Vec<_>>(),
+            "data_status": mock_status(state.use_mock_data)
+        }))
+    }
+}
+
+fn ranked_place_suggestions(
+    cities: &[City],
+    stops: &[Stop],
+    normalized_query: &str,
+    limit: usize,
+) -> (Vec<Value>, Vec<City>, Vec<Stop>) {
+    enum Candidate<'a> {
+        City(&'a City),
+        Stop(&'a Stop),
+    }
+
+    let mut candidates = cities
+        .iter()
+        .filter_map(|city| {
+            city_search_score(city, normalized_query)
+                .map(|score| (score, city.name.as_str(), Candidate::City(city)))
+        })
+        .chain(stops.iter().filter_map(|stop| {
+            stop_search_score(stop, normalized_query)
+                .map(|score| (score, stop.name.as_str(), Candidate::Stop(stop)))
+        }))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_score, left_name, _), (right_score, right_name, _)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_name.cmp(right_name))
+    });
+
+    let mut results = Vec::new();
+    let mut visible_cities = Vec::new();
+    let mut visible_stops = Vec::new();
+    for (_, _, candidate) in candidates.into_iter().take(limit) {
+        match candidate {
+            Candidate::City(city) => {
+                results.push(city_search_json(city));
+                visible_cities.push(city.clone());
+            }
+            Candidate::Stop(stop) => {
+                results.push(stop_search_json(stop));
+                visible_stops.push(stop.clone());
+            }
+        }
+    }
+    (results, visible_cities, visible_stops)
 }
 
 fn ranked_stop_suggestions<'a>(
@@ -1051,6 +1259,8 @@ async fn journey_search(
     );
 
     if let Some(pool) = &state.db {
+        validate_journey_point_db(pool, &body.from).await?;
+        validate_journey_point_db(pool, &body.to).await?;
         return match query_journeys_db(pool, &body, departure_time).await {
             Ok((journeys, warnings, related)) => Ok(Json(json!({
                 "journeys": journeys,
@@ -1071,19 +1281,22 @@ async fn journey_search(
         };
     }
 
-    let from_stop_id =
-        resolve_journey_point_fixture(&state.stops, &body.from).unwrap_or_else(|| {
+    validate_journey_point_fixture(&state.cities, &body.from)?;
+    validate_journey_point_fixture(&state.cities, &body.to)?;
+    let from_stop_id = resolve_journey_point_fixture(&state.stops, &state.cities, &body.from)
+        .unwrap_or_else(|| {
             body.from
                 .id
                 .clone()
                 .unwrap_or_else(|| body.from.point_type.clone())
         });
-    let to_stop_id = resolve_journey_point_fixture(&state.stops, &body.to).unwrap_or_else(|| {
-        body.to
-            .id
-            .clone()
-            .unwrap_or_else(|| body.to.point_type.clone())
-    });
+    let to_stop_id = resolve_journey_point_fixture(&state.stops, &state.cities, &body.to)
+        .unwrap_or_else(|| {
+            body.to
+                .id
+                .clone()
+                .unwrap_or_else(|| body.to.point_type.clone())
+        });
     let mut journeys = earliest_arrivals(
         &fixture_snapshot(),
         RoutingSearchRequest {
@@ -3130,6 +3343,19 @@ async fn resolve_journey_point_db(
         .unwrap_or(&point.point_type);
     let mut warnings = Vec::new();
 
+    if point.point_type == "city" {
+        let stop_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM stops WHERE is_active = true AND city_id = $1 ORDER BY id",
+        )
+        .bind(candidate)
+        .fetch_all(pool)
+        .await?;
+        if stop_ids.is_empty() {
+            warnings.push(format!("city '{candidate}' has no active assigned stops"));
+        }
+        return Ok((stop_ids, warnings));
+    }
+
     if let Some(stop) = get_stop_db(pool, candidate).await? {
         return Ok((equivalent_stop_ids_db(pool, &stop).await?, warnings));
     }
@@ -3151,6 +3377,44 @@ async fn resolve_journey_point_db(
 
     warnings.push(format!("could not resolve stop query '{candidate}'"));
     Ok((Vec::new(), warnings))
+}
+
+async fn validate_journey_point_db(pool: &PgPool, point: &JourneyPoint) -> Result<(), ApiError> {
+    match point.point_type.as_str() {
+        "stop" => Ok(()),
+        "city" => {
+            let city_id = point
+                .id
+                .as_deref()
+                .filter(|id| id.starts_with("city:") && !id.trim().is_empty())
+                .ok_or_else(|| invalid_city_id(point.id.as_deref()))?;
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cities WHERE id = $1)")
+                    .bind(city_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(internal_error)?;
+            if exists {
+                Ok(())
+            } else {
+                Err(invalid_city_id(Some(city_id)))
+            }
+        }
+        other => Err(ApiError {
+            code: "invalid_journey_point_type".to_string(),
+            message: format!("journey point type '{other}' is not supported; use 'stop' or 'city'"),
+        }),
+    }
+}
+
+fn invalid_city_id(city_id: Option<&str>) -> ApiError {
+    ApiError {
+        code: "invalid_city_id".to_string(),
+        message: format!(
+            "city ID '{}' is invalid or unknown",
+            city_id.unwrap_or_default()
+        ),
+    }
 }
 
 async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String>, sqlx::Error> {
@@ -3902,6 +4166,61 @@ async fn search_stops_db(
     ))
 }
 
+async fn search_cities_db(
+    pool: &PgPool,
+    raw_query: &str,
+    normalized_query: &str,
+    limit: usize,
+) -> Result<Vec<City>, sqlx::Error> {
+    let normalized = normalized_query.to_string();
+    let prefix = format!("{normalized}%");
+    let contains = format!("%{normalized}%");
+    let rows = sqlx::query(
+        r#"
+        SELECT id, name, normalized_name, region, country_code, lat, lon, importance
+        FROM cities
+        WHERE $1 = ''
+           OR id = $2
+           OR normalized_name = $1
+           OR normalized_name LIKE $3
+           OR normalized_name LIKE $4
+           OR normalized_name % $1
+        ORDER BY
+          CASE
+            WHEN id = $2 THEN 0
+            WHEN normalized_name = $1 THEN 1
+            WHEN normalized_name LIKE $3 THEN 2
+            ELSE 3
+          END,
+          similarity(normalized_name, $1) DESC,
+          importance DESC,
+          name ASC
+        LIMIT $5
+        "#,
+    )
+    .bind(&normalized)
+    .bind(raw_query.trim())
+    .bind(&prefix)
+    .bind(&contains)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| City {
+            id: row.get("id"),
+            name: row.get("name"),
+            normalized_name: row.get("normalized_name"),
+            region: row.get("region"),
+            country_code: row.get("country_code"),
+            lat: row.get("lat"),
+            lon: row.get("lon"),
+            importance: row.get("importance"),
+        })
+        .collect())
+}
+
 async fn nearby_stops_db(
     pool: &PgPool,
     lat: f64,
@@ -4172,11 +4491,19 @@ fn database_data_status() -> Value {
     })
 }
 
-fn resolve_journey_point_fixture(stops: &[Stop], point: &JourneyPoint) -> Option<String> {
+fn resolve_journey_point_fixture(
+    stops: &[Stop],
+    cities: &[City],
+    point: &JourneyPoint,
+) -> Option<String> {
     let candidate = point
         .id
         .as_deref()
         .filter(|value| !value.trim().is_empty())?;
+
+    if point.point_type == "city" {
+        return fixture_city_stop_id(cities, candidate).map(str::to_string);
+    }
 
     if stops.iter().any(|stop| stop.id == candidate) {
         return Some(canonical_stop_id(stops, candidate));
@@ -4186,6 +4513,38 @@ fn resolve_journey_point_fixture(stops: &[Stop], point: &JourneyPoint) -> Option
         .into_iter()
         .next()
         .map(|stop| stop.id)
+}
+
+fn validate_journey_point_fixture(cities: &[City], point: &JourneyPoint) -> Result<(), ApiError> {
+    match point.point_type.as_str() {
+        "stop" => Ok(()),
+        "city" => {
+            let city_id = point
+                .id
+                .as_deref()
+                .filter(|id| id.starts_with("city:") && !id.trim().is_empty())
+                .ok_or_else(|| invalid_city_id(point.id.as_deref()))?;
+            if cities.iter().any(|city| city.id == city_id) {
+                Ok(())
+            } else {
+                Err(invalid_city_id(Some(city_id)))
+            }
+        }
+        other => Err(ApiError {
+            code: "invalid_journey_point_type".to_string(),
+            message: format!("journey point type '{other}' is not supported; use 'stop' or 'city'"),
+        }),
+    }
+}
+
+fn fixture_city_stop_id<'a>(cities: &'a [City], city_id: &str) -> Option<&'a str> {
+    cities.iter().find(|city| city.id == city_id)?;
+    match city_id {
+        "city:CZ:554782" => Some("stop-praha-hl-n"),
+        "city:CZ:582786" => Some("stop-brno-hl-n"),
+        "city:CZ:586846" => Some("stop-jihlava"),
+        _ => None,
+    }
 }
 
 fn canonical_stop_id(stops: &[Stop], stop_id: &str) -> String {
@@ -4321,6 +4680,108 @@ fn stop_search_score(stop: &Stop, query: &str) -> Option<i32> {
             + if stop.is_active { 10 } else { 0 }
             + if stop.platform_code.is_none() { 20 } else { 0 }
     })
+}
+
+fn city_search_score(city: &City, query: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(city.importance);
+    }
+
+    let name = normalize_search_text(&city.name);
+    let normalized_name = normalize_search_text(&city.normalized_name);
+    let mut score = if name == query || normalized_name == query {
+        Some(10_000)
+    } else if name.starts_with(query) || normalized_name.starts_with(query) {
+        Some(9_000 - (name.len() as i32 - query.len() as i32).abs())
+    } else if let Some(position) = normalized_name.find(query) {
+        Some(8_000 - position as i32)
+    } else {
+        None
+    };
+
+    if query.chars().count() >= 3 {
+        let distance = levenshtein(query, &name);
+        let max_len = query.chars().count().max(name.chars().count());
+        let ratio = 1.0 - (distance as f64 / max_len as f64);
+        if ratio >= 0.62 || distance <= typo_distance_threshold(query.chars().count()) {
+            score = score.max(Some(6_000 + (ratio * 500.0) as i32 - distance as i32));
+        }
+    }
+
+    score.map(|value| value + city.importance)
+}
+
+fn ranked_city_suggestions<'a>(
+    cities: impl Iterator<Item = &'a City>,
+    normalized_query: &str,
+    limit: usize,
+) -> Vec<City> {
+    let mut cities = cities
+        .filter_map(|city| city_search_score(city, normalized_query).map(|score| (score, city)))
+        .collect::<Vec<_>>();
+    cities.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    cities
+        .into_iter()
+        .take(limit)
+        .map(|(_, city)| city.clone())
+        .collect()
+}
+
+fn city_search_json(city: &City) -> Value {
+    json!({
+        "id": city.id,
+        "name": city.name,
+        "normalized_name": city.normalized_name,
+        "place_type": "city",
+        "region": city.region,
+        "country_code": city.country_code,
+        "lat": city.lat,
+        "lon": city.lon,
+        "modes": []
+    })
+}
+
+fn stop_search_json(stop: &Stop) -> Value {
+    let mut value = serde_json::to_value(stop).unwrap_or_else(|_| json!({}));
+    value["place_type"] = json!(stop_place_type(stop));
+    value
+}
+
+fn stop_place_type(stop: &Stop) -> &'static str {
+    let normalized_name = normalize_search_text(&stop.name);
+    if normalized_name.contains("letiste") || normalized_name.contains("airport") {
+        return "airport";
+    }
+    if stop.modes.contains(&TransportMode::Metro) {
+        return "metro_station";
+    }
+    if stop.modes.contains(&TransportMode::Tram) {
+        return "tram_stop";
+    }
+    if stop.modes.contains(&TransportMode::Ferry) {
+        return "ferry_terminal";
+    }
+    if stop.modes.contains(&TransportMode::Train) {
+        return if stop.platform_code.is_none() {
+            "railway_station"
+        } else {
+            "railway_stop"
+        };
+    }
+    if stop.modes.contains(&TransportMode::Bus) || stop.modes.contains(&TransportMode::Trolleybus) {
+        return if normalized_name.contains("autobusove nadrazi")
+            || normalized_name.contains("bus station")
+        {
+            "bus_station"
+        } else {
+            "bus_stop"
+        };
+    }
+    "stop"
 }
 
 fn stop_suggestion_key(stop: &Stop) -> String {
@@ -4497,6 +4958,7 @@ fn levenshtein(left: &str, right: &str) -> usize {
 
 fn fixture_stops() -> Vec<Stop> {
     vec![
+        fixture_stop("stop-praha", "Praha", 50.0755, 14.4378, TransportMode::Bus),
         fixture_stop(
             "stop-praha-hl-n",
             "Praha hlavni nadrazi",
@@ -4521,7 +4983,61 @@ fn fixture_stops() -> Vec<Stop> {
     ]
 }
 
+fn fixture_cities() -> Vec<City> {
+    vec![
+        City {
+            id: "city:CZ:554782".to_string(),
+            name: "Praha".to_string(),
+            normalized_name: "praha".to_string(),
+            region: Some("Hlavni mesto Praha".to_string()),
+            country_code: "CZ".to_string(),
+            lat: Some(50.0755),
+            lon: Some(14.4378),
+            importance: 100,
+        },
+        City {
+            id: "city:CZ:582786".to_string(),
+            name: "Brno".to_string(),
+            normalized_name: "brno".to_string(),
+            region: Some("Jihomoravsky kraj".to_string()),
+            country_code: "CZ".to_string(),
+            lat: Some(49.1951),
+            lon: Some(16.6068),
+            importance: 90,
+        },
+        City {
+            id: "city:CZ:544256".to_string(),
+            name: "Ceske Budejovice".to_string(),
+            normalized_name: "ceske budejovice".to_string(),
+            region: Some("Jihocesky kraj".to_string()),
+            country_code: "CZ".to_string(),
+            lat: Some(48.9747),
+            lon: Some(14.4749),
+            importance: 70,
+        },
+        City {
+            id: "city:CZ:586846".to_string(),
+            name: "Jihlava".to_string(),
+            normalized_name: "jihlava".to_string(),
+            region: Some("Kraj Vysocina".to_string()),
+            country_code: "CZ".to_string(),
+            lat: Some(49.3961),
+            lon: Some(15.5912),
+            importance: 65,
+        },
+    ]
+}
+
 fn fixture_stop(id: &str, name: &str, lat: f64, lon: f64, mode: TransportMode) -> Stop {
+    let municipality = if id.starts_with("stop-praha") {
+        Some("Praha".to_string())
+    } else if id.starts_with("stop-brno") {
+        Some("Brno".to_string())
+    } else if id.starts_with("stop-jihlava") {
+        Some("Jihlava".to_string())
+    } else {
+        None
+    };
     Stop {
         id: id.to_string(),
         source_ids: vec![transit_model::SourceRef {
@@ -4534,7 +5050,7 @@ fn fixture_stop(id: &str, name: &str, lat: f64, lon: f64, mode: TransportMode) -
         }],
         name: name.to_string(),
         normalized_name: normalize_czech_name(name),
-        municipality: None,
+        municipality,
         district: None,
         region: None,
         lat: Some(lat),
@@ -4612,6 +5128,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_city_search_and_journey_points() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["paths"]["/stops/search"]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["name"] == "includeCities")
+        );
+        assert_eq!(
+            payload["components"]["schemas"]["JourneyPoint"]["properties"]["type"]["enum"],
+            json!(["stop", "city"])
+        );
+        assert!(
+            payload["components"]["schemas"]["PlaceType"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "city")
+        );
     }
 
     #[tokio::test]
@@ -4783,6 +5334,220 @@ mod tests {
 
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].id, "stop-praha-hl-n");
+    }
+
+    #[tokio::test]
+    async fn place_search_returns_praha_city_and_main_station() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=Praha&limit=20&includeCities=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let results = payload["results"].as_array().unwrap();
+        assert!(
+            results.iter().any(|result| {
+                result["id"] == "city:CZ:554782" && result["place_type"] == "city"
+            })
+        );
+        assert!(results.iter().any(|result| {
+            result["id"] == "stop-praha-hl-n" && result["place_type"] == "railway_station"
+        }));
+    }
+
+    #[tokio::test]
+    async fn place_search_finds_ceske_budejovice_without_diacritics() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=Ceske%20Budejovice&includeCities=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            payload["results"].as_array().unwrap().iter().any(|result| {
+                result["id"] == "city:CZ:544256" && result["place_type"] == "city"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn city_and_same_named_stop_have_distinct_ids() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=Praha&includeCities=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let results = payload["results"].as_array().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|result| result["id"] == "city:CZ:554782")
+        );
+        assert!(results.iter().any(|result| result["id"] == "stop-praha"));
+    }
+
+    #[tokio::test]
+    async fn include_cities_false_preserves_stop_only_response() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?q=Praha&includeCities=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload.get("results").is_none());
+        assert!(payload.get("cities").is_none());
+        assert!(
+            payload["stops"].as_array().unwrap().iter().all(|result| {
+                result["place_type"] != "city" && result["id"] != "city:CZ:554782"
+            })
+        );
+    }
+
+    fn journey_search_request(
+        from_type: &str,
+        from_id: &str,
+        to_type: &str,
+        to_id: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/journeys/search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "from": {"type": from_type, "id": from_id},
+                    "to": {"type": to_type, "id": to_id},
+                    "datetime": "2026-07-06T07:05:00+02:00",
+                    "mode": "depart_at",
+                    "transport_modes": ["train"],
+                    "max_transfers": 4,
+                    "walking_speed": "normal",
+                    "prefer_reliable_transfers": true,
+                    "offline_compatible": false
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn journey_from_city_to_stop_uses_concrete_stop() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(journey_search_request(
+                "city",
+                "city:CZ:554782",
+                "stop",
+                "stop-brno-hl-n",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["journeys"][0]["legs"][0]["from_stop_id"],
+            "stop-praha-hl-n"
+        );
+    }
+
+    #[tokio::test]
+    async fn journey_from_stop_to_city_uses_concrete_stop() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(journey_search_request(
+                "stop",
+                "stop-praha-hl-n",
+                "city",
+                "city:CZ:582786",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["journeys"][0]["legs"][0]["to_stop_id"],
+            "stop-brno-hl-n"
+        );
+    }
+
+    #[tokio::test]
+    async fn journey_between_cities_uses_concrete_stops() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(journey_search_request(
+                "city",
+                "city:CZ:554782",
+                "city",
+                "city:CZ:582786",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["journeys"][0]["legs"][0]["from_stop_id"],
+            "stop-praha-hl-n"
+        );
+        assert_eq!(
+            payload["journeys"][0]["legs"][0]["to_stop_id"],
+            "stop-brno-hl-n"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_city_id_returns_readable_bad_request() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(journey_search_request(
+                "city",
+                "city:CZ:does-not-exist",
+                "stop",
+                "stop-brno-hl-n",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], "invalid_city_id");
+        assert!(payload["message"].as_str().unwrap().contains("unknown"));
     }
 
     #[test]

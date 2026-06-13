@@ -242,12 +242,41 @@ pub struct TicketOption {
 }
 
 pub fn normalize_czech_name(value: &str) -> String {
-    value
-        .trim()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut normalized = String::new();
+    let mut previous_was_space = true;
+
+    for character in value.trim().to_lowercase().chars() {
+        let folded = match character {
+            '\u{00e1}' | '\u{00e0}' | '\u{00e2}' | '\u{00e4}' => Some('a'),
+            '\u{010d}' => Some('c'),
+            '\u{010f}' => Some('d'),
+            '\u{00e9}' | '\u{011b}' | '\u{00e8}' | '\u{00ea}' | '\u{00eb}' => Some('e'),
+            '\u{00ed}' | '\u{00ec}' | '\u{00ee}' | '\u{00ef}' => Some('i'),
+            '\u{0148}' => Some('n'),
+            '\u{00f3}' | '\u{00f2}' | '\u{00f4}' | '\u{00f6}' => Some('o'),
+            '\u{0159}' => Some('r'),
+            '\u{0161}' => Some('s'),
+            '\u{0165}' => Some('t'),
+            '\u{00fa}' | '\u{016f}' | '\u{00f9}' | '\u{00fb}' | '\u{00fc}' => Some('u'),
+            '\u{00fd}' | '\u{00ff}' => Some('y'),
+            '\u{017e}' => Some('z'),
+            character if character.is_ascii_alphanumeric() => Some(character),
+            _ => None,
+        };
+
+        if let Some(character) = folded {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    if normalized.ends_with(' ') {
+        normalized.pop();
+    }
+    normalized
 }
 
 pub fn parse_gtfs_time(value: &str) -> Option<u32> {
@@ -267,4 +296,21 @@ pub fn seconds_to_time(value: u32) -> String {
 
 pub fn naive_time_to_seconds(value: NaiveTime) -> u32 {
     value.signed_duration_since(NaiveTime::MIN).num_seconds() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_czech_names_without_diacritics_or_punctuation() {
+        assert_eq!(
+            normalize_czech_name("  Ceske Budejovice, hlavni nadrazi  "),
+            "ceske budejovice hlavni nadrazi"
+        );
+        assert_eq!(
+            normalize_czech_name("\u{010c}esk\u{00e9} Bud\u{011b}jovice"),
+            "ceske budejovice"
+        );
+    }
 }
