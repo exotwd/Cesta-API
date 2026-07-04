@@ -1228,21 +1228,20 @@ fn ranked_stop_suggestions<'a>(
         },
     );
 
-    let mut seen = HashMap::new();
-    scored_stops
-        .into_iter()
-        .map(|(_, _, stop)| stop)
-        .filter(|stop| {
-            let key = stop_suggestion_key(stop);
-            if seen.contains_key(&key) {
-                false
-            } else {
-                seen.insert(key, ());
-                true
-            }
-        })
-        .take(limit)
-        .collect()
+    let mut suggestions: Vec<Stop> = Vec::new();
+    for stop in scored_stops.into_iter().map(|(_, _, stop)| stop) {
+        if suggestions
+            .iter()
+            .any(|existing| stops_are_same_suggestion(existing, &stop))
+        {
+            continue;
+        }
+        suggestions.push(stop);
+        if suggestions.len() == limit {
+            break;
+        }
+    }
+    suggestions
 }
 
 async fn nearby_stops(
@@ -3348,8 +3347,7 @@ async fn query_journeys_db(
     let (mut journeys, transfer_search_timed_out) = current_service_day_result?;
     if transfer_search_timed_out {
         warnings.push(
-            "transfer search exceeded the response deadline; direct journeys are still included"
-                .to_string(),
+            "transfer search did not complete; direct journeys are still included".to_string(),
         );
     }
 
@@ -3357,7 +3355,37 @@ async fn query_journeys_db(
         let (next_service_day_journeys, next_transfer_search_timed_out) = next_service_day_result?;
         if next_transfer_search_timed_out {
             warnings.push(
-                "next service-day transfer search exceeded the response deadline".to_string(),
+                "next service-day transfer search did not complete; direct journeys are still included"
+                    .to_string(),
+            );
+        }
+        let mut next_service_day_journeys = next_service_day_journeys
+            .into_iter()
+            .map(|journey| shift_journey_service_day(journey, SERVICE_DAY_SECONDS))
+            .collect::<Vec<_>>();
+        if !next_service_day_journeys.is_empty() {
+            journeys.append(&mut next_service_day_journeys);
+            warnings.push(
+                "included next service-day journeys because early-morning departures occur after the requested time"
+                    .to_string(),
+            );
+        }
+    }
+    if journeys.is_empty() && !include_next_service_day {
+        let (next_service_day_journeys, next_transfer_search_timed_out) = service_day_journeys_db(
+            pool,
+            &from_stop_ids,
+            &to_stop_ids,
+            0,
+            &mode_filters,
+            body.max_transfers,
+            service_date.succ_opt().unwrap_or(service_date),
+        )
+        .await?;
+        if next_transfer_search_timed_out {
+            warnings.push(
+                "next service-day transfer search did not complete; direct journeys are still included"
+                    .to_string(),
             );
         }
         let mut next_service_day_journeys =
@@ -3365,7 +3393,7 @@ async fn query_journeys_db(
         if !next_service_day_journeys.is_empty() {
             journeys.append(&mut next_service_day_journeys);
             warnings.push(
-                "included next service-day journeys because early-morning departures occur after the requested time"
+                "included next service-day journeys because no later service was available on the requested day"
                     .to_string(),
             );
         }
@@ -3463,7 +3491,7 @@ async fn service_day_journeys_db(
     );
     let transfer_search = async {
         if max_transfers == 0 {
-            return Ok((Vec::new(), false));
+            return Ok::<_, sqlx::Error>((Vec::new(), false));
         }
 
         match time::timeout(
@@ -3479,7 +3507,8 @@ async fn service_day_journeys_db(
         )
         .await
         {
-            Ok(result) => result.map(|journeys| (journeys, false)),
+            Ok(Ok(journeys)) => Ok((journeys, false)),
+            Ok(Err(_)) => Ok((Vec::new(), true)),
             Err(_) => Ok((Vec::new(), true)),
         }
     };
@@ -3561,7 +3590,7 @@ async fn dedupe_relevant_journeys_db(
     } else {
         sqlx::query(
             r#"
-            SELECT id, normalized_name, municipality, lat, lon, stop_area_id
+            SELECT id, name, normalized_name, municipality, lat, lon, stop_area_id
             FROM stops
             WHERE id = ANY($1)
             "#,
@@ -3574,11 +3603,15 @@ async fn dedupe_relevant_journeys_db(
         .into_iter()
         .map(|row| {
             let id = row.get::<String, _>("id");
-            let normalized_name = row.get::<String, _>("normalized_name");
-            let municipality = row
-                .get::<Option<String>, _>("municipality")
-                .map(|value| normalize_czech_name(&value))
+            let municipality_value = row.get::<Option<String>, _>("municipality");
+            let municipality = municipality_value
+                .as_deref()
+                .map(normalize_search_text)
                 .unwrap_or_default();
+            let normalized_name = canonical_stop_name_parts(
+                &row.get::<String, _>("name"),
+                municipality_value.as_deref(),
+            );
             let signature = if let Some(station) = railway_station_stop_base(&id) {
                 format!("rail:{station}")
             } else if let Some(stop_area_id) = row.get::<Option<String>, _>("stop_area_id") {
@@ -3715,6 +3748,7 @@ fn stop_signature<'a>(stop_id: &'a str, stop_signatures: &'a HashMap<String, Str
 }
 
 fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
+    journeys = remove_dominated_journeys(journeys);
     journeys.sort_by_key(journey_arrival_rank);
 
     let mut seen = HashSet::new();
@@ -3794,6 +3828,25 @@ fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
             }
             journey
         })
+        .collect()
+}
+
+fn remove_dominated_journeys(journeys: Vec<Journey>) -> Vec<Journey> {
+    journeys
+        .iter()
+        .enumerate()
+        .filter(|(candidate_index, candidate)| {
+            !journeys.iter().enumerate().any(|(other_index, other)| {
+                other_index != *candidate_index
+                    && other.departure_time >= candidate.departure_time
+                    && other.arrival_time <= candidate.arrival_time
+                    && other.transfer_count <= candidate.transfer_count
+                    && (other.departure_time > candidate.departure_time
+                        || other.arrival_time < candidate.arrival_time
+                        || other.transfer_count < candidate.transfer_count)
+            })
+        })
+        .map(|(_, journey)| journey.clone())
         .collect()
 }
 
@@ -4010,25 +4063,30 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
     }
 
     if let Some((lat, lon)) = stop.lat.zip(stop.lon) {
-        let mut sibling_ids = sqlx::query_scalar::<_, String>(
+        let sibling_rows = sqlx::query(
             r#"
-            SELECT id
+            SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+                   lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+                   platform_code, modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
-              AND normalized_name = $1
               AND lat IS NOT NULL
               AND lon IS NOT NULL
-              AND abs(lat - $2) < 0.0005
-              AND abs(lon - $3) < 0.0005
+              AND abs(lat - $1) < 0.003
+              AND abs(lon - $2) < 0.005
             LIMIT 250
             "#,
         )
-        .bind(&stop.normalized_name)
         .bind(lat)
         .bind(lon)
         .fetch_all(pool)
         .await?;
-        ids.append(&mut sibling_ids);
+        for sibling in sibling_rows {
+            let sibling = stop_from_row(sibling)?;
+            if stops_are_same_suggestion(stop, &sibling) {
+                ids.push(sibling.id);
+            }
+        }
     }
 
     ids.sort();
@@ -5652,11 +5710,10 @@ fn canonical_stop_id(stops: &[Stop], stop_id: &str) -> String {
         return stop.id.clone();
     }
 
-    let key = stop_suggestion_key(stop);
     stops
         .iter()
         .find(|candidate| {
-            candidate.platform_code.is_none() && stop_suggestion_key(candidate) == key
+            candidate.platform_code.is_none() && stops_are_same_suggestion(candidate, stop)
         })
         .map(|candidate| candidate.id.clone())
         .unwrap_or_else(|| stop.id.clone())
@@ -5880,18 +5937,46 @@ fn stop_place_type(stop: &Stop) -> &'static str {
     "stop"
 }
 
-fn stop_suggestion_key(stop: &Stop) -> String {
-    let name = normalize_search_text(&stop.name);
-    if let Some(stop_area_id) = &stop.stop_area_id {
-        return format!("area:{stop_area_id}:{name}");
+fn canonical_stop_name(stop: &Stop) -> String {
+    canonical_stop_name_parts(&stop.name, stop.municipality.as_deref())
+}
+
+fn canonical_stop_name_parts(name: &str, municipality: Option<&str>) -> String {
+    let name = normalize_search_text(name);
+    let municipality = municipality.map(normalize_search_text).unwrap_or_default();
+    name.strip_prefix(&format!("{municipality} "))
+        .filter(|_| !municipality.is_empty())
+        .unwrap_or(&name)
+        .to_string()
+}
+
+fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
+    if left.stop_area_id.is_some() && left.stop_area_id == right.stop_area_id {
+        return true;
+    }
+    if let (Some(left_base), Some(right_base)) = (
+        railway_station_stop_base(&left.id),
+        railway_station_stop_base(&right.id),
+    ) && left_base == right_base
+    {
+        return true;
+    }
+    if canonical_stop_name(left) != canonical_stop_name(right) {
+        return false;
     }
 
-    match stop.lat.zip(stop.lon) {
-        Some((lat, lon)) => format!("{name}:{lat:.5}:{lon:.5}"),
-        None => format!(
-            "{name}:{}",
-            stop.municipality.as_deref().unwrap_or_default()
-        ),
+    let left_municipality = left.municipality.as_deref().map(normalize_search_text);
+    let right_municipality = right.municipality.as_deref().map(normalize_search_text);
+    if matches!((&left_municipality, &right_municipality), (Some(left), Some(right)) if left != right)
+    {
+        return false;
+    }
+
+    match (left.lat.zip(left.lon), right.lat.zip(right.lon)) {
+        (Some((left_lat, left_lon)), Some((right_lat, right_lon))) => {
+            haversine_m(left_lat, left_lon, right_lat, right_lon) <= 300.0
+        }
+        _ => left_municipality.is_some() && left_municipality == right_municipality,
     }
 }
 
@@ -6441,6 +6526,56 @@ mod tests {
         assert_eq!(suggestions[0].id, "stop-praha-hl-n");
     }
 
+    #[test]
+    fn stop_search_collapses_municipality_prefixed_source_aliases() {
+        let mut short_name = fixture_stop(
+            "pid-belarie",
+            "Belárie",
+            50.0350,
+            14.4180,
+            TransportMode::Tram,
+        );
+        short_name.municipality = Some("Praha".to_string());
+        let mut qualified_name = fixture_stop(
+            "national-belarie",
+            "Praha, Belárie",
+            50.0353,
+            14.4182,
+            TransportMode::Tram,
+        );
+        qualified_name.municipality = Some("Praha".to_string());
+
+        let suggestions =
+            ranked_stop_suggestions([&short_name, &qualified_name].into_iter(), "belarie", 10);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id, "pid-belarie");
+    }
+
+    #[test]
+    fn stop_search_keeps_same_named_stops_in_different_places() {
+        let mut prague = fixture_stop(
+            "prague-namesti",
+            "Náměstí",
+            50.0755,
+            14.4378,
+            TransportMode::Bus,
+        );
+        prague.municipality = Some("Praha".to_string());
+        let mut brno = fixture_stop(
+            "brno-namesti",
+            "Náměstí",
+            49.1951,
+            16.6068,
+            TransportMode::Bus,
+        );
+        brno.municipality = Some("Brno".to_string());
+
+        let suggestions = ranked_stop_suggestions([&prague, &brno].into_iter(), "namesti", 10);
+
+        assert_eq!(suggestions.len(), 2);
+    }
+
     #[tokio::test]
     async fn place_search_returns_praha_city_and_main_station() {
         let app = build_router(app_state().await.unwrap());
@@ -6930,6 +7065,19 @@ mod tests {
         assert_eq!(ranked[0].transfer_count, 1);
         assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
         assert!(!ranked[1].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn ranked_journeys_remove_strictly_worse_connections() {
+        let useful = test_journey("useful", 0, 8 * 3600, 9 * 3600);
+        let useless = test_journey("useless", 1, 7 * 3600, 10 * 3600);
+
+        let ranked = ranked_journey_results(vec![useless, useful]);
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].departure_time, 8 * 3600);
+        assert_eq!(ranked[0].arrival_time, 9 * 3600);
+        assert_eq!(ranked[0].transfer_count, 0);
     }
 
     #[test]
