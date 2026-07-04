@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{collections::HashMap, env, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -720,6 +720,7 @@ async fn sync_duk(
 }
 
 async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<usize> {
+    let records = deduplicate_records(records);
     let mut written = 0usize;
     for chunk in records.chunks(2_000) {
         let sources = chunk.iter().map(|record| record.source).collect::<Vec<_>>();
@@ -855,6 +856,27 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
         .rows_affected() as usize;
     }
     Ok(written)
+}
+
+fn deduplicate_records(records: &[RealtimeRecord]) -> Vec<&RealtimeRecord> {
+    let mut records_by_identity = HashMap::new();
+    for record in records {
+        records_by_identity
+            .entry((record.source, record.source_entity_id.as_str()))
+            .and_modify(|existing: &mut &RealtimeRecord| {
+                if record.fetched_at >= existing.fetched_at {
+                    *existing = record;
+                }
+            })
+            .or_insert(record);
+    }
+    let mut records = records_by_identity.into_values().collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.source
+            .cmp(right.source)
+            .then_with(|| left.source_entity_id.cmp(&right.source_entity_id))
+    });
+    records
 }
 
 async fn cleanup_expired(pool: &PgPool) -> Result<()> {
@@ -1032,6 +1054,39 @@ mod tests {
     fn converts_string_and_numeric_source_values() {
         assert_eq!(value_string(Some(&json!(42))).as_deref(), Some("42"));
         assert_eq!(value_bool(Some(&json!("false"))), Some(false));
+    }
+
+    #[test]
+    fn realtime_batch_keeps_latest_duplicate_entity() {
+        let timestamp = Utc::now();
+        let record = |fetched_at, delay_seconds| RealtimeRecord {
+            source: PID_SOURCE,
+            source_feed_id: PID_FEED_ID,
+            source_entity_id: "vehicle:duplicate".to_string(),
+            trip_id: None,
+            route_id: None,
+            stop_id: None,
+            delay_seconds: Some(delay_seconds),
+            estimated_arrival: None,
+            estimated_departure: None,
+            cancellation_status: None,
+            vehicle_id: Some("duplicate".to_string()),
+            lat: None,
+            lon: None,
+            bearing: None,
+            fetched_at,
+            valid_until: fetched_at + chrono::Duration::seconds(90),
+            service_date: None,
+            raw_payload: json!({}),
+        };
+        let older = record(timestamp, 30);
+        let newer = record(timestamp + chrono::Duration::seconds(1), 60);
+
+        let input = [older, newer];
+        let records = deduplicate_records(&input);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].delay_seconds, Some(60));
     }
 
     #[test]

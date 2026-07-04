@@ -1,6 +1,7 @@
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgis/postgis:16-3.4}
+    restart: unless-stopped
     environment:
       POSTGRES_USER: cesta
       POSTGRES_PASSWORD: cesta
@@ -13,6 +14,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "${REDIS_HOST_PORT:-6380}:6379"
 
@@ -23,6 +25,7 @@ services:
     depends_on:
       - postgres
       - redis
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
       REDIS_URL: redis://redis:6379

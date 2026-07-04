@@ -436,33 +436,14 @@ async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPoo
     let mut last_error = None;
     for attempt in 1..=30 {
         match PgPool::connect(database_url).await {
-            Ok(pool) => {
-                match sqlx::raw_sql(include_str!(
-                    "../../../infra/postgres/migrations/0005_cities.sql"
-                ))
-                .execute(&pool)
-                .await
-                {
-                    Ok(_) => match sqlx::raw_sql(include_str!(
-                        "../../../infra/postgres/migrations/0006_public_transport_feeds.sql"
-                    ))
-                    .execute(&pool)
-                    .await
-                    {
-                        Ok(_) => return Ok(pool),
-                        Err(error) => {
-                            tracing::warn!(error = %error, "public transport feed migration failed; retrying");
-                            last_error = Some(error);
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(attempt, %error, "database schema is not ready yet");
-                        last_error = Some(error);
-                        time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+            Ok(pool) => match apply_startup_migrations(&pool).await {
+                Ok(()) => return Ok(pool),
+                Err(error) => {
+                    tracing::warn!(attempt, %error, "database migration failed; retrying");
+                    last_error = Some(error);
+                    time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-            }
+            },
             Err(error) => {
                 tracing::warn!(attempt, %error, "database is not ready yet");
                 last_error = Some(error);
@@ -477,6 +458,98 @@ async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPoo
             .map(|error| error.to_string())
             .unwrap_or_else(|| "unknown error".to_string())
     ))
+}
+
+async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cesta_schema_migrations (
+          version text PRIMARY KEY,
+          applied_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Existing installations predate migration tracking. Terminal schema artifacts prove that
+    // these idempotent migrations already completed and prevent their full-table work repeating.
+    sqlx::query(
+        r#"
+        INSERT INTO cesta_schema_migrations (version)
+        SELECT '0005_cities'
+        WHERE to_regclass('public.cities') IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'stops' AND column_name = 'city_id'
+          )
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'cities'
+              AND column_name = 'source_reference_date'
+          )
+        ON CONFLICT (version) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO cesta_schema_migrations (version)
+        SELECT '0006_public_transport_feeds'
+        WHERE to_regclass('public.route_geometries') IS NOT NULL
+          AND to_regclass('public.data_source_syncs') IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'realtime_updates'
+              AND column_name = 'source_entity_id'
+          )
+        ON CONFLICT (version) DO NOTHING
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    apply_startup_migration(
+        pool,
+        "0005_cities",
+        include_str!("../../../infra/postgres/migrations/0005_cities.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0006_public_transport_feeds",
+        include_str!("../../../infra/postgres/migrations/0006_public_transport_feeds.sql"),
+    )
+    .await
+}
+
+async fn apply_startup_migration(
+    pool: &PgPool,
+    version: &str,
+    statements: &str,
+) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('cesta-api-startup-migrations'))")
+        .execute(&mut *transaction)
+        .await?;
+    let already_applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM cesta_schema_migrations WHERE version = $1)",
+    )
+    .bind(version)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if already_applied {
+        transaction.commit().await?;
+        return Ok(());
+    }
+
+    sqlx::raw_sql(statements).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO cesta_schema_migrations (version) VALUES ($1)")
+        .bind(version)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
 }
 
 fn build_router(state: AppState) -> Router {
