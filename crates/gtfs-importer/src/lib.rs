@@ -5,10 +5,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use transit_model::{
-    Agency, Route, Stop, StopTime, TransportMode, normalize_czech_name, parse_gtfs_time,
+    Agency, Calendar, CalendarDate, Route, Stop, StopTime, TransportMode, normalize_czech_name,
+    parse_gtfs_time,
 };
 use zip::ZipArchive;
 
@@ -26,6 +28,8 @@ pub struct GtfsDataset {
     pub routes: Vec<Route>,
     pub trips: Vec<GtfsTrip>,
     pub stop_times: Vec<StopTime>,
+    pub calendars: Vec<Calendar>,
+    pub calendar_dates: Vec<CalendarDate>,
     pub validation_issues: Vec<ValidationIssue>,
 }
 
@@ -124,6 +128,22 @@ fn parse_archive<R: Read + Seek>(
         dataset.stop_times =
             parse_stop_times(archive, options.limit_rows, &mut dataset.validation_issues)?;
     }
+    if names.iter().any(|name| name == "calendar.txt") {
+        dataset.calendars = parse_calendars(archive, options.limit_rows)?;
+    }
+    if names.iter().any(|name| name == "calendar_dates.txt") {
+        dataset.calendar_dates = parse_calendar_dates(archive, options.limit_rows)?;
+    }
+    if dataset.calendars.is_empty() && dataset.calendar_dates.is_empty() {
+        dataset.validation_issues.push(ValidationIssue {
+            severity: ValidationSeverity::Warning,
+            code: "missing_service_calendar".to_string(),
+            message: "GTFS feed has neither calendar.txt nor calendar_dates.txt".to_string(),
+            source_file: None,
+            affected_entity: None,
+            raw_payload: None,
+        });
+    }
 
     Ok(dataset)
 }
@@ -183,52 +203,50 @@ fn parse_stops<R: Read + Seek>(
     csv_reader(file)
         .deserialize::<StopRow>()
         .take(limit.unwrap_or(usize::MAX))
-        .filter_map(|row| match row {
-            Ok(row) => {
-                if row.stop_lat.is_none() || row.stop_lon.is_none() {
-                    issues.push(ValidationIssue {
-                        severity: ValidationSeverity::Warning,
-                        code: "stop_without_coordinates".to_string(),
-                        message: "Stop has no usable coordinates".to_string(),
-                        source_file: Some("stops.txt".to_string()),
-                        affected_entity: Some(row.stop_id.clone()),
-                        raw_payload: None,
-                    });
-                }
-                Some(Ok(Stop {
-                    id: row.stop_id.clone(),
-                    source_ids: vec![transit_model::SourceRef {
-                        feed_id: options.source_feed_id.clone(),
-                        original_id: row.stop_id,
-                        import_run_id: None,
-                        priority: options.source_priority,
-                        confidence: None,
-                        suppressed_as_duplicate: false,
-                    }],
-                    name: row.stop_name.clone(),
-                    normalized_name: normalize_czech_name(&row.stop_name),
-                    municipality: None,
-                    district: None,
-                    region: None,
-                    lat: row.stop_lat,
-                    lon: row.stop_lon,
-                    geom: row
-                        .stop_lat
-                        .zip(row.stop_lon)
-                        .map(|(lat, lon)| geo_types::Point::new(lon, lat)),
-                    coordinate_confidence: if row.stop_lat.is_some() && row.stop_lon.is_some() {
-                        transit_model::CoordinateConfidence::Exact
-                    } else {
-                        transit_model::CoordinateConfidence::Unresolved
-                    },
-                    coordinate_source: Some(options.source_feed_id.clone()),
-                    stop_area_id: None,
-                    platform_code: row.platform_code,
-                    modes: Vec::new(),
-                    is_active: true,
-                }))
+        .map(|row| {
+            let row = row?;
+            if row.stop_lat.is_none() || row.stop_lon.is_none() {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    code: "stop_without_coordinates".to_string(),
+                    message: "Stop has no usable coordinates".to_string(),
+                    source_file: Some("stops.txt".to_string()),
+                    affected_entity: Some(row.stop_id.clone()),
+                    raw_payload: None,
+                });
             }
-            Err(error) => Some(Err(error.into())),
+            Ok(Stop {
+                id: row.stop_id.clone(),
+                source_ids: vec![transit_model::SourceRef {
+                    feed_id: options.source_feed_id.clone(),
+                    original_id: row.stop_id,
+                    import_run_id: None,
+                    priority: options.source_priority,
+                    confidence: None,
+                    suppressed_as_duplicate: false,
+                }],
+                name: row.stop_name.clone(),
+                normalized_name: normalize_czech_name(&row.stop_name),
+                municipality: None,
+                district: None,
+                region: None,
+                lat: row.stop_lat,
+                lon: row.stop_lon,
+                geom: row
+                    .stop_lat
+                    .zip(row.stop_lon)
+                    .map(|(lat, lon)| geo_types::Point::new(lon, lat)),
+                coordinate_confidence: if row.stop_lat.is_some() && row.stop_lon.is_some() {
+                    transit_model::CoordinateConfidence::Exact
+                } else {
+                    transit_model::CoordinateConfidence::Unresolved
+                },
+                coordinate_source: Some(options.source_feed_id.clone()),
+                stop_area_id: None,
+                platform_code: row.platform_code,
+                modes: Vec::new(),
+                is_active: true,
+            })
         })
         .collect()
 }
@@ -377,6 +395,77 @@ pub fn map_gtfs_route_type(route_type: Option<i32>) -> TransportMode {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CalendarRow {
+    service_id: String,
+    monday: i16,
+    tuesday: i16,
+    wednesday: i16,
+    thursday: i16,
+    friday: i16,
+    saturday: i16,
+    sunday: i16,
+    start_date: String,
+    end_date: String,
+}
+
+fn parse_calendars<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+) -> Result<Vec<Calendar>> {
+    let file = archive.by_name("calendar.txt")?;
+    csv_reader(file)
+        .deserialize::<CalendarRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| {
+            let row = row?;
+            Ok(Calendar {
+                service_id: row.service_id,
+                monday: row.monday == 1,
+                tuesday: row.tuesday == 1,
+                wednesday: row.wednesday == 1,
+                thursday: row.thursday == 1,
+                friday: row.friday == 1,
+                saturday: row.saturday == 1,
+                sunday: row.sunday == 1,
+                start_date: parse_gtfs_date(&row.start_date)?,
+                end_date: parse_gtfs_date(&row.end_date)?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct CalendarDateRow {
+    service_id: String,
+    date: String,
+    exception_type: i16,
+}
+
+fn parse_calendar_dates<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+) -> Result<Vec<CalendarDate>> {
+    let file = archive.by_name("calendar_dates.txt")?;
+    csv_reader(file)
+        .deserialize::<CalendarDateRow>()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|row| {
+            let row = row?;
+            Ok(CalendarDate {
+                service_id: row.service_id,
+                date: parse_gtfs_date(&row.date)?,
+                exception_type: row.exception_type,
+            })
+        })
+        .collect()
+}
+
+fn parse_gtfs_date(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
+        .with_context(|| format!("invalid GTFS date {value}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -403,6 +492,11 @@ mod tests {
                 .unwrap();
             zip.start_file("stop_times.txt", options).unwrap();
             zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,10:35:00,10:35:00,s2,2\n").unwrap();
+            zip.start_file("calendar.txt", options).unwrap();
+            zip.write_all(b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwd,1,1,1,1,1,0,0,20260701,20260731\n").unwrap();
+            zip.start_file("calendar_dates.txt", options).unwrap();
+            zip.write_all(b"service_id,date,exception_type\nwd,20260706,2\n")
+                .unwrap();
             zip.finish().unwrap();
         }
 
@@ -420,6 +514,10 @@ mod tests {
         assert_eq!(dataset.stops.len(), 2);
         assert_eq!(dataset.routes[0].mode, TransportMode::Train);
         assert_eq!(dataset.stop_times.len(), 2);
+        assert_eq!(dataset.calendars.len(), 1);
+        assert!(dataset.calendars[0].monday);
+        assert_eq!(dataset.calendar_dates.len(), 1);
+        assert_eq!(dataset.calendar_dates[0].exception_type, 2);
     }
 
     #[test]

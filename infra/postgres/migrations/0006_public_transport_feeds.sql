@@ -50,6 +50,10 @@ CREATE INDEX IF NOT EXISTS route_geometries_route_idx
   ON route_geometries (route_id);
 CREATE INDEX IF NOT EXISTS route_geometries_geom_gist
   ON route_geometries USING gist (geom);
+CREATE INDEX IF NOT EXISTS calendars_feed_dates_idx
+  ON calendars (source_feed_id, start_date, end_date);
+CREATE INDEX IF NOT EXISTS calendar_dates_feed_date_idx
+  ON calendar_dates (source_feed_id, date, exception_type, service_id);
 
 INSERT INTO source_feeds (id, name, url, type, mode_scope, priority)
 VALUES

@@ -781,6 +781,8 @@ async fn import_pid_gtfs(
         "routes": dataset.routes.len(),
         "trips": dataset.trips.len(),
         "stop_times": dataset.stop_times.len(),
+        "calendars": dataset.calendars.len(),
+        "calendar_dates": dataset.calendar_dates.len(),
         "validation_issues": dataset.validation_issues,
         "database": database
     });
@@ -1331,6 +1333,8 @@ async fn import_ggu_latest(
             "routes": dataset.routes.len(),
             "trips": dataset.trips.len(),
             "stop_times": dataset.stop_times.len(),
+            "calendars": dataset.calendars.len(),
+            "calendar_dates": dataset.calendar_dates.len(),
             "validation_issues": dataset.validation_issues,
             "database": db_summary
         }));
@@ -1439,6 +1443,21 @@ async fn database_import_skip_reason(
     .fetch_optional(pool)
     .await?
     {
+        let previous_summary = row.get::<Value, _>("summary");
+        let feed_id = source.split(':').next().unwrap_or(source);
+        let has_service_calendar: bool = sqlx::query_scalar(
+            r#"
+            SELECT
+              EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = $1)
+              OR EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = $1)
+            "#,
+        )
+        .bind(feed_id)
+        .fetch_one(pool)
+        .await?;
+        if previous_summary.get("calendars").is_none() || !has_service_calendar {
+            return Ok(None);
+        }
         return Ok(Some(serde_json::json!({
             "exported": false,
             "skipped": true,
@@ -1447,7 +1466,7 @@ async fn database_import_skip_reason(
             "sha256": checksum,
             "previous_import_run_id": row.get::<Uuid, _>("id"),
             "previous_finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
-            "previous_summary": row.get::<Value, _>("summary")
+            "previous_summary": previous_summary
         })));
     }
 
@@ -1781,7 +1800,9 @@ async fn export_dataset_to_postgres(
         trip_batch
             .route_ids
             .push(scoped_id(feed_id, &trip.route_id));
-        trip_batch.service_ids.push(trip.service_id.clone());
+        trip_batch
+            .service_ids
+            .push(scoped_id(feed_id, &trip.service_id));
         trip_batch.headsigns.push(trip.trip_headsign.clone());
         trip_batch.source_priorities.push(priority);
         trips.insert(trip.trip_id.clone());
@@ -1846,6 +1867,9 @@ async fn export_dataset_to_postgres(
         );
     }
 
+    let (inserted_calendars, inserted_calendar_dates) =
+        export_service_calendars(pool, dataset, feed_id, import_run_id).await?;
+
     for issue in &dataset.validation_issues {
         sqlx::query(
             r#"
@@ -1885,6 +1909,8 @@ async fn export_dataset_to_postgres(
         "routes": routes.len(),
         "trips": trips.len(),
         "stop_times": inserted_stop_times,
+        "calendars": inserted_calendars,
+        "calendar_dates": inserted_calendar_dates,
         "skipped_stop_times": skipped_stop_times,
         "stale_cleanup": stale_cleanup,
         "validation_issues": dataset.validation_issues.len()
@@ -1909,6 +1935,78 @@ async fn export_dataset_to_postgres(
         "summary": summary,
         "visible_stops_for_feed": visible_stops
     }))
+}
+
+async fn export_service_calendars(
+    pool: &PgPool,
+    dataset: &GtfsDataset,
+    feed_id: &str,
+    import_run_id: Uuid,
+) -> Result<(u64, u64), sqlx::Error> {
+    let mut calendars = 0_u64;
+    for calendar in &dataset.calendars {
+        calendars += sqlx::query(
+            r#"
+            INSERT INTO calendars (
+              service_id, monday, tuesday, wednesday, thursday, friday,
+              saturday, sunday, start_date, end_date, import_run_id, source_feed_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (service_id) DO UPDATE SET
+              monday = EXCLUDED.monday,
+              tuesday = EXCLUDED.tuesday,
+              wednesday = EXCLUDED.wednesday,
+              thursday = EXCLUDED.thursday,
+              friday = EXCLUDED.friday,
+              saturday = EXCLUDED.saturday,
+              sunday = EXCLUDED.sunday,
+              start_date = EXCLUDED.start_date,
+              end_date = EXCLUDED.end_date,
+              import_run_id = EXCLUDED.import_run_id,
+              source_feed_id = EXCLUDED.source_feed_id
+            "#,
+        )
+        .bind(scoped_id(feed_id, &calendar.service_id))
+        .bind(calendar.monday)
+        .bind(calendar.tuesday)
+        .bind(calendar.wednesday)
+        .bind(calendar.thursday)
+        .bind(calendar.friday)
+        .bind(calendar.saturday)
+        .bind(calendar.sunday)
+        .bind(calendar.start_date)
+        .bind(calendar.end_date)
+        .bind(import_run_id)
+        .bind(feed_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+
+    let mut calendar_dates = 0_u64;
+    for exception in &dataset.calendar_dates {
+        calendar_dates += sqlx::query(
+            r#"
+            INSERT INTO calendar_dates (
+              service_id, date, exception_type, import_run_id, source_feed_id
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (service_id, date) DO UPDATE SET
+              exception_type = EXCLUDED.exception_type,
+              import_run_id = EXCLUDED.import_run_id,
+              source_feed_id = EXCLUDED.source_feed_id
+            "#,
+        )
+        .bind(scoped_id(feed_id, &exception.service_id))
+        .bind(exception.date)
+        .bind(exception.exception_type)
+        .bind(import_run_id)
+        .bind(feed_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok((calendars, calendar_dates))
 }
 
 async fn prune_stale_feed_schedule_rows(
@@ -1955,10 +2053,38 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    let deleted_calendar_dates = sqlx::query(
+        r#"
+        DELETE FROM calendar_dates
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_calendars = sqlx::query(
+        r#"
+        DELETE FROM calendars
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
     Ok(serde_json::json!({
         "deleted_stop_times": deleted_stop_times,
         "deleted_trips": deleted_trips,
-        "deleted_routes": deleted_routes
+        "deleted_routes": deleted_routes,
+        "deleted_calendars": deleted_calendars,
+        "deleted_calendar_dates": deleted_calendar_dates
     }))
 }
 

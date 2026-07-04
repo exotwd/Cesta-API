@@ -316,6 +316,26 @@ struct JourneySearchBody {
     walking_speed: String,
     prefer_reliable_transfers: bool,
     offline_compatible: bool,
+    #[serde(default, alias = "includeIntermediateStops")]
+    include_intermediate_stops: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JourneyStopCall {
+    trip_id: String,
+    stop_id: String,
+    stop_sequence: i32,
+    scheduled_arrival: i32,
+    scheduled_departure: i32,
+    pickup_type: Option<i16>,
+    drop_off_type: Option<i16>,
+    timepoint: Option<bool>,
+    stop_time_platform: Option<String>,
+    stop_name: String,
+    municipality: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    platform_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -599,7 +619,12 @@ async fn openapi() -> Json<Value> {
                             "max_transfers": {"type": "integer", "minimum": 0},
                             "walking_speed": {"type": "string"},
                             "prefer_reliable_transfers": {"type": "boolean"},
-                            "offline_compatible": {"type": "boolean"}
+                            "offline_compatible": {"type": "boolean"},
+                            "include_intermediate_stops": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "When true, every journey leg contains ordered stop_calls including its origin, all intermediate stops and its destination. The camelCase alias includeIntermediateStops is also accepted."
+                            }
                         }
                     }}}
                 }
@@ -728,6 +753,45 @@ async fn openapi() -> Json<Value> {
                         "vehicle_position": {"type": ["object", "null"]},
                         "source": {"type": "string"},
                         "fetched_at": {"type": "string", "format": "date-time"},
+                        "valid_until": {"type": ["string", "null"], "format": "date-time"}
+                    }
+                },
+                "JourneyStopCall": {
+                    "type": "object",
+                    "required": ["trip_id", "stop_id", "stop_sequence", "name", "scheduled_arrival_seconds", "scheduled_departure_seconds", "scheduled_arrival", "scheduled_departure", "is_origin", "is_destination", "is_intermediate", "realtime"],
+                    "properties": {
+                        "trip_id": {"type": "string"},
+                        "stop_id": {"type": "string"},
+                        "stop_sequence": {"type": ["integer", "null"]},
+                        "name": {"type": "string"},
+                        "municipality": {"type": ["string", "null"]},
+                        "lat": {"type": ["number", "null"]},
+                        "lon": {"type": ["number", "null"]},
+                        "platform": {"type": ["string", "null"]},
+                        "scheduled_arrival_seconds": {"type": "integer"},
+                        "scheduled_departure_seconds": {"type": "integer"},
+                        "scheduled_arrival": {"type": "string"},
+                        "scheduled_departure": {"type": "string"},
+                        "pickup_type": {"type": ["integer", "null"]},
+                        "drop_off_type": {"type": ["integer", "null"]},
+                        "timepoint": {"type": ["boolean", "null"]},
+                        "is_origin": {"type": "boolean"},
+                        "is_destination": {"type": "boolean"},
+                        "is_intermediate": {"type": "boolean"},
+                        "realtime": {"$ref": "#/components/schemas/JourneyStopCallRealtime"}
+                    }
+                },
+                "JourneyStopCallRealtime": {
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["scheduled", "realtime", "cancelled", "unavailable"]},
+                        "delay_seconds": {"type": ["integer", "null"]},
+                        "estimated_arrival": {"type": ["string", "null"], "format": "date-time"},
+                        "estimated_departure": {"type": ["string", "null"], "format": "date-time"},
+                        "platform_change": {"type": ["string", "null"]},
+                        "source": {"type": ["string", "null"]},
+                        "fetched_at": {"type": ["string", "null"], "format": "date-time"},
                         "valid_until": {"type": ["string", "null"], "format": "date-time"}
                     }
                 }
@@ -1392,6 +1456,8 @@ async fn journey_search(
     Json(body): Json<JourneySearchBody>,
 ) -> Result<Json<Value>, ApiError> {
     let departure_time = parse_journey_departure_seconds(&body.datetime)?;
+    let service_date = parse_journey_service_date(&body.datetime)?;
+    let include_intermediate_stops = body.include_intermediate_stops;
     let _request_metadata = (
         &body.mode,
         &body.walking_speed,
@@ -1406,7 +1472,7 @@ async fn journey_search(
     if let Some(pool) = &state.db {
         validate_journey_point_db(pool, &body.from).await?;
         validate_journey_point_db(pool, &body.to).await?;
-        return match query_journeys_db(pool, &body, departure_time).await {
+        return match query_journeys_db(pool, &body, departure_time, service_date).await {
             Ok((journeys, warnings, related)) => {
                 let realtime_status = related["realtime_status"].as_str().unwrap_or("unavailable");
                 Ok(Json(json!({
@@ -1478,8 +1544,16 @@ async fn journey_search(
             );
         }
     }
+    let journey_values = if include_intermediate_stops {
+        fixture_journeys_with_stop_calls(&journeys, &state.stops)
+    } else {
+        journeys
+            .iter()
+            .map(|journey| serde_json::to_value(journey).unwrap_or_else(|_| json!({})))
+            .collect::<Vec<_>>()
+    };
     Ok(Json(json!({
-        "journeys": journeys,
+        "journeys": journey_values,
         "data_status": {
             "schedule": if state.use_mock_data { "mock" } else { "current" },
             "realtime": "unavailable",
@@ -1488,6 +1562,49 @@ async fn journey_search(
         },
         "warnings": warnings
     })))
+}
+
+fn fixture_journeys_with_stop_calls(journeys: &[Journey], stops: &[Stop]) -> Vec<Value> {
+    journeys
+        .iter()
+        .map(|journey| {
+            let mut value = serde_json::to_value(journey).unwrap_or_else(|_| json!({}));
+            for (index, leg) in journey.legs.iter().enumerate() {
+                let endpoint = |stop_id: &str, arrival: u32, departure: u32, origin: bool| {
+                    let stop = stops.iter().find(|stop| stop.id == stop_id);
+                    json!({
+                        "trip_id": leg.trip_id,
+                        "stop_id": stop_id,
+                        "stop_sequence": null,
+                        "name": stop.map(|stop| stop.name.as_str()).unwrap_or(stop_id),
+                        "municipality": stop.and_then(|stop| stop.municipality.as_deref()),
+                        "lat": stop.and_then(|stop| stop.lat),
+                        "lon": stop.and_then(|stop| stop.lon),
+                        "platform": stop.and_then(|stop| stop.platform_code.as_deref()),
+                        "scheduled_arrival_seconds": arrival,
+                        "scheduled_departure_seconds": departure,
+                        "scheduled_arrival": transit_model::seconds_to_time(arrival),
+                        "scheduled_departure": transit_model::seconds_to_time(departure),
+                        "is_origin": origin,
+                        "is_destination": !origin,
+                        "is_intermediate": false,
+                        "realtime": {"status": "unavailable"}
+                    })
+                };
+                value["legs"][index]["intermediate_stop_count"] = json!(0);
+                value["legs"][index]["stop_calls"] = json!([
+                    endpoint(
+                        &leg.from_stop_id,
+                        leg.departure_time,
+                        leg.departure_time,
+                        true
+                    ),
+                    endpoint(&leg.to_stop_id, leg.arrival_time, leg.arrival_time, false)
+                ]);
+            }
+            value
+        })
+        .collect()
 }
 
 fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
@@ -1511,6 +1628,25 @@ fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
         code: "invalid_datetime".to_string(),
         message: "datetime must be RFC3339, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS, or HH:MM:SS"
             .to_string(),
+    })
+}
+
+fn parse_journey_service_date(datetime: &str) -> Result<chrono::NaiveDate, ApiError> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
+        return Ok(value.date_naive());
+    }
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(value.date());
+    }
+    if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S") {
+        return Ok(value.date());
+    }
+    if NaiveTime::parse_from_str(datetime, "%H:%M:%S").is_ok() {
+        return Ok(Utc::now().date_naive());
+    }
+    Err(ApiError {
+        code: "invalid_datetime".to_string(),
+        message: "datetime must include a valid service date and time".to_string(),
     })
 }
 
@@ -3161,6 +3297,7 @@ async fn query_journeys_db(
     pool: &PgPool,
     body: &JourneySearchBody,
     departure_time: u32,
+    service_date: chrono::NaiveDate,
 ) -> Result<(Vec<Value>, Vec<String>, Value), sqlx::Error> {
     let mut warnings = Vec::new();
     let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
@@ -3189,6 +3326,7 @@ async fn query_journeys_db(
         departure_time,
         &mode_filters,
         body.max_transfers,
+        service_date,
     );
     let include_next_service_day = should_search_next_service_day(departure_time);
     let (current_service_day_result, next_service_day_result) = if include_next_service_day {
@@ -3199,6 +3337,7 @@ async fn query_journeys_db(
             0,
             &mode_filters,
             body.max_transfers,
+            service_date.succ_opt().unwrap_or(service_date),
         );
         let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
         (current, Some(next))
@@ -3231,21 +3370,78 @@ async fn query_journeys_db(
             );
         }
     }
+    let candidate_count = journeys.len();
+    journeys = dedupe_relevant_journeys_db(pool, journeys).await?;
+    let removed_candidates = candidate_count.saturating_sub(journeys.len());
+    if removed_candidates > 0 {
+        warnings.push(format!(
+            "removed {removed_candidates} duplicate or invalid journey candidates"
+        ));
+    }
     journeys = ranked_journey_results(journeys);
+
+    let unverified_services = unverified_journey_service_count(pool, &journeys).await?;
+    if unverified_services > 0 {
+        warnings.push(format!(
+            "{unverified_services} selected trip services come from a legacy import without calendar data; refresh that source to verify the requested date"
+        ));
+    }
 
     if journeys.is_empty() {
         warnings.push("no database journeys found for the resolved stops".to_string());
     }
 
     let mut related = journey_related_data_db(pool, &journeys).await?;
-    let realtime_updates = journey_realtime_updates_db(pool, &journeys).await?;
-    let journeys = journeys_with_realtime(journeys, &realtime_updates);
+    let realtime_updates = journey_realtime_updates_db(pool, &journeys, service_date).await?;
+    let stop_calls = if body.include_intermediate_stops {
+        Some(journey_stop_calls_db(pool, &journeys).await?)
+    } else {
+        None
+    };
+    let mut journey_values = journeys_with_realtime(&journeys, &realtime_updates);
+    if let Some(stop_calls) = &stop_calls {
+        attach_stop_calls(
+            &journeys,
+            &mut journey_values,
+            stop_calls,
+            &realtime_updates,
+        );
+    }
     related["realtime_updates"] = Value::Array(realtime_updates);
-    related["realtime_status"] = json!(journeys_realtime_status(&journeys));
+    related["realtime_status"] = json!(journeys_realtime_status(&journey_values));
+    related["intermediate_stops_included"] = json!(body.include_intermediate_stops);
     related["query_context"] =
         journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids);
 
-    Ok((journeys, warnings, related))
+    Ok((journey_values, warnings, related))
+}
+
+async fn unverified_journey_service_count(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<i64, sqlx::Error> {
+    let trip_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if trip_ids.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM trips trip
+        WHERE trip.id = ANY($1)
+          AND NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
+          AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = trip.source_feed_id)
+        "#,
+    )
+    .bind(trip_ids)
+    .fetch_one(pool)
+    .await
 }
 
 async fn service_day_journeys_db(
@@ -3255,6 +3451,7 @@ async fn service_day_journeys_db(
     departure_time: u32,
     mode_filters: &[String],
     max_transfers: u32,
+    service_date: chrono::NaiveDate,
 ) -> Result<(Vec<Journey>, bool), sqlx::Error> {
     let direct_search = direct_journeys_db(
         pool,
@@ -3262,6 +3459,7 @@ async fn service_day_journeys_db(
         to_stop_ids,
         departure_time,
         mode_filters,
+        service_date,
     );
     let transfer_search = async {
         if max_transfers == 0 {
@@ -3276,6 +3474,7 @@ async fn service_day_journeys_db(
                 to_stop_ids,
                 departure_time,
                 mode_filters,
+                service_date,
             ),
         )
         .await
@@ -3303,9 +3502,11 @@ fn journey_query_context(
     to_stop_ids: &[String],
 ) -> Value {
     json!({
+        "requested_datetime": body.datetime,
         "departure_time": departure_time,
         "max_transfers": body.max_transfers,
         "transport_modes": body.transport_modes,
+        "include_intermediate_stops": body.include_intermediate_stops,
         "from_stop_ids": from_stop_ids,
         "to_stop_ids": to_stop_ids
     })
@@ -3334,6 +3535,183 @@ fn shift_journey_service_day(mut journey: Journey, offset_seconds: u32) -> Journ
         leg.arrival_time = leg.arrival_time.saturating_add(offset_seconds);
     }
     journey
+}
+
+async fn dedupe_relevant_journeys_db(
+    pool: &PgPool,
+    journeys: Vec<Journey>,
+) -> Result<Vec<Journey>, sqlx::Error> {
+    let stop_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .flat_map(|leg| [leg.from_stop_id.clone(), leg.to_stop_id.clone()])
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let route_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.route_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let stop_rows = if stop_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, normalized_name, municipality, lat, lon, stop_area_id
+            FROM stops
+            WHERE id = ANY($1)
+            "#,
+        )
+        .bind(stop_ids)
+        .fetch_all(pool)
+        .await?
+    };
+    let stop_signatures = stop_rows
+        .into_iter()
+        .map(|row| {
+            let id = row.get::<String, _>("id");
+            let normalized_name = row.get::<String, _>("normalized_name");
+            let municipality = row
+                .get::<Option<String>, _>("municipality")
+                .map(|value| normalize_czech_name(&value))
+                .unwrap_or_default();
+            let signature = if let Some(station) = railway_station_stop_base(&id) {
+                format!("rail:{station}")
+            } else if let Some(stop_area_id) = row.get::<Option<String>, _>("stop_area_id") {
+                format!("area:{stop_area_id}")
+            } else {
+                match (
+                    row.get::<Option<f64>, _>("lat"),
+                    row.get::<Option<f64>, _>("lon"),
+                ) {
+                    (Some(lat), Some(lon)) => format!(
+                        "{normalized_name}:{municipality}:{}:{}",
+                        (lat * 100.0).round() as i32,
+                        (lon * 100.0).round() as i32
+                    ),
+                    _ => format!("{normalized_name}:{municipality}"),
+                }
+            };
+            (id, signature)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let route_priorities = if route_ids.is_empty() {
+        HashMap::new()
+    } else {
+        sqlx::query("SELECT id, source_priority FROM routes WHERE id = ANY($1)")
+            .bind(route_ids)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("id"),
+                    row.get::<i32, _>("source_priority"),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    Ok(dedupe_relevant_journeys(
+        journeys,
+        &stop_signatures,
+        &route_priorities,
+    ))
+}
+
+fn dedupe_relevant_journeys(
+    mut journeys: Vec<Journey>,
+    stop_signatures: &HashMap<String, String>,
+    route_priorities: &HashMap<String, i32>,
+) -> Vec<Journey> {
+    journeys.retain(|journey| journey_is_relevant(journey, stop_signatures));
+    journeys.sort_by_key(|journey| {
+        journey
+            .legs
+            .iter()
+            .map(|leg| {
+                leg.route_id
+                    .as_ref()
+                    .and_then(|route_id| route_priorities.get(route_id))
+                    .copied()
+                    .unwrap_or(1_000)
+            })
+            .sum::<i32>()
+    });
+
+    let mut seen = HashSet::new();
+    journeys.retain(|journey| seen.insert(visible_journey_key(journey, stop_signatures)));
+    journeys
+}
+
+fn journey_is_relevant(journey: &Journey, stop_signatures: &HashMap<String, String>) -> bool {
+    let Some(first_leg) = journey.legs.first() else {
+        return false;
+    };
+    let Some(last_leg) = journey.legs.last() else {
+        return false;
+    };
+    if first_leg.departure_time != journey.departure_time
+        || last_leg.arrival_time != journey.arrival_time
+        || journey.arrival_time < journey.departure_time
+        || journey.duration_seconds != journey.arrival_time - journey.departure_time
+    {
+        return false;
+    }
+    let mut trip_ids = HashSet::new();
+    for (index, leg) in journey.legs.iter().enumerate() {
+        if leg.arrival_time < leg.departure_time
+            || stop_signature(&leg.from_stop_id, stop_signatures)
+                == stop_signature(&leg.to_stop_id, stop_signatures)
+        {
+            return false;
+        }
+        if let Some(trip_id) = &leg.trip_id
+            && !trip_ids.insert(trip_id)
+        {
+            return false;
+        }
+        if let Some(next_leg) = journey.legs.get(index + 1) {
+            let wait = next_leg.departure_time.saturating_sub(leg.arrival_time);
+            if next_leg.departure_time < leg.arrival_time
+                || !(MIN_TRANSFER_SECONDS..=MAX_TRANSFER_WAIT_SECONDS).contains(&wait)
+                || stop_signature(&leg.to_stop_id, stop_signatures)
+                    != stop_signature(&next_leg.from_stop_id, stop_signatures)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn visible_journey_key(journey: &Journey, stop_signatures: &HashMap<String, String>) -> String {
+    journey
+        .legs
+        .iter()
+        .map(|leg| {
+            format!(
+                "{}:{}:{}:{}",
+                stop_signature(&leg.from_stop_id, stop_signatures),
+                stop_signature(&leg.to_stop_id, stop_signatures),
+                leg.departure_time,
+                leg.arrival_time
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn stop_signature<'a>(stop_id: &'a str, stop_signatures: &'a HashMap<String, String>) -> &'a str {
+    stop_signatures
+        .get(stop_id)
+        .map(String::as_str)
+        .unwrap_or(stop_id)
 }
 
 fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
@@ -3664,10 +4042,35 @@ async fn direct_journeys_db(
     to_stop_ids: &[String],
     departure_time: u32,
     mode_filters: &[String],
+    service_date: chrono::NaiveDate,
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH latest_import_runs AS (
+        WITH active_services AS (
+          SELECT calendar.service_id
+          FROM calendars calendar
+          WHERE $6::date BETWEEN calendar.start_date AND calendar.end_date
+            AND CASE EXTRACT(ISODOW FROM $6::date)::integer
+              WHEN 1 THEN calendar.monday
+              WHEN 2 THEN calendar.tuesday
+              WHEN 3 THEN calendar.wednesday
+              WHEN 4 THEN calendar.thursday
+              WHEN 5 THEN calendar.friday
+              WHEN 6 THEN calendar.saturday
+              WHEN 7 THEN calendar.sunday
+            END
+            AND NOT EXISTS (
+              SELECT 1 FROM calendar_dates exception
+              WHERE exception.service_id = calendar.service_id
+                AND exception.date = $6::date
+                AND exception.exception_type = 2
+            )
+          UNION
+          SELECT exception.service_id
+          FROM calendar_dates exception
+          WHERE exception.date = $6::date AND exception.exception_type = 1
+        ),
+        latest_import_runs AS (
           SELECT DISTINCT ON (summary->>'feed_id')
             summary->>'feed_id' AS source_feed_id,
             id AS import_run_id
@@ -3699,6 +4102,7 @@ async fn direct_journeys_db(
             st_from.departure_time,
             st_to.arrival_time,
             r.source_priority,
+            t.service_id IN (SELECT service_id FROM active_services) AS service_verified,
             lir.import_run_id IS NOT NULL AS from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
@@ -3723,6 +4127,11 @@ async fn direct_journeys_db(
             AND st_to.stop_id = ANY($2)
             AND st_from.departure_time >= $3
             AND (
+              t.service_id IN (SELECT service_id FROM active_services)
+              OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = t.source_feed_id)
+                 AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t.source_feed_id)
+            )
+            AND (
               COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
               OR r.id IN (SELECT route_id FROM current_train_route_variants)
             )
@@ -3737,6 +4146,7 @@ async fn direct_journeys_db(
           departure_time,
           arrival_time,
           source_priority,
+          service_verified,
           public_mode AS mode
         FROM candidate_legs
         WHERE public_mode <> 'unknown'
@@ -3747,8 +4157,8 @@ async fn direct_journeys_db(
               SELECT 1 FROM candidate_legs latest_candidates WHERE latest_candidates.from_latest_import
             )
           )
-        ORDER BY arrival_time ASC, departure_time ASC, source_priority ASC
-        LIMIT $6
+        ORDER BY service_verified DESC, arrival_time ASC, departure_time ASC, source_priority ASC
+        LIMIT $7
         "#,
     )
     .bind(from_stop_ids.to_vec())
@@ -3756,6 +4166,7 @@ async fn direct_journeys_db(
     .bind(departure_time as i32)
     .bind(!mode_filters.is_empty())
     .bind(mode_filters.to_vec())
+    .bind(service_date)
     .bind(MAX_DIRECT_JOURNEY_CANDIDATES)
     .fetch_all(pool)
     .await?;
@@ -3797,10 +4208,35 @@ async fn one_transfer_journeys_db(
     to_stop_ids: &[String],
     departure_time: u32,
     mode_filters: &[String],
+    service_date: chrono::NaiveDate,
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        WITH latest_import_runs AS (
+        WITH active_services AS (
+          SELECT calendar.service_id
+          FROM calendars calendar
+          WHERE $8::date BETWEEN calendar.start_date AND calendar.end_date
+            AND CASE EXTRACT(ISODOW FROM $8::date)::integer
+              WHEN 1 THEN calendar.monday
+              WHEN 2 THEN calendar.tuesday
+              WHEN 3 THEN calendar.wednesday
+              WHEN 4 THEN calendar.thursday
+              WHEN 5 THEN calendar.friday
+              WHEN 6 THEN calendar.saturday
+              WHEN 7 THEN calendar.sunday
+            END
+            AND NOT EXISTS (
+              SELECT 1 FROM calendar_dates exception
+              WHERE exception.service_id = calendar.service_id
+                AND exception.date = $8::date
+                AND exception.exception_type = 2
+            )
+          UNION
+          SELECT exception.service_id
+          FROM calendar_dates exception
+          WHERE exception.date = $8::date AND exception.exception_type = 1
+        ),
+        latest_import_runs AS (
           SELECT DISTINCT ON (summary->>'feed_id')
             summary->>'feed_id' AS source_feed_id,
             id AS import_run_id
@@ -3832,6 +4268,7 @@ async fn one_transfer_journeys_db(
             st_from.departure_time AS first_departure_time,
             st_mid.arrival_time AS first_arrival_time,
             r.source_priority AS first_source_priority,
+            t.service_id IN (SELECT service_id FROM active_services) AS first_service_verified,
             CASE
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_mid.id, '-[0-9][[:alnum:]]{0,3}$', '')
@@ -3867,6 +4304,11 @@ async fn one_transfer_journeys_db(
           WHERE st_from.stop_id = ANY($1)
             AND st_from.departure_time >= $3
             AND (
+              t.service_id IN (SELECT service_id FROM active_services)
+              OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = t.source_feed_id)
+                 AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t.source_feed_id)
+            )
+            AND (
               COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
               OR r.id IN (SELECT route_id FROM current_train_route_variants)
             )
@@ -3888,6 +4330,7 @@ async fn one_transfer_journeys_db(
             st_transfer.departure_time AS second_departure_time,
             st_to.arrival_time AS second_arrival_time,
             r2.source_priority AS second_source_priority,
+            t2.service_id IN (SELECT service_id FROM active_services) AS second_service_verified,
             CASE
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_transfer.id, '-[0-9][[:alnum:]]{0,3}$', '')
@@ -3923,6 +4366,11 @@ async fn one_transfer_journeys_db(
           WHERE st_to.stop_id = ANY($2)
             AND st_transfer.departure_time >= $3 + $6
             AND (
+              t2.service_id IN (SELECT service_id FROM active_services)
+              OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = t2.source_feed_id)
+                 AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t2.source_feed_id)
+            )
+            AND (
               COALESCE(r2.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
               OR r2.id IN (SELECT route_id FROM current_train_route_variants)
             )
@@ -3944,6 +4392,7 @@ async fn one_transfer_journeys_db(
             first_legs.first_departure_time,
             first_legs.first_arrival_time,
             first_legs.first_source_priority,
+            first_legs.first_service_verified,
             first_legs.first_mode,
             second_legs.second_trip_id,
             second_legs.second_route_id,
@@ -3952,6 +4401,7 @@ async fn one_transfer_journeys_db(
             second_legs.second_departure_time,
             second_legs.second_arrival_time,
             second_legs.second_source_priority,
+            second_legs.second_service_verified,
             second_legs.second_mode,
             first_legs.first_from_latest_import
               AND second_legs.second_from_latest_import AS from_latest_import
@@ -3972,9 +4422,10 @@ async fn one_transfer_journeys_db(
               SELECT 1 FROM candidate_journeys latest_candidates WHERE latest_candidates.from_latest_import
             )
           )
-        ORDER BY second_arrival_time ASC, first_departure_time ASC,
+        ORDER BY (first_service_verified AND second_service_verified) DESC,
+                 second_arrival_time ASC, first_departure_time ASC,
                  first_source_priority + second_source_priority ASC
-        LIMIT $8
+        LIMIT $9
         "#,
     )
     .bind(from_stop_ids.to_vec())
@@ -3984,6 +4435,7 @@ async fn one_transfer_journeys_db(
     .bind(mode_filters.to_vec())
     .bind(MIN_TRANSFER_SECONDS as i32)
     .bind(MAX_TRANSFER_WAIT_SECONDS as i32)
+    .bind(service_date)
     .bind(MAX_TRANSFER_JOURNEY_CANDIDATES)
     .fetch_all(pool)
     .await?;
@@ -4215,6 +4667,7 @@ async fn journey_related_data_db(
 async fn journey_realtime_updates_db(
     pool: &PgPool,
     journeys: &[Journey],
+    service_date: chrono::NaiveDate,
 ) -> Result<Vec<Value>, sqlx::Error> {
     let trip_ids = journeys
         .iter()
@@ -4229,6 +4682,8 @@ async fn journey_realtime_updates_db(
     Ok(sqlx::query(
         r#"
         SELECT source, source_feed_id, source_entity_id, trip_id, route_id, stop_id,
+               CASE WHEN raw_payload->>'stop_sequence' ~ '^[0-9]+$'
+                 THEN (raw_payload->>'stop_sequence')::integer ELSE NULL END AS stop_sequence,
                delay_seconds, estimated_arrival, estimated_departure,
                cancellation_status, platform_change, vehicle_id, bearing,
                ST_Y(vehicle_position::geometry) AS latitude,
@@ -4237,12 +4692,13 @@ async fn journey_realtime_updates_db(
         FROM realtime_updates
         WHERE trip_id = ANY($1)
           AND (valid_until IS NULL OR valid_until >= now())
-          AND (service_date IS NULL OR service_date = CURRENT_DATE)
+          AND (service_date IS NULL OR service_date BETWEEN $2::date AND $2::date + 1)
         ORDER BY fetched_at DESC
         LIMIT 10000
         "#,
     )
     .bind(trip_ids)
+    .bind(service_date)
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -4254,6 +4710,7 @@ async fn journey_realtime_updates_db(
             "trip_id": row.get::<Option<String>, _>("trip_id"),
             "route_id": row.get::<Option<String>, _>("route_id"),
             "stop_id": row.get::<Option<String>, _>("stop_id"),
+            "stop_sequence": row.get::<Option<i32>, _>("stop_sequence"),
             "delay_seconds": row.get::<Option<i32>, _>("delay_seconds"),
             "estimated_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
             "estimated_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
@@ -4277,11 +4734,217 @@ async fn journey_realtime_updates_db(
     .collect())
 }
 
-fn journeys_with_realtime(journeys: Vec<Journey>, updates: &[Value]) -> Vec<Value> {
-    journeys
+async fn journey_stop_calls_db(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<HashMap<String, Vec<JourneyStopCall>>, sqlx::Error> {
+    let trip_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.clone())
+        .collect::<HashSet<_>>()
         .into_iter()
+        .collect::<Vec<_>>();
+    if trip_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT st.trip_id, st.stop_id, st.stop_sequence, st.arrival_time,
+               st.departure_time, st.pickup_type, st.drop_off_type, st.timepoint,
+               st.platform AS stop_time_platform, s.name AS stop_name,
+               s.municipality, s.lat, s.lon, s.platform_code
+        FROM stop_times st
+        JOIN stops s ON s.id = st.stop_id
+        WHERE st.trip_id = ANY($1)
+        ORDER BY st.trip_id ASC, st.stop_sequence ASC
+        "#,
+    )
+    .bind(trip_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut calls = HashMap::<String, Vec<JourneyStopCall>>::new();
+    for row in rows {
+        let call = JourneyStopCall {
+            trip_id: row.get("trip_id"),
+            stop_id: row.get("stop_id"),
+            stop_sequence: row.get("stop_sequence"),
+            scheduled_arrival: row.get("arrival_time"),
+            scheduled_departure: row.get("departure_time"),
+            pickup_type: row.get("pickup_type"),
+            drop_off_type: row.get("drop_off_type"),
+            timepoint: row.get("timepoint"),
+            stop_time_platform: row.get("stop_time_platform"),
+            stop_name: row.get("stop_name"),
+            municipality: row.get("municipality"),
+            lat: row.get("lat"),
+            lon: row.get("lon"),
+            platform_code: row.get("platform_code"),
+        };
+        calls.entry(call.trip_id.clone()).or_default().push(call);
+    }
+    Ok(calls)
+}
+
+fn attach_stop_calls(
+    journeys: &[Journey],
+    journey_values: &mut [Value],
+    calls_by_trip: &HashMap<String, Vec<JourneyStopCall>>,
+    realtime_updates: &[Value],
+) {
+    for (journey_index, journey) in journeys.iter().enumerate() {
+        for (leg_index, leg) in journey.legs.iter().enumerate() {
+            let Some(trip_id) = leg.trip_id.as_deref() else {
+                journey_values[journey_index]["legs"][leg_index]["stop_calls"] = json!([]);
+                continue;
+            };
+            let Some(trip_calls) = calls_by_trip.get(trip_id) else {
+                journey_values[journey_index]["legs"][leg_index]["stop_calls"] = json!([]);
+                continue;
+            };
+            let start = trip_calls
+                .iter()
+                .position(|call| {
+                    call.stop_id == leg.from_stop_id
+                        && service_time_matches(call.scheduled_departure, leg.departure_time)
+                })
+                .or_else(|| {
+                    trip_calls
+                        .iter()
+                        .position(|call| call.stop_id == leg.from_stop_id)
+                });
+            let Some(start) = start else {
+                journey_values[journey_index]["legs"][leg_index]["stop_calls"] = json!([]);
+                continue;
+            };
+            let end = trip_calls
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, call)| {
+                    call.stop_id == leg.to_stop_id
+                        && service_time_matches(call.scheduled_arrival, leg.arrival_time)
+                })
+                .map(|(index, _)| index)
+                .or_else(|| {
+                    trip_calls
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .find(|(_, call)| call.stop_id == leg.to_stop_id)
+                        .map(|(index, _)| index)
+                });
+            let Some(end) = end.filter(|end| *end >= start) else {
+                journey_values[journey_index]["legs"][leg_index]["stop_calls"] = json!([]);
+                continue;
+            };
+            let service_day_offset = if (trip_calls[start].scheduled_departure as u32)
+                .saturating_add(SERVICE_DAY_SECONDS)
+                == leg.departure_time
+            {
+                SERVICE_DAY_SECONDS
+            } else {
+                0
+            };
+
+            let stop_calls = trip_calls[start..=end]
+                .iter()
+                .enumerate()
+                .map(|(offset, call)| {
+                    let is_origin = offset == 0;
+                    let is_destination = start + offset == end;
+                    let scheduled_arrival =
+                        (call.scheduled_arrival.max(0) as u32).saturating_add(service_day_offset);
+                    let scheduled_departure = (call.scheduled_departure.max(0) as u32)
+                        .saturating_add(service_day_offset);
+                    json!({
+                        "trip_id": call.trip_id,
+                        "stop_id": call.stop_id,
+                        "stop_sequence": call.stop_sequence,
+                        "name": call.stop_name,
+                        "municipality": call.municipality,
+                        "lat": call.lat,
+                        "lon": call.lon,
+                        "platform": call.stop_time_platform.as_ref().or(call.platform_code.as_ref()),
+                        "scheduled_arrival_seconds": scheduled_arrival,
+                        "scheduled_departure_seconds": scheduled_departure,
+                        "scheduled_arrival": transit_model::seconds_to_time(scheduled_arrival),
+                        "scheduled_departure": transit_model::seconds_to_time(scheduled_departure),
+                        "pickup_type": call.pickup_type,
+                        "drop_off_type": call.drop_off_type,
+                        "timepoint": call.timepoint,
+                        "is_origin": is_origin,
+                        "is_destination": is_destination,
+                        "is_intermediate": !is_origin && !is_destination,
+                        "realtime": stop_call_realtime(call, realtime_updates)
+                    })
+                })
+                .collect::<Vec<_>>();
+            journey_values[journey_index]["legs"][leg_index]["intermediate_stop_count"] =
+                json!(stop_calls.len().saturating_sub(2));
+            journey_values[journey_index]["legs"][leg_index]["stop_calls"] =
+                Value::Array(stop_calls);
+        }
+    }
+}
+
+fn stop_call_realtime(call: &JourneyStopCall, updates: &[Value]) -> Value {
+    let trip_updates = updates
+        .iter()
+        .filter(|update| update["trip_id"].as_str() == Some(&call.trip_id))
+        .collect::<Vec<_>>();
+    let exact = trip_updates
+        .iter()
+        .copied()
+        .find(|update| {
+            update["stop_id"].as_str() == Some(&call.stop_id)
+                && update["stop_sequence"].as_i64() == Some(call.stop_sequence as i64)
+        })
+        .or_else(|| {
+            trip_updates
+                .iter()
+                .copied()
+                .find(|update| update["stop_id"].as_str() == Some(&call.stop_id))
+        });
+    let cancellation = trip_updates
+        .iter()
+        .find_map(|update| update["cancellation_status"].as_str());
+    let Some(update) = exact else {
+        return json!({
+            "status": if cancellation.is_some() { "cancelled" } else { "scheduled" },
+            "delay_seconds": null,
+            "estimated_arrival": null,
+            "estimated_departure": null,
+            "cancellation_status": cancellation
+        });
+    };
+    json!({
+        "status": if cancellation.is_some() { "cancelled" } else { "realtime" },
+        "delay_seconds": update["delay_seconds"],
+        "estimated_arrival": update["estimated_arrival"],
+        "estimated_departure": update["estimated_departure"],
+        "cancellation_status": cancellation,
+        "platform_change": update["platform_change"],
+        "source": update["source"],
+        "fetched_at": update["fetched_at"],
+        "valid_until": update["valid_until"],
+        "confidence": update["confidence"]
+    })
+}
+
+fn service_time_matches(database_time: i32, journey_time: u32) -> bool {
+    let database_time = database_time.max(0) as u32;
+    database_time == journey_time
+        || database_time.saturating_add(SERVICE_DAY_SECONDS) == journey_time
+}
+
+fn journeys_with_realtime(journeys: &[Journey], updates: &[Value]) -> Vec<Value> {
+    journeys
+        .iter()
         .map(|journey| {
-            let mut value = serde_json::to_value(&journey).unwrap_or_else(|_| json!({}));
+            let mut value = serde_json::to_value(journey).unwrap_or_else(|_| json!({}));
             let mut realtime_legs = 0usize;
             for (index, leg) in journey.legs.iter().enumerate() {
                 let Some(trip_id) = leg.trip_id.as_deref() else {
@@ -4331,10 +4994,10 @@ fn journeys_with_realtime(journeys: Vec<Journey>, updates: &[Value]) -> Vec<Valu
                     "confidence": fallback["confidence"]
                 });
                 value["legs"][index]["realtime"] = realtime;
-                if let Some(delay) = delay_seconds {
-                    if let Some(warnings) = value["legs"][index]["warnings"].as_array_mut() {
-                        warnings.push(json!(format!("delay_seconds:{delay}")));
-                    }
+                if let Some(delay) = delay_seconds
+                    && let Some(warnings) = value["legs"][index]["warnings"].as_array_mut()
+                {
+                    warnings.push(json!(format!("delay_seconds:{delay}")));
                 }
                 realtime_legs += 1;
             }
@@ -5599,6 +6262,12 @@ mod tests {
         assert!(payload["paths"]["/realtime/vehicles"].is_object());
         assert!(payload["paths"]["/data-sources/status"].is_object());
         assert!(payload["components"]["schemas"]["JourneyLegRealtime"].is_object());
+        assert_eq!(
+            payload["paths"]["/journeys/search"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["properties"]["include_intermediate_stops"]["default"],
+            false
+        );
+        assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
     }
 
     #[tokio::test]
@@ -5915,6 +6584,47 @@ mod tests {
         assert_eq!(
             payload["journeys"][0]["legs"][0]["from_stop_id"],
             "stop-praha-hl-n"
+        );
+    }
+
+    #[tokio::test]
+    async fn journey_search_accepts_camel_case_intermediate_stop_request() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/journeys/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "from": {"type": "stop", "id": "stop-praha-hl-n"},
+                            "to": {"type": "stop", "id": "stop-brno-hl-n"},
+                            "datetime": "2026-07-06T07:05:00+02:00",
+                            "mode": "depart_at",
+                            "transport_modes": ["train"],
+                            "max_transfers": 4,
+                            "walking_speed": "normal",
+                            "prefer_reliable_transfers": true,
+                            "offline_compatible": false,
+                            "includeIntermediateStops": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["journeys"][0]["legs"][0]["stop_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -6249,6 +6959,16 @@ mod tests {
     }
 
     #[test]
+    fn journey_service_date_comes_from_requested_local_date() {
+        assert_eq!(
+            parse_journey_service_date("2026-07-04T00:15:00+02:00")
+                .unwrap()
+                .to_string(),
+            "2026-07-04"
+        );
+    }
+
+    #[test]
     fn ranked_journeys_keep_simplest_direct_route_when_transfers_are_faster() {
         let mut journeys = (0..6)
             .map(|index| {
@@ -6363,13 +7083,99 @@ mod tests {
             "confidence": "estimated"
         })];
 
-        let enriched = journeys_with_realtime(vec![journey], &updates);
+        let enriched = journeys_with_realtime(&[journey], &updates);
 
         assert_eq!(enriched[0]["realtime_status"], "full");
         assert_eq!(enriched[0]["legs"][0]["realtime"]["delay_seconds"], 120);
         assert_eq!(
             enriched[0]["legs"][0]["realtime"]["vehicle_id"],
             "vehicle-1"
+        );
+    }
+
+    #[test]
+    fn source_independent_deduplication_keeps_preferred_connection() {
+        let mut official = test_journey("official", 0, 3_600, 7_200);
+        official.legs[0].from_stop_id = "pid-origin".to_string();
+        official.legs[0].to_stop_id = "pid-destination".to_string();
+        let mut aggregate = test_journey("aggregate", 0, 3_600, 7_200);
+        aggregate.legs[0].from_stop_id = "ggu-origin".to_string();
+        aggregate.legs[0].to_stop_id = "ggu-destination".to_string();
+        let stop_signatures = HashMap::from([
+            ("pid-origin".to_string(), "origin".to_string()),
+            ("ggu-origin".to_string(), "origin".to_string()),
+            ("pid-destination".to_string(), "destination".to_string()),
+            ("ggu-destination".to_string(), "destination".to_string()),
+        ]);
+        let route_priorities = HashMap::from([
+            ("route-official".to_string(), 10),
+            ("route-aggregate".to_string(), 30),
+        ]);
+
+        let deduplicated = dedupe_relevant_journeys(
+            vec![aggregate, official],
+            &stop_signatures,
+            &route_priorities,
+        );
+
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].id, "official");
+    }
+
+    #[test]
+    fn relevance_filter_rejects_impossible_transfer() {
+        let mut journey = test_journey("bad-transfer", 1, 3_600, 7_200);
+        journey.legs[1].departure_time = journey.legs[0].arrival_time + 60;
+        let signatures = HashMap::from([
+            ("praha".to_string(), "praha".to_string()),
+            ("vsetin".to_string(), "vsetin".to_string()),
+            ("transfer-bad-transfer".to_string(), "transfer".to_string()),
+        ]);
+
+        assert!(!journey_is_relevant(&journey, &signatures));
+    }
+
+    #[test]
+    fn stop_calls_include_ordered_intermediate_stops_and_endpoints() {
+        let journey = test_journey("calls", 0, 3_600, 5_400);
+        let calls = [
+            ("praha", "Praha", 1, 3_600),
+            ("middle", "Intermediate", 2, 4_500),
+            ("vsetin", "Vsetin", 3, 5_400),
+        ]
+        .into_iter()
+        .map(
+            |(stop_id, stop_name, stop_sequence, time)| JourneyStopCall {
+                trip_id: "trip-calls".to_string(),
+                stop_id: stop_id.to_string(),
+                stop_sequence,
+                scheduled_arrival: time,
+                scheduled_departure: time,
+                pickup_type: Some(0),
+                drop_off_type: Some(0),
+                timepoint: Some(true),
+                stop_time_platform: None,
+                stop_name: stop_name.to_string(),
+                municipality: None,
+                lat: None,
+                lon: None,
+                platform_code: None,
+            },
+        )
+        .collect::<Vec<_>>();
+        let calls_by_trip = HashMap::from([("trip-calls".to_string(), calls)]);
+        let mut values = journeys_with_realtime(std::slice::from_ref(&journey), &[]);
+
+        attach_stop_calls(&[journey], &mut values, &calls_by_trip, &[]);
+
+        assert_eq!(
+            values[0]["legs"][0]["stop_calls"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(values[0]["legs"][0]["intermediate_stop_count"], 1);
+        assert_eq!(
+            values[0]["legs"][0]["stop_calls"][1]["is_intermediate"],
+            true
         );
     }
 }

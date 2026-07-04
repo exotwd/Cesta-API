@@ -155,6 +155,10 @@ The API exposes a static OpenAPI foundation at:
 GET /openapi.json
 ```
 
+Flutter integration for detailed journey stop calls is documented in [`docs/app-intermediate-stops.md`](docs/app-intermediate-stops.md).
+
+After deploying calendar-aware routing, refresh existing schedule feeds once. PID refreshes automatically; refresh a legacy GGU import with `docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest`.
+
 ## Next Connections
 
 - Replace fixture routing snapshots with generated per-service-day snapshots.
