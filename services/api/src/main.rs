@@ -4210,20 +4210,6 @@ async fn direct_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
-        current_train_route_variants AS (
-          SELECT route_id
-          FROM (
-            SELECT
-              id AS route_id,
-              row_number() OVER (
-                PARTITION BY source_feed_id, regexp_replace(source_id, 'CZTRAINR-[0-9]{4}-', 'CZTRAINR-')
-                ORDER BY substring(source_id from 'CZTRAINR-([0-9]{4})-')::integer DESC, id DESC
-              ) AS route_variant_rank
-            FROM routes
-            WHERE COALESCE(source_id, '') ~ 'CZTRAINR-[0-9]{4}-'
-          ) ranked_route_variants
-          WHERE route_variant_rank = 1
-        ),
         candidate_legs AS (
           SELECT
             st_from.trip_id,
@@ -4234,7 +4220,6 @@ async fn direct_journeys_db(
             st_to.arrival_time,
             r.source_priority,
             t.service_id IN (SELECT service_id FROM active_services) AS service_verified,
-            lir.import_run_id IS NOT NULL AS from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 OR r.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
@@ -4263,8 +4248,11 @@ async fn direct_journeys_db(
                  AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t.source_feed_id)
             )
             AND (
-              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
-              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+              lir.import_run_id IS NOT NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM latest_import_runs latest_for_feed
+                WHERE latest_for_feed.source_feed_id = t.source_feed_id
+              )
             )
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
@@ -4282,12 +4270,6 @@ async fn direct_journeys_db(
         FROM candidate_legs
         WHERE public_mode <> 'unknown'
           AND ($4 = false OR public_mode = ANY($5))
-          AND (
-            from_latest_import
-            OR NOT EXISTS (
-              SELECT 1 FROM candidate_legs latest_candidates WHERE latest_candidates.from_latest_import
-            )
-          )
         ORDER BY service_verified DESC, arrival_time ASC, departure_time ASC, source_priority ASC
         LIMIT $7
         "#,
@@ -4376,20 +4358,6 @@ async fn one_transfer_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
-        current_train_route_variants AS (
-          SELECT route_id
-          FROM (
-            SELECT
-              id AS route_id,
-              row_number() OVER (
-                PARTITION BY source_feed_id, regexp_replace(source_id, 'CZTRAINR-[0-9]{4}-', 'CZTRAINR-')
-                ORDER BY substring(source_id from 'CZTRAINR-([0-9]{4})-')::integer DESC, id DESC
-              ) AS route_variant_rank
-            FROM routes
-            WHERE COALESCE(source_id, '') ~ 'CZTRAINR-[0-9]{4}-'
-          ) ranked_route_variants
-          WHERE route_variant_rank = 1
-        ),
         first_legs AS MATERIALIZED (
           SELECT
             st_from.trip_id AS first_trip_id,
@@ -4409,7 +4377,6 @@ async fn one_transfer_journeys_db(
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_mid.id
               ELSE 'stop:' || s_mid.id
             END AS transfer_key,
-            lir.import_run_id IS NOT NULL AS first_from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r.mode) = 'tram' OR r.gtfs_route_type = 0 OR r.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
@@ -4440,8 +4407,11 @@ async fn one_transfer_journeys_db(
                  AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t.source_feed_id)
             )
             AND (
-              COALESCE(r.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
-              OR r.id IN (SELECT route_id FROM current_train_route_variants)
+              lir.import_run_id IS NOT NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM latest_import_runs latest_for_feed
+                WHERE latest_for_feed.source_feed_id = t.source_feed_id
+              )
             )
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_mid.drop_off_type, 0) = 0
@@ -4473,7 +4443,6 @@ async fn one_transfer_journeys_db(
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_transfer.id
               ELSE 'stop:' || s_transfer.id
             END AS transfer_key,
-            lir2.import_run_id IS NOT NULL AS second_from_latest_import,
             CASE
               WHEN lower(r2.mode) IN ('train', 'rail') OR r2.gtfs_route_type = 2 OR r2.gtfs_route_type BETWEEN 100 AND 199 OR r2.gtfs_route_type BETWEEN 400 AND 499 OR lower(r2.id) LIKE '%train%' OR lower(r2.source_id) LIKE '%train%' THEN 'train'
               WHEN lower(r2.mode) = 'tram' OR r2.gtfs_route_type = 0 OR r2.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
@@ -4504,8 +4473,11 @@ async fn one_transfer_journeys_db(
                  AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t2.source_feed_id)
             )
             AND (
-              COALESCE(r2.source_id, '') !~ 'CZTRAINR-[0-9]{4}-'
-              OR r2.id IN (SELECT route_id FROM current_train_route_variants)
+              lir2.import_run_id IS NOT NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM latest_import_runs latest_for_feed
+                WHERE latest_for_feed.source_feed_id = t2.source_feed_id
+              )
             )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
@@ -4537,9 +4509,7 @@ async fn one_transfer_journeys_db(
             second_legs.second_arrival_time,
             second_legs.second_source_priority,
             second_legs.second_service_verified,
-            second_legs.second_mode,
-            first_legs.first_from_latest_import
-              AND second_legs.second_from_latest_import AS from_latest_import
+            second_legs.second_mode
           FROM filtered_first_legs first_legs
           JOIN filtered_second_legs second_legs
             ON first_legs.first_trip_id <> second_legs.second_trip_id
@@ -4551,12 +4521,6 @@ async fn one_transfer_journeys_db(
         FROM candidate_journeys
         WHERE first_mode <> 'unknown'
           AND ($4 = false OR first_mode = ANY($5))
-          AND (
-            from_latest_import
-            OR NOT EXISTS (
-              SELECT 1 FROM candidate_journeys latest_candidates WHERE latest_candidates.from_latest_import
-            )
-          )
         ORDER BY (first_service_verified AND second_service_verified) DESC,
                  second_arrival_time ASC, first_departure_time ASC,
                  first_source_priority + second_source_priority ASC
