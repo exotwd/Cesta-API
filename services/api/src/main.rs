@@ -4401,12 +4401,12 @@ async fn one_transfer_journeys_db(
             r.source_priority AS first_source_priority,
             t.service_id IN (SELECT service_id FROM active_services) AS first_service_verified,
             CASE
+              WHEN s_mid.stop_area_id IS NOT NULL THEN 'area:' || s_mid.stop_area_id
+              WHEN s_mid.lat IS NOT NULL AND s_mid.lon IS NOT NULL
+                THEN 'geo:' || s_mid.normalized_name || ':' || round(s_mid.lat::numeric, 2)::text || ':' || round(s_mid.lon::numeric, 2)::text
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_mid.id, '-[0-9][[:alnum:]]{0,3}$', '')
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_mid.id
-              WHEN s_mid.stop_area_id IS NOT NULL THEN 'area:' || s_mid.stop_area_id
-              WHEN s_mid.source_feed_id = 'pid_gtfs' AND s_mid.lat IS NOT NULL AND s_mid.lon IS NOT NULL
-                THEN 'pid:' || s_mid.normalized_name || ':' || round(s_mid.lat::numeric, 2)::text || ':' || round(s_mid.lon::numeric, 2)::text
               ELSE 'stop:' || s_mid.id
             END AS transfer_key,
             lir.import_run_id IS NOT NULL AS first_from_latest_import,
@@ -4445,6 +4445,8 @@ async fn one_transfer_journeys_db(
             )
             AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_mid.drop_off_type, 0) = 0
+          ORDER BY st_from.departure_time ASC, st_mid.arrival_time ASC
+          LIMIT 4000
         ),
         filtered_first_legs AS (
           SELECT *
@@ -4463,12 +4465,12 @@ async fn one_transfer_journeys_db(
             r2.source_priority AS second_source_priority,
             t2.service_id IN (SELECT service_id FROM active_services) AS second_service_verified,
             CASE
+              WHEN s_transfer.stop_area_id IS NOT NULL THEN 'area:' || s_transfer.stop_area_id
+              WHEN s_transfer.lat IS NOT NULL AND s_transfer.lon IS NOT NULL
+                THEN 'geo:' || s_transfer.normalized_name || ':' || round(s_transfer.lat::numeric, 2)::text || ':' || round(s_transfer.lon::numeric, 2)::text
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_transfer.id, '-[0-9][[:alnum:]]{0,3}$', '')
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_transfer.id
-              WHEN s_transfer.stop_area_id IS NOT NULL THEN 'area:' || s_transfer.stop_area_id
-              WHEN s_transfer.source_feed_id = 'pid_gtfs' AND s_transfer.lat IS NOT NULL AND s_transfer.lon IS NOT NULL
-                THEN 'pid:' || s_transfer.normalized_name || ':' || round(s_transfer.lat::numeric, 2)::text || ':' || round(s_transfer.lon::numeric, 2)::text
               ELSE 'stop:' || s_transfer.id
             END AS transfer_key,
             lir2.import_run_id IS NOT NULL AS second_from_latest_import,
@@ -4507,6 +4509,8 @@ async fn one_transfer_journeys_db(
             )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
             AND COALESCE(st_to.drop_off_type, 0) = 0
+          ORDER BY st_to.arrival_time ASC, st_transfer.departure_time DESC
+          LIMIT 4000
         ),
         filtered_second_legs AS (
           SELECT *
