@@ -17,7 +17,7 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 
 ## What Is Mocked
 
-- Realtime data uses explicit mock updates and reports `mock = true`.
+- Realtime mock updates are used only when `USE_MOCK_REALTIME=true` and remain labelled as development data.
 - Ticket recommendation endpoints return mock recommendations and do not implement payment.
 - The API uses fixture transport data only when `USE_MOCK_DATA=true`; with `USE_MOCK_DATA=false`, stop search, stop detail and departures read imported PostgreSQL data.
 - Offline package records are metadata-only placeholders until package generation is wired to imported data.
@@ -25,6 +25,8 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 ## What Uses Real Data
 
 - The `data-pipeline` service can download GGU latest GTFS and log files, archive them without overwrites, compute SHA-256 checksums, parse GTFS core files and export agencies, stops, routes, trips, stop times and validation issues to PostgreSQL.
+- The `schedule-updater` checks official PID GTFS and seven-day line geometry every six hours and imports only changed schedules.
+- The realtime worker consumes PID GTFS-Realtime every 20 seconds and IDS JMK/DÚK vehicle feeds every 30 seconds. PID delays are joined to concrete trips and stops.
 - `/metadata/data-status`, `/stops/search`, `/stops/{id}` and `/departures` read imported database data when `USE_MOCK_DATA=false`.
 - API response shapes include data freshness and warnings so mock or unavailable data is not hidden.
 
@@ -59,6 +61,7 @@ cargo run -p cesta-api
 cargo run -p data-pipeline -- import-and-validate ggu-latest --limit-rows 1000
 cargo run -p data-pipeline -- summarize latest
 cargo run -p realtime-worker
+cargo run -p realtime-worker -- --check-feeds
 ```
 
 On Windows, native `cargo run` requires Visual Studio Build Tools with the C++ workload because the default Rust toolchain uses MSVC `link.exe`. If that is not installed, use Docker Compose:
@@ -123,6 +126,21 @@ docker compose --profile tools run --rm data-pipeline import-and-validate ggu-la
 
 This downloads real GGU latest files into `storage/raw/...`, parses GTFS core files and exports imported rows to PostgreSQL. If the latest local GGU run still matches the remote `ETag`, `Last-Modified` or content length, the pipeline reuses the existing files instead of downloading them again. Database export also skips a source when the same feed checksum was already imported successfully, and it refuses to start a duplicate export while the same source is already running. Use `--force-db-export` only when you intentionally want to rewrite an unchanged feed. Full national imports can be large. Use `--limit-rows` for development and remove it for production-style runs.
 
+## PID Automatic Updates
+
+`docker compose up --build` starts `schedule-updater` and `realtime-worker`. Trigger a PID schedule and line-geometry refresh manually with:
+
+```powershell
+docker compose --profile tools run --rm data-pipeline sync-pid
+```
+
+Inspect source freshness and current vehicle data:
+
+```powershell
+Invoke-RestMethod http://localhost:8070/data-sources/status
+Invoke-RestMethod "http://localhost:8070/realtime/vehicles?source=pid_gtfs_rt&limit=100"
+```
+
 After import, restart the API if it was already running:
 
 ```powershell
@@ -139,8 +157,6 @@ GET /openapi.json
 
 ## Next Connections
 
-- Wire API repositories to PostgreSQL queries for imported schedules.
 - Replace fixture routing snapshots with generated per-service-day snapshots.
-- Add official PID/GTFS-RT realtime integrations.
-- Implement geodata reconciliation and manual match workflows.
+- Add reliable schedule mappings for regional realtime feeds whose identifiers differ.
 - Add production bootstrap/admin management commands.

@@ -29,6 +29,7 @@ futures-util = "0.3"
 geo-types = { version = "0.7", features = ["serde"] }
 hex = "0.4"
 jsonwebtoken = "9"
+prost = "0.14"
 password-hash = { version = "0.5", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["std"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }

@@ -32,6 +32,11 @@ const TRIP_BATCH_SIZE: usize = 10_000;
 const STOP_TIME_BATCH_SIZE: usize = 10_000;
 const DEFAULT_CZ_CITIES_URL: &str =
     "https://raw.githubusercontent.com/33bcdd/souradnice-mest/master/souradnice.csv";
+const DEFAULT_PID_GTFS_URL: &str = "https://data.pid.cz/PID_GTFS.zip";
+const DEFAULT_PID_LINES_URL: &str = "https://data.pid.cz/geodata/Linky_7d_WGS84.json";
+const PID_FEED_ID: &str = "pid_gtfs";
+const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
+const PID_SOURCE_PRIORITY: i32 = 10;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -176,6 +181,10 @@ struct Cli {
         default_value = "https://data.jr.ggu.cz/results/latest/"
     )]
     ggu_latest_base_url: String,
+    #[arg(long, env = "PID_GTFS_URL", default_value = DEFAULT_PID_GTFS_URL)]
+    pid_gtfs_url: String,
+    #[arg(long, env = "PID_LINES_URL", default_value = DEFAULT_PID_LINES_URL)]
+    pid_lines_url: String,
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
     #[command(subcommand)]
@@ -211,11 +220,24 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CZ_CITIES_URL)]
         source_url: String,
     },
+    SyncPid {
+        #[arg(long)]
+        force_db_export: bool,
+    },
+    RunScheduler {
+        #[arg(
+            long,
+            env = "SCHEDULE_UPDATE_INTERVAL_SECONDS",
+            default_value_t = 21_600
+        )]
+        interval_seconds: u64,
+    },
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
 enum Source {
     GguLatest,
+    Pid,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -236,6 +258,12 @@ async fn main() -> Result<()> {
             let run_dir = download_ggu_latest(&cli.storage_dir, &cli.ggu_latest_base_url).await?;
             println!("{}", run_dir.display());
         }
+        Command::Download {
+            source: Source::Pid,
+        } => {
+            let run_dir = download_pid_gtfs(&cli.storage_dir, &cli.pid_gtfs_url).await?;
+            println!("{}", run_dir.display());
+        }
         Command::Import {
             source: Source::GguLatest,
             limit_rows,
@@ -243,6 +271,20 @@ async fn main() -> Result<()> {
         } => {
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             import_ggu_latest(
+                &run_dir,
+                limit_rows,
+                cli.database_url.as_deref(),
+                force_db_export,
+            )
+            .await?;
+        }
+        Command::Import {
+            source: Source::Pid,
+            limit_rows,
+            force_db_export,
+        } => {
+            let run_dir = latest_pid_run_dir(&cli.storage_dir)?;
+            import_pid_gtfs(
                 &run_dir,
                 limit_rows,
                 cli.database_url.as_deref(),
@@ -271,6 +313,20 @@ async fn main() -> Result<()> {
             .await?;
             validate_latest(&run_dir)?;
         }
+        Command::ImportAndValidate {
+            source: Source::Pid,
+            limit_rows,
+            force_db_export,
+        } => {
+            let run_dir = download_pid_gtfs(&cli.storage_dir, &cli.pid_gtfs_url).await?;
+            import_pid_gtfs(
+                &run_dir,
+                limit_rows,
+                cli.database_url.as_deref(),
+                force_db_export,
+            )
+            .await?;
+        }
         Command::Summarize {
             target: Target::Latest,
         } => {
@@ -283,6 +339,34 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .context("DATABASE_URL is required for import-cities")?;
             import_czech_cities(database_url, &source_url).await?;
+        }
+        Command::SyncPid { force_db_export } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for sync-pid")?;
+            sync_pid(
+                &cli.storage_dir,
+                database_url,
+                &cli.pid_gtfs_url,
+                &cli.pid_lines_url,
+                force_db_export,
+            )
+            .await?;
+        }
+        Command::RunScheduler { interval_seconds } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for run-scheduler")?;
+            run_pid_scheduler(
+                &cli.storage_dir,
+                database_url,
+                &cli.pid_gtfs_url,
+                &cli.pid_lines_url,
+                interval_seconds,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -446,6 +530,453 @@ fn czech_city_importance(name: &str) -> i32 {
         "ceske budejovice" | "hradec kralove" | "pardubice" => 70,
         _ => 0,
     }
+}
+
+async fn run_pid_scheduler(
+    storage_dir: &Path,
+    database_url: &str,
+    gtfs_url: &str,
+    lines_url: &str,
+    interval_seconds: u64,
+) -> Result<()> {
+    let interval_seconds = interval_seconds.max(300);
+    loop {
+        let retry_after = if let Err(error) =
+            sync_pid(storage_dir, database_url, gtfs_url, lines_url, false).await
+        {
+            tracing::error!(error = %error, "PID schedule synchronization failed");
+            60
+        } else {
+            interval_seconds
+        };
+        tokio::time::sleep(Duration::from_secs(retry_after)).await;
+    }
+}
+
+async fn sync_pid(
+    storage_dir: &Path,
+    database_url: &str,
+    gtfs_url: &str,
+    lines_url: &str,
+    force_db_export: bool,
+) -> Result<()> {
+    let attempted_at = Utc::now();
+    let result = async {
+        let run_dir = download_pid_gtfs(storage_dir, gtfs_url).await?;
+        import_pid_gtfs(&run_dir, None, Some(database_url), force_db_export).await?;
+        sync_pid_line_geodata(database_url, lines_url).await?;
+        Ok::<PathBuf, anyhow::Error>(run_dir)
+    }
+    .await;
+
+    if let Ok(pool) = connect_import_database(database_url).await
+        && apply_feed_migrations(&pool).await.is_ok()
+    {
+        let (status, succeeded_at, error_message, metadata) = match &result {
+            Ok(run_dir) => (
+                "success",
+                Some(Utc::now()),
+                None,
+                serde_json::json!({"run_dir": run_dir.display().to_string()}),
+            ),
+            Err(error) => (
+                "error",
+                None,
+                Some(error.to_string()),
+                serde_json::json!({}),
+            ),
+        };
+        let counts = sqlx::query(
+            r#"
+                SELECT
+                  (SELECT COUNT(*) FROM routes WHERE source_feed_id = $1) AS routes,
+                  (SELECT COUNT(*) FROM trips WHERE source_feed_id = $1) AS trips,
+                  (SELECT COUNT(*) FROM stop_times WHERE source_feed_id = $1) AS stop_times
+                "#,
+        )
+        .bind(PID_FEED_ID)
+        .fetch_one(&pool)
+        .await
+        .ok();
+        let records = counts
+            .as_ref()
+            .map(|row| {
+                row.get::<i64, _>("routes")
+                    + row.get::<i64, _>("trips")
+                    + row.get::<i64, _>("stop_times")
+            })
+            .unwrap_or(0) as usize;
+        record_data_sync(
+            &pool,
+            PID_FEED_ID,
+            gtfs_url,
+            "schedule",
+            attempted_at,
+            succeeded_at,
+            records,
+            records,
+            error_message.as_deref(),
+            serde_json::json!({"status": status, "details": metadata}),
+        )
+        .await?;
+    }
+    result.map(|_| ())
+}
+
+async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
+    const FILE_NAME: &str = "PID_GTFS.zip";
+    let reusable_run = latest_reusable_pid_run(storage_dir)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
+    let remote = fetch_remote_file_metadata(&client, url).await?;
+
+    if let Some(run) = &reusable_run
+        && can_reuse_file(run, FILE_NAME, remote.as_ref())
+    {
+        tracing::info!(path = %run.path.display(), "PID GTFS has not changed");
+        return Ok(run.path.clone());
+    }
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let run_dir = storage_dir
+        .join("raw")
+        .join("pid")
+        .join("latest")
+        .join(timestamp);
+    fs::create_dir_all(&run_dir).await?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("download {url}"))?
+        .error_for_status()?;
+    let status = response.status().as_u16();
+    let etag = header_to_string(response.headers(), ETAG);
+    let last_modified = header_to_string(response.headers(), LAST_MODIFIED);
+    let content_length = header_to_u64(response.headers(), CONTENT_LENGTH);
+    let output = run_dir.join(FILE_NAME);
+    let mut file = fs::File::create(&output).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        file.write_all(&chunk?).await?;
+    }
+    file.flush().await?;
+    let size_bytes = fs::metadata(&output).await?.len();
+    let sha256 = sha256_file(&output)?;
+    let manifest = vec![serde_json::json!({
+        "file": FILE_NAME,
+        "feed_id": PID_FEED_ID,
+        "priority": PID_SOURCE_PRIORITY,
+        "url": url,
+        "http_status": status,
+        "downloaded": true,
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+        "etag": etag,
+        "last_modified": last_modified,
+        "content_length": content_length
+    })];
+    fs::write(
+        run_dir.join("download-manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )
+    .await?;
+    Ok(run_dir)
+}
+
+fn latest_reusable_pid_run(storage_dir: &Path) -> Result<Option<ReusableRun>> {
+    let root = storage_dir.join("raw").join("pid").join("latest");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut entries = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries.into_iter().rev() {
+        let path = entry.path();
+        let manifest_path = path.join("download-manifest.json");
+        if !manifest_path.exists() || !path.join("PID_GTFS.zip").exists() {
+            continue;
+        }
+        let entries: Vec<ManifestEntry> = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        return Ok(Some(ReusableRun {
+            path,
+            manifest: entries
+                .into_iter()
+                .map(|entry| (entry.file.clone(), entry))
+                .collect(),
+        }));
+    }
+    Ok(None)
+}
+
+fn latest_pid_run_dir(storage_dir: &Path) -> Result<PathBuf> {
+    latest_reusable_pid_run(storage_dir)?
+        .map(|run| run.path)
+        .context("no PID GTFS downloads found; run download pid first")
+}
+
+async fn import_pid_gtfs(
+    run_dir: &Path,
+    limit_rows: Option<usize>,
+    database_url: Option<&str>,
+    force_db_export: bool,
+) -> Result<()> {
+    const FILE_NAME: &str = "PID_GTFS.zip";
+    let path = run_dir.join(FILE_NAME);
+    let manifest = download_manifest_by_file(run_dir)?;
+    let manifest_entry = manifest.get(FILE_NAME);
+    let checksum = file_checksum(&path, manifest_entry)?;
+    let pool = match database_url {
+        Some(url) if !url.is_empty() => Some(connect_import_database(url).await?),
+        _ => None,
+    };
+    if let Some(pool) = &pool {
+        apply_feed_migrations(pool).await?;
+        if !force_db_export
+            && let Some(skip) = database_import_skip_reason(
+                pool,
+                &format!("{PID_FEED_ID}:{FILE_NAME}"),
+                checksum.as_deref(),
+            )
+            .await?
+        {
+            println!("{}", serde_json::to_string_pretty(&skip)?);
+            return Ok(());
+        }
+    }
+
+    let dataset = parse_gtfs_zip(
+        &path,
+        ImportOptions {
+            source_feed_id: PID_FEED_ID.to_string(),
+            source_priority: PID_SOURCE_PRIORITY,
+            limit_rows,
+        },
+    )?;
+    let database = if let Some(pool) = &pool {
+        export_dataset_to_postgres(
+            pool,
+            run_dir,
+            FILE_NAME,
+            PID_FEED_ID,
+            PID_SOURCE_PRIORITY,
+            &dataset,
+            manifest_entry,
+            checksum.as_deref(),
+        )
+        .await?
+    } else {
+        serde_json::json!({"exported": false})
+    };
+    let summary = serde_json::json!({
+        "file": FILE_NAME,
+        "feed_id": PID_FEED_ID,
+        "agencies": dataset.agencies.len(),
+        "stops": dataset.stops.len(),
+        "routes": dataset.routes.len(),
+        "trips": dataset.trips.len(),
+        "stop_times": dataset.stop_times.len(),
+        "validation_issues": dataset.validation_issues,
+        "database": database
+    });
+    std::fs::write(
+        run_dir.join("import-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+async fn sync_pid_line_geodata(database_url: &str, url: &str) -> Result<()> {
+    let pool = connect_import_database(database_url).await?;
+    apply_feed_migrations(&pool).await?;
+    let attempted_at = Utc::now();
+    let result = sync_pid_line_geodata_inner(&pool, url, attempted_at).await;
+    match &result {
+        Ok((received, written)) => {
+            record_data_sync(
+                &pool,
+                PID_LINES_FEED_ID,
+                url,
+                "route_geometry",
+                attempted_at,
+                Some(attempted_at),
+                *received,
+                *written,
+                None,
+                serde_json::json!({"format": "GeoJSON", "crs": "WGS84"}),
+            )
+            .await?;
+        }
+        Err(error) => {
+            record_data_sync(
+                &pool,
+                PID_LINES_FEED_ID,
+                url,
+                "route_geometry",
+                attempted_at,
+                None,
+                0,
+                0,
+                Some(&error.to_string()),
+                serde_json::json!({}),
+            )
+            .await?;
+        }
+    }
+    let (received, written) = result?;
+    tracing::info!(received, written, "PID route geometries synchronized");
+    Ok(())
+}
+
+async fn sync_pid_line_geodata_inner(
+    pool: &PgPool,
+    url: &str,
+    fetched_at: chrono::DateTime<Utc>,
+) -> Result<(usize, usize)> {
+    let payload: Value = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let features = payload
+        .get("features")
+        .and_then(Value::as_array)
+        .context("PID line GeoJSON does not contain a features array")?;
+    let mut transaction = pool.begin().await?;
+    let mut written = 0usize;
+    for (index, feature) in features.iter().enumerate() {
+        let properties = feature
+            .get("properties")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let geometry = feature
+            .get("geometry")
+            .cloned()
+            .context("PID line feature is missing geometry")?;
+        let source_route_id = properties
+            .get("route_id")
+            .and_then(Value::as_str)
+            .context("PID line feature is missing route_id")?
+            .to_string();
+        let source_feature_id = properties
+            .get("OBJECTID")
+            .map(Value::to_string)
+            .unwrap_or_else(|| format!("{source_route_id}:{index}"));
+        let validity = properties
+            .get("validity")
+            .and_then(Value::as_str)
+            .map(parse_pid_validity)
+            .transpose()?
+            .unwrap_or_default();
+        let affected = sqlx::query(
+            r#"
+            INSERT INTO route_geometries (
+              source_feed_id, source_feature_id, route_id, source_route_id,
+              validity, geometry, geom, properties, fetched_at
+            )
+            VALUES (
+              $1, $2, $3, $4, $5, $6,
+              ST_SetSRID(ST_GeomFromGeoJSON($6::text), 4326), $7, $8
+            )
+            ON CONFLICT (source_feed_id, source_feature_id) DO UPDATE SET
+              route_id = EXCLUDED.route_id,
+              source_route_id = EXCLUDED.source_route_id,
+              validity = EXCLUDED.validity,
+              geometry = EXCLUDED.geometry,
+              geom = EXCLUDED.geom,
+              properties = EXCLUDED.properties,
+              fetched_at = EXCLUDED.fetched_at
+            "#,
+        )
+        .bind(PID_LINES_FEED_ID)
+        .bind(source_feature_id)
+        .bind(format!("{PID_FEED_ID}:{source_route_id}"))
+        .bind(&source_route_id)
+        .bind(validity)
+        .bind(geometry)
+        .bind(properties)
+        .bind(fetched_at)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        written += affected as usize;
+    }
+    sqlx::query("DELETE FROM route_geometries WHERE source_feed_id = $1 AND fetched_at < $2")
+        .bind(PID_LINES_FEED_ID)
+        .bind(fetched_at)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok((features.len(), written))
+}
+
+fn parse_pid_validity(value: &str) -> Result<Vec<chrono::NaiveDate>> {
+    value
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
+                .with_context(|| format!("invalid PID route validity date {value}"))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_data_sync(
+    pool: &PgPool,
+    source_id: &str,
+    source_url: &str,
+    data_kind: &str,
+    attempted_at: chrono::DateTime<Utc>,
+    succeeded_at: Option<chrono::DateTime<Utc>>,
+    records_received: usize,
+    records_written: usize,
+    error_message: Option<&str>,
+    metadata: Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO data_source_syncs (
+          source_id, source_url, data_kind, status, last_attempt_at, last_success_at,
+          source_timestamp, records_received, records_written, error_message, metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10)
+        ON CONFLICT (source_id) DO UPDATE SET
+          source_url = EXCLUDED.source_url,
+          data_kind = EXCLUDED.data_kind,
+          status = EXCLUDED.status,
+          last_attempt_at = EXCLUDED.last_attempt_at,
+          last_success_at = COALESCE(EXCLUDED.last_success_at, data_source_syncs.last_success_at),
+          source_timestamp = COALESCE(EXCLUDED.source_timestamp, data_source_syncs.source_timestamp),
+          records_received = EXCLUDED.records_received,
+          records_written = EXCLUDED.records_written,
+          error_message = EXCLUDED.error_message,
+          metadata = EXCLUDED.metadata
+        "#,
+    )
+    .bind(source_id)
+    .bind(source_url)
+    .bind(data_kind)
+    .bind(if succeeded_at.is_some() { "success" } else { "error" })
+    .bind(attempted_at)
+    .bind(succeeded_at)
+    .bind(records_received as i32)
+    .bind(records_written as i32)
+    .bind(error_message)
+    .bind(metadata)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathBuf> {
@@ -823,6 +1354,20 @@ async fn connect_import_database(database_url: &str) -> Result<PgPool> {
     Ok(pool)
 }
 
+async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0005_cities.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0006_public_transport_feeds.sql"
+    ))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn download_manifest_by_file(run_dir: &Path) -> Result<HashMap<String, ManifestEntry>> {
     let path = run_dir.join("download-manifest.json");
     if !path.exists() {
@@ -919,11 +1464,7 @@ async fn export_dataset_to_postgres(
     manifest_entry: Option<&ManifestEntry>,
     checksum: Option<&str>,
 ) -> Result<serde_json::Value> {
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0005_cities.sql"
-    ))
-    .execute(pool)
-    .await?;
+    apply_feed_migrations(pool).await?;
 
     let source = format!("{feed_id}:{file_name}");
     let import_run_id: Uuid = sqlx::query_scalar(
@@ -1650,4 +2191,16 @@ fn summarize(run_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pid_line_validity_dates() {
+        let dates = parse_pid_validity("20260704,20260705").unwrap();
+        assert_eq!(dates.len(), 2);
+        assert_eq!(dates[0].to_string(), "2026-07-04");
+    }
 }

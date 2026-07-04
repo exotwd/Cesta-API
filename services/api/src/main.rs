@@ -17,7 +17,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
-use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,8 @@ const DB_STAT_TABLES: &[&str] = &[
     "stop_times",
     "validation_issues",
     "realtime_updates",
+    "data_source_syncs",
+    "route_geometries",
     "manual_stop_matches",
     "offline_packages",
 ];
@@ -58,6 +60,7 @@ const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
 const ADMIN_VALIDATION_SOURCE_FILE: &str = "admin_database_validation";
+const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 
 struct AdminEntitySpec {
     key: &'static str,
@@ -96,6 +99,8 @@ const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
     AdminEntitySpec { key: "transfers", table: "transfers", label: "Transfers", row_expression: "to_jsonb(t)", order_by: "from_stop_id ASC, to_stop_id ASC", map_available: false },
     AdminEntitySpec { key: "shapes", table: "shapes", label: "Shapes", row_expression: "to_jsonb(t) - 'geom'", order_by: "shape_id ASC, shape_pt_sequence ASC", map_available: true },
     AdminEntitySpec { key: "realtime_updates", table: "realtime_updates", label: "Realtime updates", row_expression: "to_jsonb(t) - 'vehicle_position'", order_by: "fetched_at DESC, id DESC", map_available: false },
+    AdminEntitySpec { key: "data_source_syncs", table: "data_source_syncs", label: "Data source syncs", row_expression: "to_jsonb(t)", order_by: "last_attempt_at DESC, source_id ASC", map_available: false },
+    AdminEntitySpec { key: "route_geometries", table: "route_geometries", label: "Route geometries", row_expression: "to_jsonb(t) - 'geom'", order_by: "source_route_id ASC, source_feature_id ASC", map_available: false },
     AdminEntitySpec { key: "manual_stop_matches", table: "manual_stop_matches", label: "Manual stop matches", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: true },
     AdminEntitySpec { key: "validation_issues", table: "validation_issues", label: "Validation issues", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
     AdminEntitySpec { key: "offline_packages", table: "offline_packages", label: "Offline packages", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id ASC", map_available: false },
@@ -123,6 +128,8 @@ const DATA_VALIDATION_CHECKS: &[DataValidationCheck] = &[
     DataValidationCheck { code: "route_missing_source_tracking", severity: "error", entity: "routes", description: "Routes must retain their source feed and source identifier", table: "routes", id_expression: "id", predicate: "source_feed_id IS NULL OR btrim(source_id) = ''" },
     DataValidationCheck { code: "route_without_trips", severity: "warning", entity: "routes", description: "Active routes should contain at least one trip", table: "routes", id_expression: "id", predicate: "is_active = true AND NOT EXISTS (SELECT 1 FROM trips WHERE trips.route_id = routes.id)" },
     DataValidationCheck { code: "trip_missing_source_tracking", severity: "error", entity: "trips", description: "Trips must retain their source feed, source identifier and service identifier", table: "trips", id_expression: "id", predicate: "source_feed_id IS NULL OR btrim(source_id) = '' OR btrim(service_id) = ''" },
+    DataValidationCheck { code: "realtime_missing_source_tracking", severity: "error", entity: "realtime_updates", description: "Realtime records must retain their source feed and external entity identifier", table: "realtime_updates", id_expression: "id::text", predicate: "source_feed_id IS NULL OR COALESCE(btrim(source_entity_id), '') = ''" },
+    DataValidationCheck { code: "realtime_invalid_validity", severity: "warning", entity: "realtime_updates", description: "Realtime validity must not end before the source fetch timestamp", table: "realtime_updates", id_expression: "id::text", predicate: "valid_until IS NOT NULL AND valid_until < fetched_at" },
     DataValidationCheck { code: "trip_without_stop_times", severity: "error", entity: "trips", description: "Trips must contain at least one stop time", table: "trips", id_expression: "id", predicate: "NOT EXISTS (SELECT 1 FROM stop_times WHERE stop_times.trip_id = trips.id)" },
     DataValidationCheck { code: "trip_without_service_calendar", severity: "warning", entity: "trips", description: "Trip service identifiers should exist in calendars or calendar exceptions", table: "trips", id_expression: "id", predicate: "NOT EXISTS (SELECT 1 FROM calendars WHERE calendars.service_id = trips.service_id) AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE calendar_dates.service_id = trips.service_id)" },
     DataValidationCheck { code: "stop_time_invalid_time", severity: "error", entity: "stop_times", description: "Stop times must be non-negative, ordered and within a two-day service window", table: "stop_times", id_expression: "trip_id || ':' || stop_sequence::text", predicate: "arrival_time < 0 OR departure_time < arrival_time OR arrival_time > 172800 OR departure_time > 172800" },
@@ -278,6 +285,12 @@ struct StopSearchQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct RealtimeVehiclesQuery {
+    source: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct NearbyQuery {
     lat: f64,
     lon: f64,
@@ -410,7 +423,19 @@ async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPoo
                 .execute(&pool)
                 .await
                 {
-                    Ok(_) => return Ok(pool),
+                    Ok(_) => match sqlx::raw_sql(include_str!(
+                        "../../../infra/postgres/migrations/0006_public_transport_feeds.sql"
+                    ))
+                    .execute(&pool)
+                    .await
+                    {
+                        Ok(_) => return Ok(pool),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "public transport feed migration failed; retrying");
+                            last_error = Some(error);
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    },
                     Err(error) => {
                         tracing::warn!(attempt, %error, "database schema is not ready yet");
                         last_error = Some(error);
@@ -477,6 +502,8 @@ fn build_router(state: AppState) -> Router {
         .route("/departures/board/{stop_id}", get(board_departures))
         .route("/departures/board/{stop_id}/qr", get(board_qr))
         .route("/journeys/search", post(journey_search))
+        .route("/realtime/vehicles", get(realtime_vehicles))
+        .route("/data-sources/status", get(data_sources_status))
         .route("/realtime/trip/{trip_id}", get(realtime_trip))
         .route("/realtime/status", get(realtime_status))
         .route("/offline/packages", get(offline_packages))
@@ -557,7 +584,7 @@ async fn openapi() -> Json<Value> {
             "/departures": {"get": {"summary": "Stop departures"}},
             "/journeys/search": {"post": {
                 "summary": "Search journeys",
-                "description": "Returns ranked journey candidates. City points expand to their assigned active physical stops.",
+                "description": "Returns ranked journey candidates. City points expand to active physical stops. Each leg may include PID realtime delay, estimates, cancellation, vehicle position, source and freshness metadata.",
                 "requestBody": {
                     "required": true,
                     "content": {"application/json": {"schema": {
@@ -576,6 +603,19 @@ async fn openapi() -> Json<Value> {
                         }
                     }}}
                 }
+            }},
+            "/realtime/vehicles": {"get": {
+                "summary": "Current public transport vehicle positions",
+                "description": "Returns fresh PID, IDS JMK and DUK vehicle positions with source-specific delay information.",
+                "parameters": [
+                    {"name": "source", "in": "query", "schema": {"type": "string"}},
+                    {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 2000}}
+                ],
+                "responses": {"200": {"description": "Current vehicle positions"}}
+            }},
+            "/data-sources/status": {"get": {
+                "summary": "Automatic data-source synchronization status",
+                "responses": {"200": {"description": "Freshness, record counts and latest errors for every automatic source"}}
             }},
             "/admin": {"get": {
                 "summary": "Cesta data administration interface",
@@ -674,6 +714,21 @@ async fn openapi() -> Json<Value> {
                         "id": {"type": "string"},
                         "lat": {"type": ["number", "null"]},
                         "lon": {"type": ["number", "null"]}
+                    }
+                },
+                "JourneyLegRealtime": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["realtime", "cancelled"]},
+                        "delay_seconds": {"type": ["integer", "null"]},
+                        "estimated_departure": {"type": ["string", "null"], "format": "date-time"},
+                        "estimated_arrival": {"type": ["string", "null"], "format": "date-time"},
+                        "cancellation_status": {"type": ["string", "null"]},
+                        "vehicle_id": {"type": ["string", "null"]},
+                        "vehicle_position": {"type": ["object", "null"]},
+                        "source": {"type": "string"},
+                        "fetched_at": {"type": "string", "format": "date-time"},
+                        "valid_until": {"type": ["string", "null"], "format": "date-time"}
                     }
                 }
             }
@@ -1242,6 +1297,96 @@ async fn board_qr(Path(stop_id): Path<String>) -> Json<Value> {
     )
 }
 
+async fn realtime_vehicles(
+    State(state): State<AppState>,
+    Query(query): Query<RealtimeVehiclesQuery>,
+) -> Json<Value> {
+    let Some(pool) = &state.db else {
+        return Json(json!({"vehicles": [], "data_status": mock_status(state.use_mock_data)}));
+    };
+    let limit = query.limit.unwrap_or(2_000).clamp(1, 10_000) as i64;
+    match sqlx::query(
+        r#"
+        SELECT DISTINCT ON (source, vehicle_id)
+          source, source_feed_id, vehicle_id, trip_id, route_id, stop_id,
+          delay_seconds, estimated_arrival, estimated_departure,
+          ST_Y(vehicle_position::geometry) AS lat,
+          ST_X(vehicle_position::geometry) AS lon,
+          bearing, fetched_at, valid_until, confidence
+        FROM realtime_updates
+        WHERE vehicle_id IS NOT NULL
+          AND vehicle_position IS NOT NULL
+          AND (valid_until IS NULL OR valid_until >= now())
+          AND ($1::text IS NULL OR source = $1)
+        ORDER BY source, vehicle_id, fetched_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(query.source)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Json(json!({
+            "vehicles": rows.into_iter().map(|row| json!({
+                "source": row.get::<String, _>("source"),
+                "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+                "vehicle_id": row.get::<String, _>("vehicle_id"),
+                "trip_id": row.get::<Option<String>, _>("trip_id"),
+                "route_id": row.get::<Option<String>, _>("route_id"),
+                "stop_id": row.get::<Option<String>, _>("stop_id"),
+                "delay_seconds": row.get::<Option<i32>, _>("delay_seconds"),
+                "estimated_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
+                "estimated_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
+                "position": {
+                    "lat": row.get::<f64, _>("lat"),
+                    "lon": row.get::<f64, _>("lon")
+                },
+                "bearing": row.get::<Option<f64>, _>("bearing"),
+                "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at"),
+                "valid_until": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
+                "confidence": row.get::<String, _>("confidence")
+            })).collect::<Vec<_>>()
+        })),
+        Err(error) => Json(json!({"vehicles": [], "warnings": [error.to_string()]})),
+    }
+}
+
+async fn data_sources_status(State(state): State<AppState>) -> Json<Value> {
+    let Some(pool) = &state.db else {
+        return Json(json!({"sources": [], "data_status": mock_status(state.use_mock_data)}));
+    };
+    match sqlx::query(
+        r#"
+        SELECT source_id, source_url, data_kind, status, last_attempt_at,
+               last_success_at, source_timestamp, records_received,
+               records_written, error_message, metadata
+        FROM data_source_syncs
+        ORDER BY source_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Json(json!({
+            "sources": rows.into_iter().map(|row| json!({
+                "source_id": row.get::<String, _>("source_id"),
+                "source_url": row.get::<String, _>("source_url"),
+                "data_kind": row.get::<String, _>("data_kind"),
+                "status": row.get::<String, _>("status"),
+                "last_attempt_at": row.get::<DateTime<Utc>, _>("last_attempt_at"),
+                "last_success_at": row.get::<Option<DateTime<Utc>>, _>("last_success_at"),
+                "source_timestamp": row.get::<Option<DateTime<Utc>>, _>("source_timestamp"),
+                "records_received": row.get::<i32, _>("records_received"),
+                "records_written": row.get::<i32, _>("records_written"),
+                "error_message": row.get::<Option<String>, _>("error_message"),
+                "metadata": row.get::<Value, _>("metadata")
+            })).collect::<Vec<_>>()
+        })),
+        Err(error) => Json(json!({"sources": [], "warnings": [error.to_string()]})),
+    }
+}
+
 async fn journey_search(
     State(state): State<AppState>,
     Json(body): Json<JourneySearchBody>,
@@ -1262,12 +1407,15 @@ async fn journey_search(
         validate_journey_point_db(pool, &body.from).await?;
         validate_journey_point_db(pool, &body.to).await?;
         return match query_journeys_db(pool, &body, departure_time).await {
-            Ok((journeys, warnings, related)) => Ok(Json(json!({
-                "journeys": journeys,
-                "related": related,
-                "data_status": database_data_status(),
-                "warnings": warnings
-            }))),
+            Ok((journeys, warnings, related)) => {
+                let realtime_status = related["realtime_status"].as_str().unwrap_or("unavailable");
+                Ok(Json(json!({
+                    "journeys": journeys,
+                    "related": related,
+                    "data_status": database_data_status_with_realtime(realtime_status),
+                    "warnings": warnings
+                })))
+            }
             Err(error) => Ok(Json(json!({
                 "journeys": [],
                 "data_status": {
@@ -2791,11 +2939,38 @@ async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
     let stop_time_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stop_times")
         .fetch_one(pool)
         .await?;
+    let realtime_sources = sqlx::query(
+        r#"
+        SELECT source_id, status, last_success_at, source_timestamp,
+               records_received, records_written, error_message
+        FROM data_source_syncs
+        WHERE data_kind IN ('gtfs_realtime', 'vehicle_positions')
+        ORDER BY source_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let pid_realtime_current = realtime_sources.iter().any(|row| {
+        row.get::<String, _>("source_id") == PID_SOURCE_STATUS_ID
+            && row.get::<String, _>("status") == "success"
+            && row
+                .get::<Option<DateTime<Utc>>, _>("source_timestamp")
+                .is_some_and(|timestamp| timestamp > Utc::now() - Duration::minutes(5))
+    });
     let has_successful_import = latest.is_some();
 
     Ok(json!({
         "schedule": if has_successful_import { "current" } else { "unknown" },
-        "realtime": "unavailable",
+        "realtime": if pid_realtime_current { "full" } else if realtime_sources.is_empty() { "unavailable" } else { "stale" },
+        "realtime_sources": realtime_sources.into_iter().map(|row| json!({
+            "source_id": row.get::<String, _>("source_id"),
+            "status": row.get::<String, _>("status"),
+            "last_success_at": row.get::<Option<DateTime<Utc>>, _>("last_success_at"),
+            "source_timestamp": row.get::<Option<DateTime<Utc>>, _>("source_timestamp"),
+            "records_received": row.get::<i32, _>("records_received"),
+            "records_written": row.get::<i32, _>("records_written"),
+            "error_message": row.get::<Option<String>, _>("error_message")
+        })).collect::<Vec<_>>(),
         "source": "database",
         "database_available": true,
         "latest_import": latest.map(|row| json!({
@@ -2986,7 +3161,7 @@ async fn query_journeys_db(
     pool: &PgPool,
     body: &JourneySearchBody,
     departure_time: u32,
-) -> Result<(Vec<Journey>, Vec<String>, Value), sqlx::Error> {
+) -> Result<(Vec<Value>, Vec<String>, Value), sqlx::Error> {
     let mut warnings = Vec::new();
     let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
     let (to_stop_ids, to_warning) = resolve_journey_point_db(pool, &body.to).await?;
@@ -3063,6 +3238,10 @@ async fn query_journeys_db(
     }
 
     let mut related = journey_related_data_db(pool, &journeys).await?;
+    let realtime_updates = journey_realtime_updates_db(pool, &journeys).await?;
+    let journeys = journeys_with_realtime(journeys, &realtime_updates);
+    related["realtime_updates"] = Value::Array(realtime_updates);
+    related["realtime_status"] = json!(journeys_realtime_status(&journeys));
     related["query_context"] =
         journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids);
 
@@ -3519,6 +3698,7 @@ async fn direct_journeys_db(
             st_to.stop_id AS to_stop_id,
             st_from.departure_time,
             st_to.arrival_time,
+            r.source_priority,
             lir.import_run_id IS NOT NULL AS from_latest_import,
             CASE
               WHEN lower(r.mode) IN ('train', 'rail') OR r.gtfs_route_type = 2 OR r.gtfs_route_type BETWEEN 100 AND 199 OR r.gtfs_route_type BETWEEN 400 AND 499 OR lower(r.id) LIKE '%train%' OR lower(r.source_id) LIKE '%train%' THEN 'train'
@@ -3556,6 +3736,7 @@ async fn direct_journeys_db(
           to_stop_id,
           departure_time,
           arrival_time,
+          source_priority,
           public_mode AS mode
         FROM candidate_legs
         WHERE public_mode <> 'unknown'
@@ -3566,7 +3747,7 @@ async fn direct_journeys_db(
               SELECT 1 FROM candidate_legs latest_candidates WHERE latest_candidates.from_latest_import
             )
           )
-        ORDER BY arrival_time ASC, departure_time ASC
+        ORDER BY arrival_time ASC, departure_time ASC, source_priority ASC
         LIMIT $6
         "#,
     )
@@ -3650,11 +3831,14 @@ async fn one_transfer_journeys_db(
             st_mid.stop_id AS transfer_arrival_stop_id,
             st_from.departure_time AS first_departure_time,
             st_mid.arrival_time AS first_arrival_time,
+            r.source_priority AS first_source_priority,
             CASE
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_mid.id, '-[0-9][[:alnum:]]{0,3}$', '')
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_mid.id
               WHEN s_mid.stop_area_id IS NOT NULL THEN 'area:' || s_mid.stop_area_id
+              WHEN s_mid.source_feed_id = 'pid_gtfs' AND s_mid.lat IS NOT NULL AND s_mid.lon IS NOT NULL
+                THEN 'pid:' || s_mid.normalized_name || ':' || round(s_mid.lat::numeric, 2)::text || ':' || round(s_mid.lon::numeric, 2)::text
               ELSE 'stop:' || s_mid.id
             END AS transfer_key,
             lir.import_run_id IS NOT NULL AS first_from_latest_import,
@@ -3703,11 +3887,14 @@ async fn one_transfer_journeys_db(
             st_to.stop_id AS second_to_stop_id,
             st_transfer.departure_time AS second_departure_time,
             st_to.arrival_time AS second_arrival_time,
+            r2.source_priority AS second_source_priority,
             CASE
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
                 THEN 'rail:' || regexp_replace(s_transfer.id, '-[0-9][[:alnum:]]{0,3}$', '')
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+$' THEN 'rail:' || s_transfer.id
               WHEN s_transfer.stop_area_id IS NOT NULL THEN 'area:' || s_transfer.stop_area_id
+              WHEN s_transfer.source_feed_id = 'pid_gtfs' AND s_transfer.lat IS NOT NULL AND s_transfer.lon IS NOT NULL
+                THEN 'pid:' || s_transfer.normalized_name || ':' || round(s_transfer.lat::numeric, 2)::text || ':' || round(s_transfer.lon::numeric, 2)::text
               ELSE 'stop:' || s_transfer.id
             END AS transfer_key,
             lir2.import_run_id IS NOT NULL AS second_from_latest_import,
@@ -3756,6 +3943,7 @@ async fn one_transfer_journeys_db(
             first_legs.transfer_arrival_stop_id,
             first_legs.first_departure_time,
             first_legs.first_arrival_time,
+            first_legs.first_source_priority,
             first_legs.first_mode,
             second_legs.second_trip_id,
             second_legs.second_route_id,
@@ -3763,6 +3951,7 @@ async fn one_transfer_journeys_db(
             second_legs.second_to_stop_id,
             second_legs.second_departure_time,
             second_legs.second_arrival_time,
+            second_legs.second_source_priority,
             second_legs.second_mode,
             first_legs.first_from_latest_import
               AND second_legs.second_from_latest_import AS from_latest_import
@@ -3783,7 +3972,8 @@ async fn one_transfer_journeys_db(
               SELECT 1 FROM candidate_journeys latest_candidates WHERE latest_candidates.from_latest_import
             )
           )
-        ORDER BY second_arrival_time ASC, first_departure_time ASC
+        ORDER BY second_arrival_time ASC, first_departure_time ASC,
+                 first_source_priority + second_source_priority ASC
         LIMIT $8
         "#,
     )
@@ -3976,6 +4166,38 @@ async fn journey_related_data_db(
         .collect::<Vec<_>>()
     };
 
+    let route_geometries = if route_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            r#"
+            SELECT source_feed_id, source_feature_id, route_id, source_route_id,
+                   validity, geometry, properties, fetched_at
+            FROM route_geometries
+            WHERE route_id = ANY($1)
+              AND (cardinality(validity) = 0 OR CURRENT_DATE = ANY(validity))
+            ORDER BY route_id ASC, source_feature_id ASC
+            "#,
+        )
+        .bind(&route_ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            json!({
+                "source_feed_id": row.get::<String, _>("source_feed_id"),
+                "source_feature_id": row.get::<String, _>("source_feature_id"),
+                "route_id": row.get::<Option<String>, _>("route_id"),
+                "source_route_id": row.get::<String, _>("source_route_id"),
+                "validity": row.get::<Vec<chrono::NaiveDate>, _>("validity"),
+                "geometry": row.get::<Value, _>("geometry"),
+                "properties": row.get::<Value, _>("properties"),
+                "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at")
+            })
+        })
+        .collect::<Vec<_>>()
+    };
+
     let agencies = fetch_agencies_json(pool, agency_ids.into_iter().collect()).await?;
     let source_feeds = fetch_source_feeds_json(pool, source_feed_ids.into_iter().collect()).await?;
 
@@ -3984,9 +4206,178 @@ async fn journey_related_data_db(
         "routes": routes,
         "trips": trips,
         "stop_times": stop_times,
+        "route_geometries": route_geometries,
         "agencies": agencies,
         "source_feeds": source_feeds
     }))
+}
+
+async fn journey_realtime_updates_db(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<Vec<Value>, sqlx::Error> {
+    let trip_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if trip_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query(
+        r#"
+        SELECT source, source_feed_id, source_entity_id, trip_id, route_id, stop_id,
+               delay_seconds, estimated_arrival, estimated_departure,
+               cancellation_status, platform_change, vehicle_id, bearing,
+               ST_Y(vehicle_position::geometry) AS latitude,
+               ST_X(vehicle_position::geometry) AS longitude,
+               fetched_at, valid_until, service_date, confidence
+        FROM realtime_updates
+        WHERE trip_id = ANY($1)
+          AND (valid_until IS NULL OR valid_until >= now())
+          AND (service_date IS NULL OR service_date = CURRENT_DATE)
+        ORDER BY fetched_at DESC
+        LIMIT 10000
+        "#,
+    )
+    .bind(trip_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "source": row.get::<String, _>("source"),
+            "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+            "source_entity_id": row.get::<Option<String>, _>("source_entity_id"),
+            "trip_id": row.get::<Option<String>, _>("trip_id"),
+            "route_id": row.get::<Option<String>, _>("route_id"),
+            "stop_id": row.get::<Option<String>, _>("stop_id"),
+            "delay_seconds": row.get::<Option<i32>, _>("delay_seconds"),
+            "estimated_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
+            "estimated_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
+            "cancellation_status": row.get::<Option<String>, _>("cancellation_status"),
+            "platform_change": row.get::<Option<String>, _>("platform_change"),
+            "vehicle_id": row.get::<Option<String>, _>("vehicle_id"),
+            "vehicle_position": match (
+                row.get::<Option<f64>, _>("latitude"),
+                row.get::<Option<f64>, _>("longitude")
+            ) {
+                (Some(lat), Some(lon)) => Some(json!({"lat": lat, "lon": lon})),
+                _ => None
+            },
+            "bearing": row.get::<Option<f64>, _>("bearing"),
+            "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at"),
+            "valid_until": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
+            "service_date": row.get::<Option<chrono::NaiveDate>, _>("service_date"),
+            "confidence": row.get::<String, _>("confidence")
+        })
+    })
+    .collect())
+}
+
+fn journeys_with_realtime(journeys: Vec<Journey>, updates: &[Value]) -> Vec<Value> {
+    journeys
+        .into_iter()
+        .map(|journey| {
+            let mut value = serde_json::to_value(&journey).unwrap_or_else(|_| json!({}));
+            let mut realtime_legs = 0usize;
+            for (index, leg) in journey.legs.iter().enumerate() {
+                let Some(trip_id) = leg.trip_id.as_deref() else {
+                    continue;
+                };
+                let trip_updates = updates
+                    .iter()
+                    .filter(|update| update["trip_id"].as_str() == Some(trip_id))
+                    .collect::<Vec<_>>();
+                if trip_updates.is_empty() {
+                    continue;
+                }
+                let departure = trip_updates
+                    .iter()
+                    .copied()
+                    .find(|update| update["stop_id"].as_str() == Some(&leg.from_stop_id));
+                let arrival = trip_updates
+                    .iter()
+                    .copied()
+                    .find(|update| update["stop_id"].as_str() == Some(&leg.to_stop_id));
+                let fallback = trip_updates[0];
+                let delay_seconds = departure
+                    .and_then(|update| update["delay_seconds"].as_i64())
+                    .or_else(|| arrival.and_then(|update| update["delay_seconds"].as_i64()))
+                    .or_else(|| fallback["delay_seconds"].as_i64());
+                let cancellation = trip_updates
+                    .iter()
+                    .find_map(|update| update["cancellation_status"].as_str());
+                let position_update = trip_updates
+                    .iter()
+                    .copied()
+                    .find(|update| !update["vehicle_position"].is_null())
+                    .unwrap_or(fallback);
+                let realtime = json!({
+                    "status": if cancellation.is_some() { "cancelled" } else { "realtime" },
+                    "delay_seconds": delay_seconds,
+                    "estimated_departure": departure.and_then(|update| update["estimated_departure"].as_str()),
+                    "estimated_arrival": arrival.and_then(|update| update["estimated_arrival"].as_str()),
+                    "cancellation_status": cancellation,
+                    "platform_change": departure.and_then(|update| update["platform_change"].as_str()),
+                    "vehicle_id": position_update["vehicle_id"],
+                    "vehicle_position": position_update["vehicle_position"],
+                    "bearing": position_update["bearing"],
+                    "source": fallback["source"],
+                    "fetched_at": fallback["fetched_at"],
+                    "valid_until": fallback["valid_until"],
+                    "confidence": fallback["confidence"]
+                });
+                value["legs"][index]["realtime"] = realtime;
+                if let Some(delay) = delay_seconds {
+                    if let Some(warnings) = value["legs"][index]["warnings"].as_array_mut() {
+                        warnings.push(json!(format!("delay_seconds:{delay}")));
+                    }
+                }
+                realtime_legs += 1;
+            }
+            value["realtime_status"] = json!(match realtime_legs {
+                0 => "unavailable",
+                count if count == journey.legs.len() => "full",
+                _ => "partial",
+            });
+            if journey.legs.len() > 1 {
+                for index in 0..journey.legs.len() - 1 {
+                    let delay = value["legs"][index]["realtime"]["delay_seconds"]
+                        .as_i64()
+                        .unwrap_or(0);
+                    let connection_margin = journey.legs[index + 1]
+                        .departure_time
+                        .saturating_sub(journey.legs[index].arrival_time) as i64;
+                    if delay > connection_margin.saturating_sub(MIN_TRANSFER_SECONDS as i64) {
+                        value["risk_score"] = json!(1.0);
+                        if let Some(warnings) = value["legs"][index]["warnings"].as_array_mut() {
+                            warnings.push(json!("connection_at_risk"));
+                        }
+                    }
+                }
+            }
+            value
+        })
+        .collect()
+}
+
+fn journeys_realtime_status(journeys: &[Value]) -> &'static str {
+    if journeys
+        .iter()
+        .any(|journey| journey["realtime_status"] == "full")
+    {
+        "full"
+    } else if journeys
+        .iter()
+        .any(|journey| journey["realtime_status"] == "partial")
+    {
+        "partial"
+    } else {
+        "unavailable"
+    }
 }
 
 async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Value, sqlx::Error> {
@@ -4282,10 +4673,29 @@ async fn departures_db(
           r.id AS route_id,
           r.short_name,
           r.long_name,
-          r.mode
+          r.mode,
+          realtime.delay_seconds,
+          realtime.estimated_arrival,
+          realtime.estimated_departure,
+          realtime.cancellation_status,
+          realtime.platform_change,
+          realtime.source AS realtime_source,
+          realtime.fetched_at AS realtime_fetched_at,
+          realtime.valid_until AS realtime_valid_until
         FROM stop_times st
         JOIN trips t ON t.id = st.trip_id
         JOIN routes r ON r.id = t.route_id
+        LEFT JOIN LATERAL (
+          SELECT delay_seconds, estimated_arrival, estimated_departure,
+                 cancellation_status, platform_change, source, fetched_at, valid_until
+          FROM realtime_updates realtime
+          WHERE realtime.trip_id = st.trip_id
+            AND (realtime.stop_id = st.stop_id OR realtime.stop_id IS NULL)
+            AND (realtime.valid_until IS NULL OR realtime.valid_until >= now())
+            AND (realtime.service_date IS NULL OR realtime.service_date = CURRENT_DATE)
+          ORDER BY (realtime.stop_id = st.stop_id) DESC, realtime.fetched_at DESC
+          LIMIT 1
+        ) realtime ON true
         WHERE st.stop_id = $1
           AND st.departure_time >= $2
           AND COALESCE(st.pickup_type, 0) = 0
@@ -4303,6 +4713,8 @@ async fn departures_db(
         .into_iter()
         .map(|row| {
             let departure_time = row.get::<i32, _>("departure_time") as u32;
+            let delay_seconds = row.get::<Option<i32>, _>("delay_seconds");
+            let cancellation_status = row.get::<Option<String>, _>("cancellation_status");
             json!({
                 "trip_id": row.get::<String, _>("trip_id"),
                 "route_id": row.get::<String, _>("route_id"),
@@ -4313,9 +4725,21 @@ async fn departures_db(
                 "mode": row.get::<String, _>("mode"),
                 "scheduled_departure": transit_model::seconds_to_time(departure_time),
                 "scheduled_arrival": transit_model::seconds_to_time(row.get::<i32, _>("arrival_time") as u32),
-                "realtime_departure": null,
-                "delay_seconds": null,
-                "status": "scheduled"
+                "realtime_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
+                "realtime_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
+                "delay_seconds": delay_seconds,
+                "status": if cancellation_status.is_some() {
+                    "cancelled"
+                } else if delay_seconds.is_some() {
+                    "realtime"
+                } else {
+                    "scheduled"
+                },
+                "cancellation_status": cancellation_status,
+                "platform_change": row.get::<Option<String>, _>("platform_change"),
+                "realtime_source": row.get::<Option<String>, _>("realtime_source"),
+                "realtime_fetched_at": row.get::<Option<DateTime<Utc>>, _>("realtime_fetched_at"),
+                "realtime_valid_until": row.get::<Option<DateTime<Utc>>, _>("realtime_valid_until")
             })
         })
         .collect())
@@ -4486,7 +4910,16 @@ fn database_data_status() -> Value {
     json!({
         "source": "database",
         "schedule": "current",
-        "realtime": "unavailable",
+        "realtime": "source_dependent",
+        "warnings": Vec::<String>::new()
+    })
+}
+
+fn database_data_status_with_realtime(realtime: &str) -> Value {
+    json!({
+        "source": "database",
+        "schedule": "current",
+        "realtime": realtime,
         "warnings": Vec::<String>::new()
     })
 }
@@ -5163,6 +5596,9 @@ mod tests {
                 .iter()
                 .any(|value| value == "city")
         );
+        assert!(payload["paths"]["/realtime/vehicles"].is_object());
+        assert!(payload["paths"]["/data-sources/status"].is_object());
+        assert!(payload["components"]["schemas"]["JourneyLegRealtime"].is_object());
     }
 
     #[tokio::test]
@@ -5885,5 +6321,55 @@ mod tests {
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].id, "journey-1");
+    }
+
+    #[test]
+    fn journey_legs_include_matching_realtime_delay_and_position() {
+        let journey = Journey {
+            id: "pid-journey".to_string(),
+            legs: vec![JourneyLeg {
+                from_stop_id: "pid_gtfs:U1Z1P".to_string(),
+                to_stop_id: "pid_gtfs:U2Z1P".to_string(),
+                route_id: Some("pid_gtfs:L991".to_string()),
+                trip_id: Some("pid_gtfs:trip-1".to_string()),
+                departure_time: 3600,
+                arrival_time: 4200,
+                mode: TransportMode::Metro,
+                warnings: Vec::new(),
+            }],
+            departure_time: 3600,
+            arrival_time: 4200,
+            duration_seconds: 600,
+            transfer_count: 0,
+            walking_distance_meters: 0,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: Vec::new(),
+        };
+        let updates = vec![json!({
+            "trip_id": "pid_gtfs:trip-1",
+            "stop_id": "pid_gtfs:U1Z1P",
+            "delay_seconds": 120,
+            "estimated_departure": "2026-07-04T12:02:00Z",
+            "estimated_arrival": null,
+            "cancellation_status": null,
+            "platform_change": null,
+            "vehicle_id": "vehicle-1",
+            "vehicle_position": {"lat": 50.08, "lon": 14.43},
+            "bearing": 90.0,
+            "source": "pid_gtfs_rt",
+            "fetched_at": "2026-07-04T12:00:00Z",
+            "valid_until": "2026-07-04T12:01:30Z",
+            "confidence": "estimated"
+        })];
+
+        let enriched = journeys_with_realtime(vec![journey], &updates);
+
+        assert_eq!(enriched[0]["realtime_status"], "full");
+        assert_eq!(enriched[0]["legs"][0]["realtime"]["delay_seconds"], 120);
+        assert_eq!(
+            enriched[0]["legs"][0]["realtime"]["vehicle_id"],
+            "vehicle-1"
+        );
     }
 }

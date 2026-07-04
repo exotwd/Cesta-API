@@ -44,12 +44,21 @@ services:
       context: .
       dockerfile: infra/docker/realtime-worker.Dockerfile
     depends_on:
+      - postgres
       - redis
     environment:
+      DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
       REDIS_URL: redis://redis:6379
+      PID_API_TOKEN: ${PID_API_TOKEN:-}
+      PID_POLL_INTERVAL_SECONDS: ${PID_POLL_INTERVAL_SECONDS:-20}
+      IDS_JMK_POLL_INTERVAL_SECONDS: ${IDS_JMK_POLL_INTERVAL_SECONDS:-30}
+      DUK_POLL_INTERVAL_SECONDS: ${DUK_POLL_INTERVAL_SECONDS:-30}
+      USE_MOCK_REALTIME: "false"
       RUST_LOG: info
+    restart: unless-stopped
 
   data-pipeline:
+    image: cesta-data-pipeline:local
     build:
       context: .
       dockerfile: infra/docker/data-pipeline.Dockerfile
@@ -64,6 +73,25 @@ services:
       - ./storage:/app/storage
     profiles:
       - tools
+
+  schedule-updater:
+    image: cesta-data-pipeline:local
+    build:
+      context: .
+      dockerfile: infra/docker/data-pipeline.Dockerfile
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
+      STORAGE_DIR: /app/storage
+      PID_GTFS_URL: https://data.pid.cz/PID_GTFS.zip
+      PID_LINES_URL: https://data.pid.cz/geodata/Linky_7d_WGS84.json
+      SCHEDULE_UPDATE_INTERVAL_SECONDS: ${SCHEDULE_UPDATE_INTERVAL_SECONDS:-21600}
+      RUST_LOG: info
+    command: ["run-scheduler"]
+    restart: unless-stopped
+    volumes:
+      - ./storage:/app/storage
 
 volumes:
   postgres-data:

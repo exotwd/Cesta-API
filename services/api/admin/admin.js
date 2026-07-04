@@ -39,6 +39,8 @@
     transfers: { group: "Network", description: "Walking and interchange links between stops.", columns: ["from_stop_id", "to_stop_id", "min_transfer_seconds", "distance_meters", "confidence", "source"] },
     shapes: { group: "Network", description: "Geographic points defining route paths.", columns: ["shape_id", "shape_pt_sequence", "source_feed_id"] },
     realtime_updates: { group: "Realtime", description: "Latest delays, cancellations, platforms and vehicle updates.", columns: ["trip_id", "route_id", "stop_id", "delay_seconds", "cancellation_status", "source", "fetched_at"] },
+    data_source_syncs: { group: "Realtime", description: "Health and freshness of automatic public-data synchronization.", columns: ["source_id", "data_kind", "status", "source_timestamp", "last_success_at", "records_written", "error_message"] },
+    route_geometries: { group: "Network", description: "Current PID line geometries and validity dates from the official GeoJSON feed.", columns: ["source_route_id", "route_id", "validity", "source_feed_id", "fetched_at"] },
     manual_stop_matches: { group: "Quality", description: "Administrator-reviewed stop coordinate and identity matches.", columns: ["stop_id", "target_stop_id", "confidence", "note", "created_at", "id"] },
     validation_issues: { group: "Quality", description: "Importer and database validation findings.", columns: ["severity", "code", "message", "affected_entity", "source_feed_id", "created_at"] },
     offline_packages: { group: "Distribution", description: "Generated offline transport data packages.", columns: ["name_cs", "version", "valid_from", "valid_until", "size_bytes", "id"] },
