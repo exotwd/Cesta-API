@@ -18,7 +18,10 @@
     detailRequestId: 0,
     map: null,
     mapStops: [],
-    sources: []
+    sources: [],
+    routingConfiguration: null,
+    routingDefaults: null,
+    routingDatabaseAvailable: false
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -54,6 +57,24 @@
     user_sessions: { group: "Accounts", description: "Active and revoked account sessions without token hashes.", columns: ["user_id", "device_name", "expires_at", "revoked_at", "created_at", "id"] },
     user_roles: { group: "Accounts", description: "Roles assigned to user accounts.", columns: ["user_id", "role", "created_at"] }
   };
+
+  const ROUTING_FIELDS = [
+    { group: "Candidate generation", key: "max_direct_candidates", label: "Direct candidate limit", type: "number", min: 1, max: 500, step: 1, unit: "journeys", detail: "Maximum direct services fetched before deduplication and scoring. Raise this for dense corridors; high values increase database work." },
+    { group: "Candidate generation", key: "max_transfer_candidates", label: "Transfer candidate limit", type: "number", min: 1, max: 1000, step: 1, unit: "journeys", detail: "Maximum one-transfer combinations fetched before deduplication. This should normally exceed the direct limit because transfer combinations are more numerous." },
+    { group: "Candidate generation", key: "min_transfer_seconds", label: "Minimum transfer time", type: "number", min: 60, max: 3600, step: 30, unit: "seconds", detail: "Rejects transfers with less time between arrival and onward departure. Lower values find tighter connections but increase missed-connection risk." },
+    { group: "Candidate generation", key: "max_transfer_wait_seconds", label: "Maximum transfer wait", type: "number", min: 300, max: 21600, step: 300, unit: "seconds", detail: "Rejects transfer combinations whose interchange wait exceeds this value. Must be at least the minimum transfer time." },
+    { group: "Candidate generation", key: "transfer_search_timeout_seconds", label: "Transfer query timeout", type: "number", min: 1, max: 60, step: 1, unit: "seconds", detail: "Maximum database time allowed for transfer discovery. On timeout, direct results are still returned with a warning." },
+    { group: "Candidate generation", key: "next_day_search_from_seconds", label: "Next-day search threshold", type: "number", min: 0, max: 86399, step: 300, unit: "seconds after midnight", detail: "At or after this service-day time, today and tomorrow are searched together. 64800 is 18:00." },
+    { group: "Ranking score", key: "arrival_time_weight", label: "Arrival-time weight", type: "number", min: 0, max: 10, step: 0.1, unit: "multiplier", detail: "Weight applied to absolute arrival time. A value of 1 makes earlier arrival the primary objective; 0 removes it from the score." },
+    { group: "Ranking score", key: "duration_weight", label: "In-vehicle/elapsed duration weight", type: "number", min: 0, max: 10, step: 0.1, unit: "multiplier", detail: "Weight applied to journey duration. Raising it favors shorter travel once departed, even if a journey leaves later and arrives later." },
+    { group: "Ranking score", key: "transfer_penalty_seconds", label: "Penalty per transfer", type: "number", min: 0, max: 14400, step: 60, unit: "score-seconds", detail: "Adds this many score-seconds for every transfer. Keep at 0 to let faster transfer journeys outrank slower direct services without a transfer penalty." },
+    { group: "Result selection", key: "max_results", label: "Maximum returned results", type: "number", min: 1, max: 20, step: 1, unit: "journeys", detail: "Final response size after scoring, diversity guarantees, dominance pruning and deduplication." },
+    { group: "Result selection", key: "preserve_simplest", label: "Reserve the simplest journey", type: "boolean", detail: "Keeps the best journey with the fewest transfers in the final set even when it is not the highest-scoring option." },
+    { group: "Result selection", key: "preserve_each_transfer_count", label: "Represent each transfer count", type: "boolean", detail: "Reserves the best candidate for every available transfer count before remaining result slots are filled." },
+    { group: "Result selection", key: "preserve_carrier_diversity", label: "Preserve carrier diversity", type: "boolean", detail: "Reserves the best option from each carrier combination. This keeps potentially cheaper operators visible when verified fares are unavailable." },
+    { group: "Result selection", key: "remove_dominated", label: "Remove dominated journeys", type: "boolean", detail: "Drops a journey when another departs no earlier, arrives no later, uses no more transfers, and is strictly better on at least one of those dimensions." },
+    { group: "Result selection", key: "dominate_only_same_carrier", label: "Prune only within the same carrier", type: "boolean", detail: "Limits dominance pruning to identical carrier combinations. Disable only if temporal efficiency is more important than retaining operator alternatives." }
+  ];
 
   function iconRefresh() {
     if (window.lucide) window.lucide.createIcons();
@@ -947,6 +968,85 @@
     iconRefresh();
   }
 
+  function routingFormValue(field) {
+    const input = document.querySelector(`[name="${field.key}"]`);
+    return field.type === "boolean" ? input.checked : Number(input.value);
+  }
+
+  function routingFormConfiguration() {
+    return Object.fromEntries(ROUTING_FIELDS.map((field) => [field.key, routingFormValue(field)]));
+  }
+
+  function secondsAsClock(seconds) {
+    const hours = Math.floor(seconds / 3600).toString().padStart(2, "0");
+    const minutes = Math.floor((seconds % 3600) / 60).toString().padStart(2, "0");
+    return `${hours}:${minutes}`;
+  }
+
+  function renderRoutingSummary() {
+    const config = routingFormConfiguration();
+    const formula = `${config.arrival_time_weight} × arrival + ${config.duration_weight} × duration + ${config.transfer_penalty_seconds}s × transfers`;
+    const guarantees = [
+      config.preserve_simplest && "simplest journey",
+      config.preserve_each_transfer_count && "each transfer count",
+      config.preserve_carrier_diversity && "each carrier combination"
+    ].filter(Boolean);
+    $("#routing-summary").innerHTML = `
+      <div><span>Ranking formula</span><strong>${escapeHtml(formula)}</strong></div>
+      <div><span>Transfer window</span><strong>${Math.round(config.min_transfer_seconds / 60)}–${Math.round(config.max_transfer_wait_seconds / 60)} min</strong></div>
+      <div><span>Next-day search</span><strong>from ${secondsAsClock(config.next_day_search_from_seconds)}</strong></div>
+      <div><span>Reserved coverage</span><strong>${escapeHtml(guarantees.join(", ") || "none")}</strong></div>
+      <div><span>Dominance pruning</span><strong>${config.remove_dominated ? (config.dominate_only_same_carrier ? "same carrier only" : "across all carriers") : "disabled"}</strong></div>
+      <div><span>Search envelope</span><strong>${config.max_direct_candidates} direct + ${config.max_transfer_candidates} transfer → ${config.max_results} results</strong></div>`;
+  }
+
+  function renderRoutingForm(payload) {
+    state.routingConfiguration = payload.configuration;
+    state.routingDefaults = payload.defaults;
+    state.routingDatabaseAvailable = payload.database_available;
+    const groups = [...new Set(ROUTING_FIELDS.map((field) => field.group))];
+    $("#routing-groups").innerHTML = groups.map((group) => `
+      <section class="panel routing-group">
+        <div class="panel-header"><div><h2>${escapeHtml(group)}</h2><p>${group === "Candidate generation" ? "Controls database search breadth and valid interchange windows." : group === "Ranking score" ? "Defines the generalized score; lower scores rank first." : "Controls pruning, diversity, and the final response set."}</p></div></div>
+        <div class="routing-field-grid">
+          ${ROUTING_FIELDS.filter((field) => field.group === group).map((field) => {
+            const value = payload.configuration[field.key];
+            const defaultValue = payload.defaults[field.key];
+            if (field.type === "boolean") return `
+              <label class="routing-field routing-boolean">
+                <span class="routing-field-heading"><strong>${escapeHtml(field.label)}</strong><input name="${field.key}" type="checkbox" ${value ? "checked" : ""}></span>
+                <small>${escapeHtml(field.detail)}</small>
+                <em>Default: ${defaultValue ? "enabled" : "disabled"}</em>
+              </label>`;
+            return `
+              <label class="routing-field">
+                <span class="routing-field-heading"><strong>${escapeHtml(field.label)}</strong><span>${escapeHtml(field.unit)}</span></span>
+                <input name="${field.key}" type="number" value="${escapeHtml(value)}" min="${field.min}" max="${field.max}" step="${field.step}" required>
+                <small>${escapeHtml(field.detail)}</small>
+                <em>Allowed: ${field.min}–${field.max}. Default: ${defaultValue}.</em>
+              </label>`;
+          }).join("")}
+        </div>
+      </section>`).join("");
+    const persisted = payload.database_available ? "Persisted configuration" : "Defaults only — database unavailable";
+    const audit = payload.updated_at ? ` Last changed ${new Date(payload.updated_at).toLocaleString()}${payload.updated_by ? ` by ${payload.updated_by}` : ""}.` : "";
+    $("#routing-status").classList.remove("warning");
+    $("#routing-status").textContent = `${persisted}.${audit}`;
+    $("#routing-save").disabled = !payload.database_available;
+    $("#routing-reset").disabled = !payload.database_available;
+    $$("#routing-form input").forEach((input) => input.addEventListener("input", () => {
+      renderRoutingSummary();
+      $("#routing-status").textContent = "Unsaved changes. Validate and activate to apply them.";
+      $("#routing-status").classList.add("warning");
+    }));
+    renderRoutingSummary();
+    iconRefresh();
+  }
+
+  async function loadRouting() {
+    renderRoutingForm(await api("/admin/routing-algorithm"));
+  }
+
   async function loadView(view) {
     try {
       if (view === "dashboard") await loadDashboard();
@@ -963,6 +1063,7 @@
       if (view === "imports") await loadImports();
       if (view === "quality") await loadQuality();
       if (view === "sources") await loadSources();
+      if (view === "routing") await loadRouting();
       setApiStatus(true);
     } catch (error) {
       setApiStatus(false, "Request failed");
@@ -977,7 +1078,8 @@
       map: ["Stop map", "Inspect imported stop coordinates and source coverage"],
       imports: ["Imports", "Pipeline history and source summaries"],
       quality: ["Data quality", "Validation issues and unresolved records"],
-      sources: ["Source feeds", "Feed configuration and import priority"]
+      sources: ["Source feeds", "Feed configuration and import priority"],
+      routing: ["Routing algorithm", "Candidate generation, ranking score, pruning, and diversity"]
     };
     state.view = view;
     $$(".view").forEach((section) => section.classList.toggle("active", section.id === `view-${view}`));
@@ -1029,6 +1131,36 @@
     $$(".nav-item").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
     $$("[data-jump]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.jump)));
     $("#refresh-button").addEventListener("click", () => loadView(state.view));
+    $("#routing-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!event.currentTarget.reportValidity()) return;
+      const button = $("#routing-save");
+      button.disabled = true;
+      try {
+        const payload = await api("/admin/routing-algorithm", {
+          method: "PUT",
+          body: JSON.stringify(routingFormConfiguration())
+        });
+        renderRoutingForm(payload);
+        $("#routing-status").classList.remove("warning");
+        toast("Routing algorithm validated and activated");
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        button.disabled = !state.routingDatabaseAvailable;
+      }
+    });
+    $("#routing-reset").addEventListener("click", async () => {
+      if (!window.confirm("Reset every routing parameter to its documented default and activate it immediately?")) return;
+      try {
+        const payload = await api("/admin/routing-algorithm", { method: "DELETE" });
+        renderRoutingForm(payload);
+        $("#routing-status").classList.remove("warning");
+        toast("Routing algorithm reset to defaults");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    });
     $("#entity-select").addEventListener("change", () => {
       $("#entity-search").value = "";
       loadEntityRows(true);

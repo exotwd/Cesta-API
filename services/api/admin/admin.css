@@ -398,6 +398,31 @@ tbody tr:hover .row-action { background: #f7f9fb; }
 .toggle-field { display: flex; align-items: center; gap: 8px; min-height: 40px; font-size: 13px; font-weight: 700; }
 .toggle-field input { width: 18px; min-height: 18px; }
 
+.routing-form { display: grid; gap: 16px; }
+.routing-heading { margin-bottom: -2px; }
+.routing-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.routing-notice { padding: 11px 13px; border: 1px solid var(--border); border-radius: 7px; color: #435160; background: var(--surface); font-size: 12px; }
+.routing-notice.warning { border-color: #e6c76a; color: var(--warning); background: var(--warning-soft); }
+.routing-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.routing-summary-grid > div { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); display: grid; gap: 5px; }
+.routing-summary-grid > div:nth-child(3n) { border-right: 0; }
+.routing-summary-grid > div:nth-last-child(-n + 3) { border-bottom: 0; }
+.routing-summary-grid span { color: var(--muted); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.routing-summary-grid strong { overflow-wrap: anywhere; font-size: 13px; }
+.routing-groups { display: grid; gap: 16px; }
+.routing-field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.routing-field { min-width: 0; min-height: 190px; padding: 16px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
+.routing-field:nth-child(3n) { border-right: 0; }
+.routing-field-heading { min-height: 35px; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.routing-field-heading strong { font-size: 13px; line-height: 1.35; }
+.routing-field-heading > span { color: var(--muted); font-size: 10px; text-align: right; }
+.routing-field input[type="number"] { max-width: 190px; font-variant-numeric: tabular-nums; }
+.routing-field input[type="checkbox"] { flex: 0 0 auto; width: 20px; min-height: 20px; }
+.routing-field small { color: #536170; font-size: 11px; line-height: 1.5; }
+.routing-field em { margin-top: auto; color: var(--muted); font-size: 10px; font-style: normal; }
+.routing-boolean { min-height: 160px; }
+.routing-warning-copy { padding: 16px; color: #536170; font-size: 12px; line-height: 1.6; }
+
 dialog {
   width: min(760px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
@@ -481,6 +506,11 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .source-editor .toggle-field { grid-column: 3; }
   .validation-check-list { grid-template-columns: 1fr; }
   .validation-check:nth-child(odd) { border-right: 0; }
+  .routing-field-grid, .routing-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .routing-field:nth-child(3n), .routing-summary-grid > div:nth-child(3n) { border-right: 1px solid var(--border); }
+  .routing-field:nth-child(2n), .routing-summary-grid > div:nth-child(2n) { border-right: 0; }
+  .routing-summary-grid > div:nth-last-child(-n + 3) { border-bottom: 1px solid var(--border); }
+  .routing-summary-grid > div:nth-last-child(-n + 2) { border-bottom: 0; }
 }
 
 @media (max-width: 760px) {
@@ -502,6 +532,11 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .map-results { max-height: 360px; border-left: 0; border-top: 1px solid var(--border); }
   .source-editor { grid-template-columns: 1fr; align-items: stretch; }
   .source-editor .toggle-field { grid-column: auto; }
+  .routing-field-grid, .routing-summary-grid { grid-template-columns: 1fr; }
+  .routing-field, .routing-field:nth-child(2n), .routing-field:nth-child(3n), .routing-summary-grid > div, .routing-summary-grid > div:nth-child(2n), .routing-summary-grid > div:nth-child(3n) { border-right: 0; }
+  .routing-summary-grid > div:nth-last-child(-n + 2) { border-bottom: 1px solid var(--border); }
+  .routing-summary-grid > div:last-child { border-bottom: 0; }
+  .routing-actions { width: 100%; }
   .pagination { justify-content: space-between; }
   .pagination #entity-range, .page-button { display: none; }
   .record-detail-grid { grid-template-columns: 1fr; }

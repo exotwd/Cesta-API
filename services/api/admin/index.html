@@ -65,6 +65,9 @@
         <button class="nav-item" data-view="sources">
           <i data-lucide="radio-tower"></i><span>Source feeds</span>
         </button>
+        <button class="nav-item" data-view="routing">
+          <i data-lucide="sliders-horizontal"></i><span>Routing algorithm</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <div class="user-block">
@@ -268,6 +271,36 @@
             <div><h2>Source feeds</h2><p>Control enabled feeds and import priority</p></div>
           </div>
           <div class="source-editor-list" id="source-editor-list"></div>
+        </section>
+
+        <section class="view" id="view-routing">
+          <form id="routing-form" class="routing-form">
+            <div class="section-heading routing-heading">
+              <div>
+                <h2>Journey-search algorithm</h2>
+                <p>Changes are persisted and apply to new searches immediately. Existing imports are not modified.</p>
+              </div>
+              <div class="routing-actions">
+                <button class="button" id="routing-reset" type="button"><i data-lucide="rotate-ccw"></i>Reset defaults</button>
+                <button class="button primary" id="routing-save" type="submit"><i data-lucide="save"></i>Validate and activate</button>
+              </div>
+            </div>
+
+            <div class="routing-notice" id="routing-status"></div>
+            <section class="panel routing-summary">
+              <div class="panel-header"><div><h2>Effective behavior</h2><p>Calculated from the unsaved values currently shown below</p></div></div>
+              <div class="routing-summary-grid" id="routing-summary"></div>
+            </section>
+
+            <div class="routing-groups" id="routing-groups"></div>
+
+            <section class="panel routing-warning-panel">
+              <div class="panel-header"><div><h2>Fare limitation</h2><p>What the algorithm can and cannot infer</p></div></div>
+              <div class="routing-warning-copy">
+                Cesta does not currently import real fares. Carrier diversity can retain alternatives such as RegioJet that may be cheaper, but the API will not label a journey as cheapest until verified fare data exists.
+              </div>
+            </section>
+          </form>
         </section>
       </main>
     </div>

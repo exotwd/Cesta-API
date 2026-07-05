@@ -374,6 +374,125 @@ struct AdminSourceFeedPatch {
     enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RoutingAlgorithmConfig {
+    max_results: i32,
+    max_direct_candidates: i32,
+    max_transfer_candidates: i32,
+    min_transfer_seconds: i32,
+    max_transfer_wait_seconds: i32,
+    transfer_search_timeout_seconds: i32,
+    next_day_search_from_seconds: i32,
+    arrival_time_weight: f64,
+    duration_weight: f64,
+    transfer_penalty_seconds: i32,
+    preserve_simplest: bool,
+    preserve_each_transfer_count: bool,
+    preserve_carrier_diversity: bool,
+    remove_dominated: bool,
+    dominate_only_same_carrier: bool,
+}
+
+impl Default for RoutingAlgorithmConfig {
+    fn default() -> Self {
+        Self {
+            max_results: MAX_JOURNEY_RESULTS as i32,
+            max_direct_candidates: MAX_DIRECT_JOURNEY_CANDIDATES as i32,
+            max_transfer_candidates: MAX_TRANSFER_JOURNEY_CANDIDATES as i32,
+            min_transfer_seconds: MIN_TRANSFER_SECONDS as i32,
+            max_transfer_wait_seconds: MAX_TRANSFER_WAIT_SECONDS as i32,
+            transfer_search_timeout_seconds: TRANSFER_SEARCH_TIMEOUT_SECONDS as i32,
+            next_day_search_from_seconds: NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS as i32,
+            arrival_time_weight: 1.0,
+            duration_weight: 0.0,
+            transfer_penalty_seconds: 0,
+            preserve_simplest: true,
+            preserve_each_transfer_count: true,
+            preserve_carrier_diversity: true,
+            remove_dominated: true,
+            dominate_only_same_carrier: true,
+        }
+    }
+}
+
+impl RoutingAlgorithmConfig {
+    fn validate(&self) -> Result<(), ApiError> {
+        let checks = [
+            ("max_results", self.max_results, 1, 20),
+            ("max_direct_candidates", self.max_direct_candidates, 1, 500),
+            (
+                "max_transfer_candidates",
+                self.max_transfer_candidates,
+                1,
+                1000,
+            ),
+            ("min_transfer_seconds", self.min_transfer_seconds, 60, 3600),
+            (
+                "max_transfer_wait_seconds",
+                self.max_transfer_wait_seconds,
+                300,
+                21600,
+            ),
+            (
+                "transfer_search_timeout_seconds",
+                self.transfer_search_timeout_seconds,
+                1,
+                60,
+            ),
+            (
+                "next_day_search_from_seconds",
+                self.next_day_search_from_seconds,
+                0,
+                86399,
+            ),
+            (
+                "transfer_penalty_seconds",
+                self.transfer_penalty_seconds,
+                0,
+                14400,
+            ),
+        ];
+        for (field, value, minimum, maximum) in checks {
+            if !(minimum..=maximum).contains(&value) {
+                return Err(invalid_field(field, minimum, maximum));
+            }
+        }
+        if self.max_transfer_wait_seconds < self.min_transfer_seconds {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "max_transfer_wait_seconds must be greater than or equal to min_transfer_seconds"
+                    .to_string(),
+            });
+        }
+        for (field, value) in [
+            ("arrival_time_weight", self.arrival_time_weight),
+            ("duration_weight", self.duration_weight),
+        ] {
+            if !value.is_finite() || !(0.0..=10.0).contains(&value) {
+                return Err(ApiError {
+                    code: "validation_error".to_string(),
+                    message: format!("{field} must be a finite number between 0 and 10"),
+                });
+            }
+        }
+        if self.arrival_time_weight == 0.0 && self.duration_weight == 0.0 {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "arrival_time_weight and duration_weight cannot both be zero".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn invalid_field(field: &str, minimum: i32, maximum: i32) -> ApiError {
+    ApiError {
+        code: "validation_error".to_string(),
+        message: format!("{field} must be between {minimum} and {maximum}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -521,6 +640,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0006_public_transport_feeds",
         include_str!("../../../infra/postgres/migrations/0006_public_transport_feeds.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0007_routing_algorithm_config",
+        include_str!("../../../infra/postgres/migrations/0007_routing_algorithm_config.sql"),
+    )
     .await
 }
 
@@ -633,6 +758,12 @@ fn build_router(state: AppState) -> Router {
         .route("/admin/manual-stop-match", post(admin_manual_stop_match))
         .route("/admin/source-feeds", get(admin_source_feeds))
         .route("/admin/source-feeds/{id}", patch(admin_source_feed_patch))
+        .route(
+            "/admin/routing-algorithm",
+            get(admin_routing_algorithm)
+                .put(admin_routing_algorithm_update)
+                .delete(admin_routing_algorithm_reset),
+        )
         .route("/public/boards/{stop_id}", get(public_board))
         .route("/public/boards/{stop_id}/qr-metadata", get(public_board_qr))
         .layer(middleware::from_fn_with_state(state.clone(), auth_marker))
@@ -753,6 +884,16 @@ async fn openapi() -> Json<Value> {
             "/admin/unmatched-stops": {"get": {"summary": "List active stops with unresolved coordinates"}},
             "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
             "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
+            "/admin/routing-algorithm": {
+                "get": {"summary": "Read the active journey-search algorithm configuration"},
+                "put": {
+                    "summary": "Replace and immediately activate the journey-search algorithm configuration",
+                    "description": "Validates and persists candidate-generation limits, transfer constraints, scoring weights, dominance pruning and result-diversity guarantees. Requires an admin or data_admin token.",
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"}}}},
+                    "responses": {"200": {"description": "Validated configuration is active for new searches"}, "400": {"description": "Invalid or unsafe parameter combination"}}
+                },
+                "delete": {"summary": "Reset the journey-search algorithm to safe defaults"}
+            },
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
         },
         "components": {
@@ -802,6 +943,28 @@ async fn openapi() -> Json<Value> {
                         },
                         "cities": {"type": "array", "items": {"$ref": "#/components/schemas/CitySearchResult"}},
                         "stops": {"type": "array", "items": {"$ref": "#/components/schemas/StopSearchResult"}}
+                    }
+                },
+                "RoutingAlgorithmConfig": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["max_results", "max_direct_candidates", "max_transfer_candidates", "min_transfer_seconds", "max_transfer_wait_seconds", "transfer_search_timeout_seconds", "next_day_search_from_seconds", "arrival_time_weight", "duration_weight", "transfer_penalty_seconds", "preserve_simplest", "preserve_each_transfer_count", "preserve_carrier_diversity", "remove_dominated", "dominate_only_same_carrier"],
+                    "properties": {
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                        "max_direct_candidates": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
+                        "max_transfer_candidates": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 40},
+                        "min_transfer_seconds": {"type": "integer", "minimum": 60, "maximum": 3600, "default": 300},
+                        "max_transfer_wait_seconds": {"type": "integer", "minimum": 300, "maximum": 21600, "default": 7200},
+                        "transfer_search_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 6},
+                        "next_day_search_from_seconds": {"type": "integer", "minimum": 0, "maximum": 86399, "default": 64800},
+                        "arrival_time_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
+                        "duration_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 0},
+                        "transfer_penalty_seconds": {"type": "integer", "minimum": 0, "maximum": 14400, "default": 0},
+                        "preserve_simplest": {"type": "boolean", "default": true},
+                        "preserve_each_transfer_count": {"type": "boolean", "default": true},
+                        "preserve_carrier_diversity": {"type": "boolean", "default": true},
+                        "remove_dominated": {"type": "boolean", "default": true},
+                        "dominate_only_same_carrier": {"type": "boolean", "default": true}
                     }
                 },
                 "JourneyPoint": {
@@ -2934,6 +3097,208 @@ async fn admin_source_feed_patch(
     })))
 }
 
+async fn admin_routing_algorithm(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(routing_algorithm_payload(
+            RoutingAlgorithmConfig::default(),
+            false,
+            None,
+            None,
+        )));
+    };
+    let (configuration, updated_at, updated_by) = routing_algorithm_config_db(pool)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(routing_algorithm_payload(
+        configuration,
+        true,
+        updated_at,
+        updated_by,
+    )))
+}
+
+async fn admin_routing_algorithm_update(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(configuration): Json<RoutingAlgorithmConfig>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    configuration.validate()?;
+    let Some(pool) = &state.db else {
+        return Err(ApiError {
+            code: "database_unavailable".to_string(),
+            message: "Routing configuration cannot be persisted while the database is unavailable"
+                .to_string(),
+        });
+    };
+    persist_routing_algorithm_config(pool, &configuration, &user.email)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(routing_algorithm_payload(
+        configuration,
+        true,
+        Some(Utc::now()),
+        Some(user.email),
+    )))
+}
+
+async fn admin_routing_algorithm_reset(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    let configuration = RoutingAlgorithmConfig::default();
+    let Some(pool) = &state.db else {
+        return Err(ApiError {
+            code: "database_unavailable".to_string(),
+            message: "Routing configuration cannot be reset while the database is unavailable"
+                .to_string(),
+        });
+    };
+    persist_routing_algorithm_config(pool, &configuration, &user.email)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(routing_algorithm_payload(
+        configuration,
+        true,
+        Some(Utc::now()),
+        Some(user.email),
+    )))
+}
+
+async fn routing_algorithm_config_db(
+    pool: &PgPool,
+) -> Result<
+    (
+        RoutingAlgorithmConfig,
+        Option<DateTime<Utc>>,
+        Option<String>,
+    ),
+    sqlx::Error,
+> {
+    let row = sqlx::query(
+        r#"
+        SELECT max_results, max_direct_candidates, max_transfer_candidates,
+               min_transfer_seconds, max_transfer_wait_seconds,
+               transfer_search_timeout_seconds, next_day_search_from_seconds,
+               arrival_time_weight, duration_weight, transfer_penalty_seconds,
+               preserve_simplest, preserve_each_transfer_count,
+               preserve_carrier_diversity, remove_dominated,
+               dominate_only_same_carrier, updated_at, updated_by
+        FROM routing_algorithm_config
+        WHERE id = 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok((RoutingAlgorithmConfig::default(), None, None));
+    };
+    Ok((
+        RoutingAlgorithmConfig {
+            max_results: row.get("max_results"),
+            max_direct_candidates: row.get("max_direct_candidates"),
+            max_transfer_candidates: row.get("max_transfer_candidates"),
+            min_transfer_seconds: row.get("min_transfer_seconds"),
+            max_transfer_wait_seconds: row.get("max_transfer_wait_seconds"),
+            transfer_search_timeout_seconds: row.get("transfer_search_timeout_seconds"),
+            next_day_search_from_seconds: row.get("next_day_search_from_seconds"),
+            arrival_time_weight: row.get("arrival_time_weight"),
+            duration_weight: row.get("duration_weight"),
+            transfer_penalty_seconds: row.get("transfer_penalty_seconds"),
+            preserve_simplest: row.get("preserve_simplest"),
+            preserve_each_transfer_count: row.get("preserve_each_transfer_count"),
+            preserve_carrier_diversity: row.get("preserve_carrier_diversity"),
+            remove_dominated: row.get("remove_dominated"),
+            dominate_only_same_carrier: row.get("dominate_only_same_carrier"),
+        },
+        row.get("updated_at"),
+        row.get("updated_by"),
+    ))
+}
+
+async fn persist_routing_algorithm_config(
+    pool: &PgPool,
+    configuration: &RoutingAlgorithmConfig,
+    updated_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO routing_algorithm_config (
+          id, max_results, max_direct_candidates, max_transfer_candidates,
+          min_transfer_seconds, max_transfer_wait_seconds,
+          transfer_search_timeout_seconds, next_day_search_from_seconds,
+          arrival_time_weight, duration_weight, transfer_penalty_seconds,
+          preserve_simplest, preserve_each_transfer_count,
+          preserve_carrier_diversity, remove_dominated,
+          dominate_only_same_carrier, updated_at, updated_by
+        ) VALUES (
+          1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+          $11, $12, $13, $14, $15, now(), $16
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          max_results = EXCLUDED.max_results,
+          max_direct_candidates = EXCLUDED.max_direct_candidates,
+          max_transfer_candidates = EXCLUDED.max_transfer_candidates,
+          min_transfer_seconds = EXCLUDED.min_transfer_seconds,
+          max_transfer_wait_seconds = EXCLUDED.max_transfer_wait_seconds,
+          transfer_search_timeout_seconds = EXCLUDED.transfer_search_timeout_seconds,
+          next_day_search_from_seconds = EXCLUDED.next_day_search_from_seconds,
+          arrival_time_weight = EXCLUDED.arrival_time_weight,
+          duration_weight = EXCLUDED.duration_weight,
+          transfer_penalty_seconds = EXCLUDED.transfer_penalty_seconds,
+          preserve_simplest = EXCLUDED.preserve_simplest,
+          preserve_each_transfer_count = EXCLUDED.preserve_each_transfer_count,
+          preserve_carrier_diversity = EXCLUDED.preserve_carrier_diversity,
+          remove_dominated = EXCLUDED.remove_dominated,
+          dominate_only_same_carrier = EXCLUDED.dominate_only_same_carrier,
+          updated_at = now(),
+          updated_by = EXCLUDED.updated_by
+        "#,
+    )
+    .bind(configuration.max_results)
+    .bind(configuration.max_direct_candidates)
+    .bind(configuration.max_transfer_candidates)
+    .bind(configuration.min_transfer_seconds)
+    .bind(configuration.max_transfer_wait_seconds)
+    .bind(configuration.transfer_search_timeout_seconds)
+    .bind(configuration.next_day_search_from_seconds)
+    .bind(configuration.arrival_time_weight)
+    .bind(configuration.duration_weight)
+    .bind(configuration.transfer_penalty_seconds)
+    .bind(configuration.preserve_simplest)
+    .bind(configuration.preserve_each_transfer_count)
+    .bind(configuration.preserve_carrier_diversity)
+    .bind(configuration.remove_dominated)
+    .bind(configuration.dominate_only_same_carrier)
+    .bind(updated_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn routing_algorithm_payload(
+    configuration: RoutingAlgorithmConfig,
+    database_available: bool,
+    updated_at: Option<DateTime<Utc>>,
+    updated_by: Option<String>,
+) -> Value {
+    json!({
+        "configuration": configuration,
+        "defaults": RoutingAlgorithmConfig::default(),
+        "database_available": database_available,
+        "updated_at": updated_at,
+        "updated_by": updated_by,
+        "activation": "New journey searches read this profile immediately; running searches are not changed.",
+        "scoring_formula": "arrival_time × arrival_time_weight + duration × duration_weight + transfers × transfer_penalty_seconds",
+        "fare_note": "No real fare data is imported. Carrier diversity preserves potentially cheaper operators without claiming a cheapest fare."
+    })
+}
+
 async fn public_board(Path(stop_id): Path<String>) -> Json<Value> {
     Json(public_board_payload(&stop_id))
 }
@@ -3372,6 +3737,7 @@ async fn query_journeys_db(
     service_date: chrono::NaiveDate,
 ) -> Result<(Vec<Value>, Vec<String>, Value), sqlx::Error> {
     let mut warnings = Vec::new();
+    let (routing_config, _, _) = routing_algorithm_config_db(pool).await?;
     let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
     let (to_stop_ids, to_warning) = resolve_journey_point_db(pool, &body.to).await?;
     warnings.extend(from_warning);
@@ -3399,8 +3765,12 @@ async fn query_journeys_db(
         &mode_filters,
         body.max_transfers,
         service_date,
+        &routing_config,
     );
-    let include_next_service_day = should_search_next_service_day(departure_time);
+    let include_next_service_day = should_search_next_service_day(
+        departure_time,
+        routing_config.next_day_search_from_seconds as u32,
+    );
     let (current_service_day_result, next_service_day_result) = if include_next_service_day {
         let next_service_day_search = service_day_journeys_db(
             pool,
@@ -3410,6 +3780,7 @@ async fn query_journeys_db(
             &mode_filters,
             body.max_transfers,
             service_date.succ_opt().unwrap_or(service_date),
+            &routing_config,
         );
         let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
         (current, Some(next))
@@ -3453,6 +3824,7 @@ async fn query_journeys_db(
             &mode_filters,
             body.max_transfers,
             service_date.succ_opt().unwrap_or(service_date),
+            &routing_config,
         )
         .await?;
         if next_transfer_search_timed_out {
@@ -3479,7 +3851,8 @@ async fn query_journeys_db(
             "removed {removed_candidates} duplicate or invalid journey candidates"
         ));
     }
-    journeys = ranked_journey_results(journeys);
+    let carrier_keys = journey_carrier_keys_db(pool, &journeys).await?;
+    journeys = ranked_journey_results_with_carriers(journeys, &carrier_keys, &routing_config);
 
     let unverified_services = unverified_journey_service_count(pool, &journeys).await?;
     if unverified_services > 0 {
@@ -3553,6 +3926,7 @@ async fn service_day_journeys_db(
     mode_filters: &[String],
     max_transfers: u32,
     service_date: chrono::NaiveDate,
+    routing_config: &RoutingAlgorithmConfig,
 ) -> Result<(Vec<Journey>, bool), sqlx::Error> {
     let direct_search = direct_journeys_db(
         pool,
@@ -3561,6 +3935,7 @@ async fn service_day_journeys_db(
         departure_time,
         mode_filters,
         service_date,
+        routing_config.max_direct_candidates as i64,
     );
     let transfer_search = async {
         if max_transfers == 0 {
@@ -3568,7 +3943,7 @@ async fn service_day_journeys_db(
         }
 
         match time::timeout(
-            std::time::Duration::from_secs(TRANSFER_SEARCH_TIMEOUT_SECONDS),
+            std::time::Duration::from_secs(routing_config.transfer_search_timeout_seconds as u64),
             one_transfer_journeys_db(
                 pool,
                 from_stop_ids,
@@ -3576,6 +3951,9 @@ async fn service_day_journeys_db(
                 departure_time,
                 mode_filters,
                 service_date,
+                routing_config.min_transfer_seconds,
+                routing_config.max_transfer_wait_seconds,
+                routing_config.max_transfer_candidates as i64,
             ),
         )
         .await
@@ -3593,8 +3971,8 @@ async fn service_day_journeys_db(
     Ok((journeys, transfer_search_timed_out))
 }
 
-fn should_search_next_service_day(departure_time: u32) -> bool {
-    departure_time >= NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS
+fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
+    departure_time >= threshold_seconds
 }
 
 fn journey_query_context(
@@ -3820,9 +4198,65 @@ fn stop_signature<'a>(stop_id: &'a str, stop_signatures: &'a HashMap<String, Str
         .unwrap_or(stop_id)
 }
 
-fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
-    journeys = remove_dominated_journeys(journeys);
-    journeys.sort_by_key(journey_arrival_rank);
+async fn journey_carrier_keys_db(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<HashMap<String, String>, sqlx::Error> {
+    let route_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.route_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if route_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    Ok(sqlx::query(
+        r#"
+        SELECT id,
+               COALESCE(
+                 'operator:' || operator_id,
+                 'agency:' || agency_id,
+                 'feed:' || source_feed_id,
+                 'route:' || id
+               ) AS carrier_key
+        FROM routes
+        WHERE id = ANY($1)
+        "#,
+    )
+    .bind(route_ids)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("id"),
+            row.get::<String, _>("carrier_key"),
+        )
+    })
+    .collect())
+}
+
+#[cfg(test)]
+fn ranked_journey_results(journeys: Vec<Journey>) -> Vec<Journey> {
+    ranked_journey_results_with_carriers(
+        journeys,
+        &HashMap::new(),
+        &RoutingAlgorithmConfig::default(),
+    )
+}
+
+fn ranked_journey_results_with_carriers(
+    mut journeys: Vec<Journey>,
+    carrier_keys: &HashMap<String, String>,
+    configuration: &RoutingAlgorithmConfig,
+) -> Vec<Journey> {
+    if configuration.remove_dominated {
+        journeys = remove_dominated_journeys(journeys, carrier_keys, configuration);
+    }
+    journeys.sort_by_key(|journey| journey_rank(journey, configuration));
 
     let mut seen = HashSet::new();
     let candidates = journeys
@@ -3839,17 +4273,29 @@ fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
 
     let mut selected = Vec::new();
     let mut selected_keys = HashSet::new();
-    push_ranked_journey(&mut selected, &mut selected_keys, &candidates[0]);
+    push_ranked_journey(
+        &mut selected,
+        &mut selected_keys,
+        &candidates[0],
+        configuration.max_results as usize,
+    );
 
-    if let Some(simplest) = candidates.iter().min_by_key(|journey| {
-        (
-            journey.transfer_count,
-            journey.arrival_time,
-            journey.duration_seconds,
-            journey.departure_time,
-        )
-    }) {
-        push_ranked_journey(&mut selected, &mut selected_keys, simplest);
+    if configuration.preserve_simplest
+        && let Some(simplest) = candidates.iter().min_by_key(|journey| {
+            (
+                journey.transfer_count,
+                journey.arrival_time,
+                journey.duration_seconds,
+                journey.departure_time,
+            )
+        })
+    {
+        push_ranked_journey(
+            &mut selected,
+            &mut selected_keys,
+            simplest,
+            configuration.max_results as usize,
+        );
     }
 
     let mut transfer_counts = candidates
@@ -3860,17 +4306,55 @@ fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
     transfer_counts.dedup();
 
     for transfer_count in transfer_counts {
+        if !configuration.preserve_each_transfer_count {
+            break;
+        }
         if let Some(best_for_transfer_count) = candidates
             .iter()
             .filter(|journey| journey.transfer_count == transfer_count)
-            .min_by_key(|journey| journey_arrival_rank(journey))
+            .min_by_key(|journey| journey_rank(journey, configuration))
         {
-            push_ranked_journey(&mut selected, &mut selected_keys, best_for_transfer_count);
+            push_ranked_journey(
+                &mut selected,
+                &mut selected_keys,
+                best_for_transfer_count,
+                configuration.max_results as usize,
+            );
+        }
+    }
+
+    if configuration.preserve_carrier_diversity {
+        let mut best_by_carrier = HashMap::<String, &Journey>::new();
+        for journey in &candidates {
+            let Some(signature) = journey_carrier_signature(journey, carrier_keys) else {
+                continue;
+            };
+            let replace = best_by_carrier.get(&signature).is_none_or(|known| {
+                journey_rank(journey, configuration) < journey_rank(known, configuration)
+            });
+            if replace {
+                best_by_carrier.insert(signature, journey);
+            }
+        }
+        let mut carrier_candidates = best_by_carrier.into_values().collect::<Vec<_>>();
+        carrier_candidates.sort_by_key(|journey| journey_rank(journey, configuration));
+        for best_for_carrier in carrier_candidates {
+            push_ranked_journey(
+                &mut selected,
+                &mut selected_keys,
+                best_for_carrier,
+                configuration.max_results as usize,
+            );
         }
     }
 
     for journey in &candidates {
-        push_ranked_journey(&mut selected, &mut selected_keys, journey);
+        push_ranked_journey(
+            &mut selected,
+            &mut selected_keys,
+            journey,
+            configuration.max_results as usize,
+        );
     }
 
     let simplest_key = selected
@@ -3884,16 +4368,30 @@ fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
             )
         })
         .map(journey_identity_key);
-    selected.sort_by_key(journey_arrival_rank);
+    let fastest_key = selected
+        .iter()
+        .min_by_key(|journey| {
+            (
+                journey.arrival_time,
+                journey.duration_seconds,
+                journey.transfer_count,
+                journey.departure_time,
+            )
+        })
+        .map(journey_identity_key);
+    selected.sort_by_key(|journey| journey_rank(journey, configuration));
     selected
         .into_iter()
         .enumerate()
         .map(|(index, mut journey)| {
             journey.id = format!("journey-{}", index + 1);
-            journey
-                .labels
-                .retain(|label| label != "nejrychlejsi" && label != "nejjednodussi");
+            journey.labels.retain(|label| {
+                label != "doporuceno" && label != "nejrychlejsi" && label != "nejjednodussi"
+            });
             if index == 0 {
+                journey.labels.push("doporuceno".to_string());
+            }
+            if fastest_key.as_ref() == Some(&journey_identity_key(&journey)) {
                 journey.labels.push("nejrychlejsi".to_string());
             }
             if simplest_key.as_ref() == Some(&journey_identity_key(&journey)) {
@@ -3904,13 +4402,20 @@ fn ranked_journey_results(mut journeys: Vec<Journey>) -> Vec<Journey> {
         .collect()
 }
 
-fn remove_dominated_journeys(journeys: Vec<Journey>) -> Vec<Journey> {
+fn remove_dominated_journeys(
+    journeys: Vec<Journey>,
+    carrier_keys: &HashMap<String, String>,
+    configuration: &RoutingAlgorithmConfig,
+) -> Vec<Journey> {
     journeys
         .iter()
         .enumerate()
         .filter(|(candidate_index, candidate)| {
             !journeys.iter().enumerate().any(|(other_index, other)| {
                 other_index != *candidate_index
+                    && (!configuration.dominate_only_same_carrier
+                        || journey_carrier_signature(other, carrier_keys)
+                            == journey_carrier_signature(candidate, carrier_keys))
                     && other.departure_time >= candidate.departure_time
                     && other.arrival_time <= candidate.arrival_time
                     && other.transfer_count <= candidate.transfer_count
@@ -3923,12 +4428,29 @@ fn remove_dominated_journeys(journeys: Vec<Journey>) -> Vec<Journey> {
         .collect()
 }
 
+fn journey_carrier_signature(
+    journey: &Journey,
+    carrier_keys: &HashMap<String, String>,
+) -> Option<String> {
+    let mut keys = journey
+        .legs
+        .iter()
+        .filter_map(|leg| leg.route_id.as_ref())
+        .filter_map(|route_id| carrier_keys.get(route_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    (!keys.is_empty()).then(|| keys.join("|"))
+}
+
 fn push_ranked_journey(
     selected: &mut Vec<Journey>,
     selected_keys: &mut HashSet<String>,
     journey: &Journey,
+    max_results: usize,
 ) {
-    if selected.len() >= MAX_JOURNEY_RESULTS {
+    if selected.len() >= max_results {
         return;
     }
 
@@ -3938,8 +4460,15 @@ fn push_ranked_journey(
     }
 }
 
-fn journey_arrival_rank(journey: &Journey) -> (u32, u32, u32, u32) {
+fn journey_rank(
+    journey: &Journey,
+    configuration: &RoutingAlgorithmConfig,
+) -> (u64, u32, u32, u32, u32) {
+    let score = journey.arrival_time as f64 * configuration.arrival_time_weight
+        + journey.duration_seconds as f64 * configuration.duration_weight
+        + journey.transfer_count as f64 * configuration.transfer_penalty_seconds as f64;
     (
+        (score * 1000.0).round().max(0.0) as u64,
         journey.arrival_time,
         journey.duration_seconds,
         journey.transfer_count,
@@ -4174,6 +4703,7 @@ async fn direct_journeys_db(
     departure_time: u32,
     mode_filters: &[String],
     service_date: chrono::NaiveDate,
+    candidate_limit: i64,
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
@@ -4280,7 +4810,7 @@ async fn direct_journeys_db(
     .bind(!mode_filters.is_empty())
     .bind(mode_filters.to_vec())
     .bind(service_date)
-    .bind(MAX_DIRECT_JOURNEY_CANDIDATES)
+    .bind(candidate_limit)
     .fetch_all(pool)
     .await?;
 
@@ -4322,6 +4852,9 @@ async fn one_transfer_journeys_db(
     departure_time: u32,
     mode_filters: &[String],
     service_date: chrono::NaiveDate,
+    min_transfer_seconds: i32,
+    max_transfer_wait_seconds: i32,
+    candidate_limit: i64,
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
@@ -4532,10 +5065,10 @@ async fn one_transfer_journeys_db(
     .bind(departure_time as i32)
     .bind(!mode_filters.is_empty())
     .bind(mode_filters.to_vec())
-    .bind(MIN_TRANSFER_SECONDS as i32)
-    .bind(MAX_TRANSFER_WAIT_SECONDS as i32)
+    .bind(min_transfer_seconds)
+    .bind(max_transfer_wait_seconds)
     .bind(service_date)
-    .bind(MAX_TRANSFER_JOURNEY_CANDIDATES)
+    .bind(candidate_limit)
     .fetch_all(pool)
     .await?;
 
@@ -6394,6 +6927,7 @@ mod tests {
             false
         );
         assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
+        assert!(payload["paths"]["/admin/routing-algorithm"]["put"].is_object());
     }
 
     #[tokio::test]
@@ -6429,6 +6963,7 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Administrator sign in"));
         assert!(html.contains("/admin/assets/admin.js"));
+        assert!(html.contains("Routing algorithm"));
     }
 
     #[tokio::test]
@@ -6438,6 +6973,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_routing_algorithm_requires_admin_token() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/routing-algorithm")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -7122,6 +7673,91 @@ mod tests {
     }
 
     #[test]
+    fn ranked_journeys_preserve_a_different_carrier_option() {
+        let mut journeys = (0..6)
+            .map(|index| {
+                test_journey(
+                    &format!("carrier-a-{index}"),
+                    1,
+                    5 * 3600 + index * 60,
+                    8 * 3600 + index * 60,
+                )
+            })
+            .collect::<Vec<_>>();
+        journeys.push(test_journey("carrier-b", 1, 5 * 3600, 8 * 3600 + 30 * 60));
+
+        let mut carrier_keys = HashMap::new();
+        for index in 0..6 {
+            carrier_keys.insert(
+                format!("feeder-route-carrier-a-{index}"),
+                "carrier-a".to_string(),
+            );
+            carrier_keys.insert(format!("route-carrier-a-{index}"), "carrier-a".to_string());
+        }
+        carrier_keys.insert(
+            "feeder-route-carrier-b".to_string(),
+            "carrier-b".to_string(),
+        );
+        carrier_keys.insert("route-carrier-b".to_string(), "carrier-b".to_string());
+
+        let ranked = ranked_journey_results_with_carriers(
+            journeys,
+            &carrier_keys,
+            &RoutingAlgorithmConfig::default(),
+        );
+
+        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
+        assert!(ranked.iter().any(|journey| {
+            journey
+                .legs
+                .iter()
+                .any(|leg| leg.route_id.as_deref() == Some("route-carrier-b"))
+        }));
+    }
+
+    #[test]
+    fn routing_transfer_penalty_is_tunable_without_mislabeling_fastest() {
+        let transfer = test_journey("transfer", 1, 5 * 3600, 8 * 3600);
+        let direct = test_journey("direct", 0, 5 * 3600, 9 * 3600);
+        let configuration = RoutingAlgorithmConfig {
+            transfer_penalty_seconds: 2 * 3600,
+            ..RoutingAlgorithmConfig::default()
+        };
+
+        let ranked = ranked_journey_results_with_carriers(
+            vec![transfer, direct],
+            &HashMap::new(),
+            &configuration,
+        );
+
+        assert_eq!(ranked[0].transfer_count, 0);
+        assert!(ranked[0].labels.iter().any(|label| label == "doporuceno"));
+        let fastest = ranked
+            .iter()
+            .find(|journey| journey.arrival_time == 8 * 3600)
+            .unwrap();
+        assert!(fastest.labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn routing_configuration_rejects_unsafe_combinations() {
+        let invalid_window = RoutingAlgorithmConfig {
+            min_transfer_seconds: 1800,
+            max_transfer_wait_seconds: 900,
+            ..RoutingAlgorithmConfig::default()
+        };
+        assert!(invalid_window.validate().is_err());
+
+        let no_time_objective = RoutingAlgorithmConfig {
+            arrival_time_weight: 0.0,
+            duration_weight: 0.0,
+            ..RoutingAlgorithmConfig::default()
+        };
+        assert!(no_time_objective.validate().is_err());
+        assert!(RoutingAlgorithmConfig::default().validate().is_ok());
+    }
+
+    #[test]
     fn next_service_day_journeys_shift_early_departures_after_evening_search() {
         let next_morning = test_journey("next-morning", 0, 4 * 3600, 8 * 3600);
         let same_evening = test_journey("same-evening", 0, 20 * 3600, 23 * 3600);
@@ -7142,9 +7778,16 @@ mod tests {
 
     #[test]
     fn next_service_day_query_only_runs_for_evening_departures() {
-        assert!(!should_search_next_service_day(17 * 3600 + 59 * 60));
-        assert!(should_search_next_service_day(18 * 3600));
-        assert!(should_search_next_service_day(19 * 3600 + 24 * 60));
+        let threshold = NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS;
+        assert!(!should_search_next_service_day(
+            17 * 3600 + 59 * 60,
+            threshold
+        ));
+        assert!(should_search_next_service_day(18 * 3600, threshold));
+        assert!(should_search_next_service_day(
+            19 * 3600 + 24 * 60,
+            threshold
+        ));
     }
 
     #[test]
