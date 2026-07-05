@@ -10,6 +10,7 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 - GTFS importer crate that parses core GTFS files from zip archives and validates common data-quality issues.
 - GGU latest downloader/import CLI foundation for `https://data.jr.ggu.cz/results/latest/`.
 - API endpoints for health, metadata, auth, user data, stops, departures, journeys, realtime status, offline packages, tickets, public boards and admin import/data-quality status.
+- Authenticated ČD Ticket API integration for searches, quotes, add-ons, verified checkout/issuance, owned documents, and refunds.
 - Embedded administrator interface for database browsing, stop maps, import history, validation issues and source-feed management.
 - PostgreSQL/PostGIS migrations for accounts, transport data, imports, validation and offline packages.
 - Docker Compose for PostgreSQL/PostGIS, Redis, API, data pipeline and realtime worker.
@@ -165,6 +166,8 @@ The API exposes a static OpenAPI foundation at:
 ```text
 GET /openapi.json
 ```
+
+ČD ticketing configuration and the exact mobile contract are documented in [`docs/cd-ticketing-frontend-handoff.md`](docs/cd-ticketing-frontend-handoff.md). Ticketing remains disabled until partner credentials are supplied; checkout remains disabled independently until the backend payment-provider verifier is configured.
 
 Flutter integration for detailed journey stop calls is documented in [`docs/app-intermediate-stops.md`](docs/app-intermediate-stops.md).
 

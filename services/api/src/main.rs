@@ -31,6 +31,9 @@ use transit_model::{
 };
 use uuid::Uuid;
 
+mod cd;
+mod ticketing;
+
 const DB_STAT_TABLES: &[&str] = &[
     "import_runs",
     "source_feeds",
@@ -149,6 +152,7 @@ struct AppState {
     db: Option<PgPool>,
     jwt_secret: String,
     use_mock_data: bool,
+    ticketing: ticketing::TicketingService,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +199,15 @@ impl IntoResponse for ApiError {
             "forbidden" => StatusCode::FORBIDDEN,
             "not_found" => StatusCode::NOT_FOUND,
             "conflict" => StatusCode::CONFLICT,
+            "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+            "ticketing_unavailable" | "upstream_unavailable" | "payment_provider_unavailable" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            "upstream_timeout" => StatusCode::GATEWAY_TIMEOUT,
+            "payment_not_settled" | "payment_verification_failed" => StatusCode::PAYMENT_REQUIRED,
+            "internal_error"
+            | "ticketing_configuration_error"
+            | "upstream_authentication_error" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };
         (status, Json(self)).into_response()
@@ -522,6 +535,48 @@ async fn app_state() -> anyhow::Result<AppState> {
         Some(connect_database_with_retry(&database_url).await?)
     };
 
+    let cd_client: Option<Arc<dyn cd::CdApi>> =
+        match (env::var("CD_TICKET_API_USER").ok(), cd_private_key()?) {
+            (Some(user), Some(private_key)) if !user.is_empty() => Some(Arc::new(
+                cd::HttpCdClient::new(cd::CdConfig {
+                    base_url: env::var("CD_TICKET_API_BASE_URL")
+                        .unwrap_or_else(|_| "https://ticket-api.cd.cz/v1".to_string()),
+                    partner_user: cd::Secret::new(user),
+                    private_key_pem: cd::Secret::new(private_key),
+                    description: env::var("CD_TICKET_API_DESCRIPTION")
+                        .unwrap_or_else(|_| "Cesta API".to_string()),
+                    language: match env::var("CD_TICKET_API_LANGUAGE").as_deref() {
+                        Ok("en") => cd::Language::En,
+                        Ok("de") => cd::Language::De,
+                        _ => cd::Language::Cs,
+                    },
+                    timeout: std::time::Duration::from_secs(
+                        env::var("CD_TICKET_API_TIMEOUT_SECONDS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(15),
+                    ),
+                })
+                .map_err(|error| anyhow::anyhow!("invalid ČD Ticket API configuration: {error}"))?,
+            )),
+            _ => None,
+        };
+    let payment_provider: Arc<dyn ticketing::PaymentProvider> = match (
+        env::var("PAYMENT_PROVIDER_BASE_URL").ok(),
+        env::var("PAYMENT_PROVIDER_API_KEY").ok(),
+    ) {
+        (Some(base_url), Some(api_key)) if !base_url.is_empty() && !api_key.is_empty() => Arc::new(
+            ticketing::HttpPaymentProvider::new(
+                base_url,
+                api_key,
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|error| anyhow::anyhow!("invalid payment provider configuration: {error}"))?,
+        ),
+        _ => Arc::new(ticketing::DisabledPaymentProvider),
+    };
+    let ticketing = ticketing::TicketingService::new(cd_client, payment_provider, db.clone());
+
     let state = AppState {
         users: Arc::new(RwLock::new(HashMap::new())),
         refresh_tokens: Arc::new(RwLock::new(HashMap::new())),
@@ -532,23 +587,74 @@ async fn app_state() -> anyhow::Result<AppState> {
         db,
         jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-change-me".to_string()),
         use_mock_data,
+        ticketing,
     };
+    state
+        .ticketing
+        .start_refund_reconciliation(std::time::Duration::from_secs(
+            env::var("CD_TICKET_REFUND_RECONCILE_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        ));
 
     if let (Ok(email), Ok(password)) = (
         env::var("ADMIN_BOOTSTRAP_EMAIL"),
         env::var("ADMIN_BOOTSTRAP_PASSWORD"),
-    ) {
-        if !email.is_empty() && !password.is_empty() {
-            let user = create_user_record(
+    ) && !email.is_empty()
+        && !password.is_empty()
+    {
+        let user = if let Some(db) = &state.db {
+            if let Some(existing) = user_by_email_db(db, &email).await? {
+                existing
+            } else {
+                let created = create_user_record(
+                    &email,
+                    &password,
+                    Some("Admin".to_string()),
+                    vec!["admin".to_string(), "data_admin".to_string()],
+                )?;
+                let mut transaction = db.begin().await?;
+                sqlx::query("INSERT INTO users(id,email,password_hash,display_name,created_at) VALUES($1,$2,$3,$4,$5)").bind(created.id).bind(&created.email).bind(&created.password_hash).bind(&created.display_name).bind(created.created_at).execute(&mut *transaction).await?;
+                for role in &created.roles {
+                    sqlx::query("INSERT INTO user_roles(user_id,role) VALUES($1,$2)")
+                        .bind(created.id)
+                        .bind(role)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                sqlx::query("INSERT INTO user_profiles(user_id) VALUES($1)")
+                    .bind(created.id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                created
+            }
+        } else {
+            create_user_record(
                 &email,
                 &password,
                 Some("Admin".to_string()),
                 vec!["admin".to_string(), "data_admin".to_string()],
-            )?;
-            state.users.write().await.insert(user.id, user);
-        }
+            )?
+        };
+        state.users.write().await.insert(user.id, user);
     }
     Ok(state)
+}
+
+fn cd_private_key() -> anyhow::Result<Option<String>> {
+    if let Ok(pem) = env::var("CD_TICKET_API_PRIVATE_KEY_PEM")
+        && !pem.is_empty()
+    {
+        return Ok(Some(pem.replace("\\n", "\n")));
+    }
+    if let Ok(path) = env::var("CD_TICKET_API_PRIVATE_KEY_FILE")
+        && !path.is_empty()
+    {
+        return Ok(Some(std::fs::read_to_string(path)?));
+    }
+    Ok(None)
 }
 
 async fn connect_database_with_retry(database_url: &str) -> anyhow::Result<PgPool> {
@@ -645,6 +751,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         pool,
         "0007_routing_algorithm_config",
         include_str!("../../../infra/postgres/migrations/0007_routing_algorithm_config.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0008_cd_ticketing",
+        include_str!("../../../infra/postgres/migrations/0008_cd_ticketing.sql"),
     )
     .await
 }
@@ -766,8 +878,17 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/public/boards/{stop_id}", get(public_board))
         .route("/public/boards/{stop_id}/qr-metadata", get(public_board_qr))
+        .merge(ticketing::router())
         .layer(middleware::from_fn_with_state(state.clone(), auth_marker))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path()
+                )
+            },
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -785,7 +906,7 @@ async fn health() -> Json<Value> {
 }
 
 async fn openapi() -> Json<Value> {
-    Json(json!({
+    let mut specification = json!({
         "openapi": "3.1.0",
         "info": {"title": "Cesta API", "version": "0.1.0"},
         "paths": {
@@ -1033,7 +1154,9 @@ async fn openapi() -> Json<Value> {
                 }
             }
         }
-    }))
+    });
+    ticketing::augment_openapi(&mut specification);
+    Json(specification)
 }
 
 async fn data_status(State(state): State<AppState>) -> Json<Value> {
@@ -1071,11 +1194,17 @@ async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    let mut users = state.users.write().await;
-    if users
-        .values()
-        .any(|user| user.email == body.email && user.deleted_at.is_none())
-    {
+    let exists = if let Some(db) = &state.db {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL)").bind(&body.email).fetch_one(db).await.map_err(internal_error)?
+    } else {
+        state
+            .users
+            .read()
+            .await
+            .values()
+            .any(|user| user.email.eq_ignore_ascii_case(&body.email) && user.deleted_at.is_none())
+    };
+    if exists {
         return Err(ApiError {
             code: "conflict".to_string(),
             message: "Email is already registered".to_string(),
@@ -1088,8 +1217,26 @@ async fn register(
         vec!["user".to_string()],
     )
     .map_err(internal_error)?;
+    if let Some(db) = &state.db {
+        let mut transaction = db.begin().await.map_err(internal_error)?;
+        sqlx::query("INSERT INTO users(id,email,password_hash,display_name,created_at) VALUES($1,$2,$3,$4,$5)").bind(user.id).bind(&user.email).bind(&user.password_hash).bind(&user.display_name).bind(user.created_at).execute(&mut *transaction).await.map_err(internal_error)?;
+        for role in &user.roles {
+            sqlx::query("INSERT INTO user_roles(user_id,role) VALUES($1,$2)")
+                .bind(user.id)
+                .bind(role)
+                .execute(&mut *transaction)
+                .await
+                .map_err(internal_error)?;
+        }
+        sqlx::query("INSERT INTO user_profiles(user_id) VALUES($1) ON CONFLICT DO NOTHING")
+            .bind(user.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+        transaction.commit().await.map_err(internal_error)?;
+    }
     let response = auth_response(&state, &user).await?;
-    users.insert(user.id, user);
+    state.users.write().await.insert(user.id, user);
     Ok(Json(response))
 }
 
@@ -1098,13 +1245,24 @@ async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let _device_name = body.device_name;
-    let users = state.users.read().await;
-    let user = users
-        .values()
-        .find(|user| user.email == body.email && user.deleted_at.is_none())
-        .ok_or_else(unauthorized)?;
+    let user = if let Some(db) = &state.db {
+        user_by_email_db(db, &body.email)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(unauthorized)?
+    } else {
+        state
+            .users
+            .read()
+            .await
+            .values()
+            .find(|user| user.email.eq_ignore_ascii_case(&body.email) && user.deleted_at.is_none())
+            .cloned()
+            .ok_or_else(unauthorized)?
+    };
     verify_password(&body.password, &user.password_hash)?;
-    Ok(Json(auth_response(&state, user).await?))
+    state.users.write().await.insert(user.id, user.clone());
+    Ok(Json(auth_response(&state, &user).await?))
 }
 
 async fn refresh(
@@ -1112,16 +1270,33 @@ async fn refresh(
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
     let token_hash = hash_token(&body.refresh_token);
-    let user_id = state
-        .refresh_tokens
-        .read()
-        .await
-        .get(&token_hash)
-        .copied()
-        .ok_or_else(unauthorized)?;
-    let users = state.users.read().await;
-    let user = users.get(&user_id).ok_or_else(unauthorized)?;
-    Ok(Json(auth_response(&state, user).await?))
+    let user_id = if let Some(db) = &state.db {
+        sqlx::query_scalar::<_,Uuid>("SELECT user_id FROM user_sessions WHERE refresh_token_hash=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY created_at DESC LIMIT 1").bind(&token_hash).fetch_optional(db).await.map_err(internal_error)?.ok_or_else(unauthorized)?
+    } else {
+        state
+            .refresh_tokens
+            .read()
+            .await
+            .get(&token_hash)
+            .copied()
+            .ok_or_else(unauthorized)?
+    };
+    let user = if let Some(db) = &state.db {
+        user_by_id_db(db, user_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(unauthorized)?
+    } else {
+        state
+            .users
+            .read()
+            .await
+            .get(&user_id)
+            .cloned()
+            .ok_or_else(unauthorized)?
+    };
+    state.users.write().await.insert(user.id, user.clone());
+    Ok(Json(auth_response(&state, &user).await?))
 }
 
 async fn logout(
@@ -1133,6 +1308,9 @@ async fn logout(
         .write()
         .await
         .remove(&hash_token(&body.refresh_token));
+    if let Some(db) = &state.db {
+        sqlx::query("UPDATE user_sessions SET revoked_at=now() WHERE refresh_token_hash=$1 AND revoked_at IS NULL").bind(hash_token(&body.refresh_token)).execute(db).await.map_err(internal_error)?;
+    }
     Ok(Json(json!({"status":"logged_out"})))
 }
 
@@ -3353,11 +3531,16 @@ async fn auth_response(state: &AppState, user: &UserRecord) -> Result<AuthRespon
     )
     .map_err(internal_error)?;
     let refresh_token = Uuid::new_v4().to_string();
+    let refresh_token_hash = hash_token(&refresh_token);
     state
         .refresh_tokens
         .write()
         .await
-        .insert(hash_token(&refresh_token), user.id);
+        .insert(refresh_token_hash.clone(), user.id);
+    if let Some(db) = &state.db {
+        sqlx::query("INSERT INTO user_sessions(user_id,refresh_token_hash,created_at,expires_at) VALUES($1,$2,now(),now()+interval '30 days')")
+            .bind(user.id).bind(refresh_token_hash).execute(db).await.map_err(internal_error)?;
+    }
     Ok(AuthResponse {
         access_token,
         refresh_token,
@@ -3381,13 +3564,59 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<UserRecor
     .map_err(|_| unauthorized())?
     .claims;
     let id = Uuid::parse_str(&claims.sub).map_err(|_| unauthorized())?;
-    state
-        .users
-        .read()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(unauthorized)
+    if let Some(user) = state.users.read().await.get(&id).cloned() {
+        return Ok(user);
+    }
+    if let Some(db) = &state.db {
+        let user = user_by_id_db(db, id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(unauthorized)?;
+        if user.deleted_at.is_some() {
+            return Err(unauthorized());
+        }
+        state.users.write().await.insert(user.id, user.clone());
+        return Ok(user);
+    }
+    Err(unauthorized())
+}
+
+async fn user_by_email_db(pool: &PgPool, email: &str) -> Result<Option<UserRecord>, sqlx::Error> {
+    let row=sqlx::query("SELECT id,email,password_hash,display_name,created_at,deleted_at FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL").bind(email).fetch_optional(pool).await?;
+    user_record_from_db(pool, row).await
+}
+
+async fn user_by_id_db(pool: &PgPool, id: Uuid) -> Result<Option<UserRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id,email,password_hash,display_name,created_at,deleted_at FROM users WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    user_record_from_db(pool, row).await
+}
+
+async fn user_record_from_db(
+    pool: &PgPool,
+    row: Option<sqlx::postgres::PgRow>,
+) -> Result<Option<UserRecord>, sqlx::Error> {
+    let Some(row) = row else { return Ok(None) };
+    let id: Uuid = row.get("id");
+    let roles = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM user_roles WHERE user_id=$1 ORDER BY role",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(UserRecord {
+        id,
+        email: row.get("email"),
+        password_hash: row.get("password_hash"),
+        display_name: row.get("display_name"),
+        roles,
+        created_at: row.get("created_at"),
+        deleted_at: row.get("deleted_at"),
+    }))
 }
 
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<UserRecord, ApiError> {
@@ -3417,8 +3646,8 @@ fn public_user(user: &UserRecord) -> PublicUser {
 }
 
 fn hash_token(value: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn unauthorized() -> ApiError {
@@ -3918,6 +4147,7 @@ async fn unverified_journey_service_count(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn service_day_journeys_db(
     pool: &PgPool,
     from_stop_ids: &[String],
@@ -4544,6 +4774,7 @@ fn escaped_like_prefix(value: &str) -> String {
     )
 }
 
+#[allow(clippy::collapsible_if)]
 async fn resolve_journey_point_db(
     pool: &PgPool,
     point: &JourneyPoint,
@@ -4845,6 +5076,7 @@ async fn direct_journeys_db(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn one_transfer_journeys_db(
     pool: &PgPool,
     from_stop_ids: &[String],
@@ -6420,10 +6652,10 @@ fn city_search_score(city: &City, query: &str) -> Option<i32> {
         Some(10_000)
     } else if name.starts_with(query) || normalized_name.starts_with(query) {
         Some(9_000 - (name.len() as i32 - query.len() as i32).abs())
-    } else if let Some(position) = normalized_name.find(query) {
-        Some(8_000 - position as i32)
     } else {
-        None
+        normalized_name
+            .find(query)
+            .map(|position| 8_000 - position as i32)
     };
 
     if query.chars().count() >= 3 {
@@ -7110,7 +7342,7 @@ mod tests {
             14.435,
             TransportMode::Train,
         );
-        let stops = vec![platform, station];
+        let stops = [platform, station];
 
         let suggestions = ranked_stop_suggestions(stops.iter(), "praha", 6);
 

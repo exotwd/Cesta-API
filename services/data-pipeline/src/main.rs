@@ -981,6 +981,7 @@ async fn record_data_sync(
     Ok(())
 }
 
+#[allow(clippy::collapsible_if)]
 async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathBuf> {
     let reusable_run = latest_reusable_ggu_run(storage_dir)?;
     let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -1262,6 +1263,7 @@ fn latest_run_dir(storage_dir: &Path) -> Result<PathBuf> {
         .context("no GGU latest run directories found")
 }
 
+#[allow(clippy::collapsible_if)]
 async fn import_ggu_latest(
     run_dir: &Path,
     limit_rows: Option<usize>,
@@ -1473,6 +1475,7 @@ async fn database_import_skip_reason(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn export_dataset_to_postgres(
     pool: &PgPool,
     run_dir: &Path,

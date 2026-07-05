@@ -142,6 +142,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,18 +318,26 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
  "geo-types",
+ "hex",
  "jsonwebtoken",
  "offline-pack",
  "password-hash",
+ "percent-encoding",
  "rand_core 0.6.4",
+ "reqwest",
  "routing-core",
+ "rsa",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "sqlx",
+ "thiserror",
  "tokio",
  "tower",
  "tower-http",
@@ -326,6 +345,7 @@ dependencies = [
  "tracing-subscriber",
  "transit-model",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2061,6 +2081,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha1",
  "signature",
  "spki",
  "subtle",

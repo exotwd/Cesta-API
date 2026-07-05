@@ -11,6 +11,7 @@ The API exposes:
 - realtime status under `/realtime`
 - offline package metadata under `/offline`
 - ticket recommendation placeholders under `/tickets`
+- authenticated ČD searches, orders, add-ons, checkout, documents and refunds under `/ticketing`
 - admin imports and data quality under `/admin`
 - public board data under `/public/boards`
 
