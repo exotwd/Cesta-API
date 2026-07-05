@@ -70,6 +70,17 @@ On Windows, native `cargo run` requires Visual Studio Build Tools with the C++ w
 docker compose up --build
 ```
 
+The API and realtime worker share one cached Rust build stage, so building them together does not
+store duplicate release dependency trees. On a host that previously failed with `No space left on
+device`, reclaim the incomplete build cache once before retrying (this does not remove volumes or
+PostgreSQL data):
+
+```bash
+sudo docker system df
+sudo docker builder prune --all --force
+sudo docker compose up -d --build api realtime-worker
+```
+
 The API listens on `http://localhost:8070` by default.
 
 ## First Admin

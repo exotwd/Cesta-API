@@ -22,7 +22,8 @@ services:
   api:
     build:
       context: .
-      dockerfile: infra/docker/api.Dockerfile
+      dockerfile: infra/docker/runtime-services.Dockerfile
+      target: api
     depends_on:
       - postgres
       - redis
@@ -46,7 +47,8 @@ services:
   realtime-worker:
     build:
       context: .
-      dockerfile: infra/docker/realtime-worker.Dockerfile
+      dockerfile: infra/docker/runtime-services.Dockerfile
+      target: realtime-worker
     depends_on:
       - postgres
       - redis
