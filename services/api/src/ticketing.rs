@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,7 @@ pub struct TicketingService {
 
 #[derive(Default)]
 struct MemoryStore {
+    journey_refs: HashMap<Uuid, JourneyReferenceRecord>,
     locations: HashMap<Uuid, LocationRecord>,
     searches: HashMap<Uuid, SearchRecord>,
     orders: HashMap<Uuid, OrderRecord>,
@@ -54,6 +55,13 @@ struct MemoryStore {
     tickets: HashMap<Uuid, TicketRecord>,
     refunds: HashMap<Uuid, RefundRecord>,
     idempotency: HashMap<(Uuid, String, String), IdempotentResult>,
+}
+
+#[derive(Clone)]
+struct JourneyReferenceRecord {
+    id: Uuid,
+    snapshot: Value,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -189,6 +197,26 @@ pub struct OrderCreateRequest {
     pub class: i32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TicketingIntentRequest {
+    pub journey_reference: Uuid,
+    #[serde(default)]
+    pub segment_indexes: Vec<usize>,
+    #[serde(default)]
+    pub passenger_groups: Vec<PassengerRequest>,
+    #[serde(default = "default_class")]
+    pub class: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrdersQuery {
+    pub status: Option<String>,
+    pub cursor: Option<Uuid>,
+    pub limit: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OfferRequest {
@@ -286,6 +314,8 @@ pub struct RefundRequest {
 pub struct CheckoutSession {
     pub id: String,
     pub redirect_url: String,
+    pub return_url: String,
+    pub cancel_url: String,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -335,9 +365,17 @@ pub struct HttpPaymentProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: cd::Secret,
+    return_url: String,
+    cancel_url: String,
 }
 impl HttpPaymentProvider {
-    pub fn new(base_url: String, api_key: String, timeout: Duration) -> Result<Self, PaymentError> {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        return_url: String,
+        cancel_url: String,
+        timeout: Duration,
+    ) -> Result<Self, PaymentError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -347,6 +385,8 @@ impl HttpPaymentProvider {
             client,
             base_url,
             api_key: cd::Secret::new(api_key),
+            return_url,
+            cancel_url,
         })
     }
 }
@@ -372,7 +412,15 @@ struct ProviderStatus {
 #[async_trait]
 impl PaymentProvider for HttpPaymentProvider {
     async fn create_checkout(&self, o: &PaymentOrder) -> Result<CheckoutSession, PaymentError> {
-        let r=self.client.post(format!("{}/checkout-sessions",self.base_url.trim_end_matches('/'))).bearer_auth(self.api_key.expose()).json(&json!({"merchantReference":o.order_id,"amountHellers":o.amount_hellers,"currency":o.currency})).send().await.map_err(|_|PaymentError::Unavailable)?;
+        let callback = |base: &str| -> Result<String, PaymentError> {
+            let mut url = reqwest::Url::parse(base).map_err(|_| PaymentError::NotConfigured)?;
+            url.query_pairs_mut()
+                .append_pair("orderId", &o.order_id.to_string());
+            Ok(url.to_string())
+        };
+        let return_url = callback(&self.return_url)?;
+        let cancel_url = callback(&self.cancel_url)?;
+        let r=self.client.post(format!("{}/checkout-sessions",self.base_url.trim_end_matches('/'))).bearer_auth(self.api_key.expose()).json(&json!({"merchantReference":o.order_id,"amountHellers":o.amount_hellers,"currency":o.currency,"returnUrl":return_url,"cancelUrl":cancel_url})).send().await.map_err(|_|PaymentError::Unavailable)?;
         if !r.status().is_success() {
             return Err(PaymentError::Unavailable);
         }
@@ -386,6 +434,8 @@ impl PaymentProvider for HttpPaymentProvider {
         Ok(CheckoutSession {
             id: p.id,
             redirect_url: p.redirect_url.ok_or(PaymentError::Unavailable)?,
+            return_url,
+            cancel_url,
             expires_at: p.expires_at,
         })
     }
@@ -490,6 +540,109 @@ impl TicketingService {
         })
     }
 
+    pub async fn annotate_journeys(
+        &self,
+        journeys: &mut [Value],
+        related: &Value,
+        service_date: NaiveDate,
+    ) -> Result<(), ApiError> {
+        let stop_names = related
+            .get("stops")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|stop| {
+                Some((
+                    stop.get("id")?.as_str()?.to_string(),
+                    stop.get("name")?.as_str()?.to_string(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let route_names = related
+            .get("routes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|route| {
+                Some((
+                    route.get("id")?.as_str()?.to_string(),
+                    route
+                        .get("short_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        for journey in journeys {
+            let legs = journey
+                .get("legs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let candidate_indexes = legs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, leg)| {
+                    (leg.get("mode").and_then(Value::as_str) == Some("train")).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let segments=legs.iter().enumerate().map(|(index,_leg)|json!({
+                "legIndex":index,
+                "provider":if candidate_indexes.contains(&index){Some("cd")}else{None},
+                "availability":if candidate_indexes.contains(&index){"authentication_required"}else{"unsupported_mode"},
+                "ticketable":Value::Null
+            })).collect::<Vec<_>>();
+            if candidate_indexes.is_empty() {
+                journey["ticketing"] = json!({"provider":Value::Null,"journeyReference":Value::Null,"authenticationRequired":true,"availability":"not_supported","indicativePriceHellers":Value::Null,"currency":"CZK","completeJourneyTicketable":false,"segments":segments});
+                continue;
+            }
+            let reference = Uuid::new_v4();
+            let snapshot_legs=legs.iter().enumerate().map(|(index,leg)|{
+                let from_id=leg.get("from_stop_id").and_then(Value::as_str).unwrap_or_default();
+                let to_id=leg.get("to_stop_id").and_then(Value::as_str).unwrap_or_default();
+                let route_id=leg.get("route_id").and_then(Value::as_str);
+                json!({"index":index,"mode":leg.get("mode"),"fromName":stop_names.get(from_id),"toName":stop_names.get(to_id),"routeName":route_id.and_then(|id|route_names.get(id)).and_then(|value|value.clone()),"departureSeconds":leg.get("departure_time"),"arrivalSeconds":leg.get("arrival_time")})
+            }).collect::<Vec<_>>();
+            let record = JourneyReferenceRecord {
+                id: reference,
+                snapshot: json!({"journeyId":journey.get("id"),"serviceDate":service_date,"departureSeconds":journey.get("departure_time"),"arrivalSeconds":journey.get("arrival_time"),"legs":snapshot_legs,"candidateSegmentIndexes":candidate_indexes}),
+                expires_at: Utc::now() + chrono::Duration::minutes(30),
+            };
+            self.memory
+                .write()
+                .await
+                .journey_refs
+                .insert(reference, record.clone());
+            if let Some(db) = &self.db {
+                sqlx::query("INSERT INTO cd_ticketing_journey_refs(id,journey_snapshot,expires_at) VALUES($1,$2,$3)").bind(record.id).bind(&record.snapshot).bind(record.expires_at).execute(db).await.map_err(db_error)?;
+            }
+            let all_supported = legs.iter().all(|leg| {
+                matches!(
+                    leg.get("mode").and_then(Value::as_str),
+                    Some("train" | "walk")
+                )
+            });
+            journey["ticketing"] = json!({"provider":"cd","journeyReference":reference,"authenticationRequired":true,"availability":"authentication_required","indicativePriceHellers":Value::Null,"currency":"CZK","completeJourneyTicketable":Value::Null,"scope":if all_supported{"complete_journey_candidate"}else{"segments"},"segments":segments});
+        }
+        Ok(())
+    }
+
+    async fn journey_reference(&self, id: Uuid) -> Result<JourneyReferenceRecord, ApiError> {
+        if let Some(record) = self.memory.read().await.journey_refs.get(&id).cloned()
+            && record.expires_at > Utc::now()
+        {
+            return Ok(record);
+        }
+        if let Some(db)=&self.db
+            && let Some(row)=sqlx::query("SELECT journey_snapshot,expires_at FROM cd_ticketing_journey_refs WHERE id=$1 AND expires_at>now()").bind(id).fetch_optional(db).await.map_err(db_error)?{
+                return Ok(JourneyReferenceRecord{id,snapshot:row.get("journey_snapshot"),expires_at:row.get("expires_at")});
+            }
+        Err(api_error(
+            "journey_reference_expired",
+            "Journey ticketing reference is invalid or expired",
+        ))
+    }
+
     pub fn start_refund_reconciliation(&self, interval: Duration) {
         if self.db.is_none() || self.cd.is_none() {
             return;
@@ -573,13 +726,14 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/ticketing/locations", get(locations))
         .route("/ticketing/reference/passengers", get(passengers))
+        .route("/ticketing/intents", post(create_intent))
         .route("/ticketing/searches", post(create_search))
         .route("/ticketing/searches/{search_id}", get(search_page))
         .route(
             "/ticketing/searches/{search_id}/connections/{connection_id}",
             get(connection_detail),
         )
-        .route("/ticketing/orders", post(create_order))
+        .route("/ticketing/orders", get(list_orders).post(create_order))
         .route(
             "/ticketing/orders/{order_id}",
             get(get_order).delete(cancel_order),
@@ -647,6 +801,12 @@ pub fn augment_openapi(specification: &mut Value) {
         false,
     );
     add(
+        "/ticketing/intents",
+        "post",
+        "Create a draft order from an opaque Cesta journey reference",
+        true,
+    );
+    add(
         "/ticketing/searches",
         "post",
         "Create a connection search",
@@ -669,6 +829,12 @@ pub fn augment_openapi(specification: &mut Value) {
         "post",
         "Create a draft order and price quote",
         true,
+    );
+    add(
+        "/ticketing/orders",
+        "get",
+        "List the authenticated user's ticketing orders",
+        false,
     );
     add(
         "/ticketing/orders/{orderId}",
@@ -767,6 +933,7 @@ pub fn augment_openapi(specification: &mut Value) {
         false,
     );
     for (path, method, schema) in [
+        ("/ticketing/intents", "post", "TicketingIntentRequest"),
         ("/ticketing/searches", "post", "TicketingSearchRequest"),
         ("/ticketing/orders", "post", "TicketingOrderCreateRequest"),
         (
@@ -808,6 +975,156 @@ pub fn augment_openapi(specification: &mut Value) {
             operation.insert("requestBody".into(), json!({"required":true,"content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}}));
         }
     }
+    for (path, method, status, schema) in [
+        (
+            "/ticketing/locations",
+            "get",
+            "200",
+            "TicketingLocationSuggestions",
+        ),
+        (
+            "/ticketing/reference/passengers",
+            "get",
+            "200",
+            "TicketingPassengerCatalogue",
+        ),
+        ("/ticketing/intents", "post", "201", "TicketingIntentResult"),
+        (
+            "/ticketing/searches",
+            "post",
+            "201",
+            "TicketingConnectionPage",
+        ),
+        (
+            "/ticketing/searches/{searchId}",
+            "get",
+            "200",
+            "TicketingConnectionPage",
+        ),
+        (
+            "/ticketing/searches/{searchId}/connections/{connectionId}",
+            "get",
+            "200",
+            "TicketingConnection",
+        ),
+        (
+            "/ticketing/orders",
+            "get",
+            "200",
+            "TicketingOrderCollection",
+        ),
+        ("/ticketing/orders", "post", "201", "TicketingOrder"),
+        (
+            "/ticketing/orders/{orderId}",
+            "get",
+            "200",
+            "TicketingOrder",
+        ),
+        (
+            "/ticketing/orders/{orderId}",
+            "delete",
+            "200",
+            "TicketingOrder",
+        ),
+        (
+            "/ticketing/orders/{orderId}/offer",
+            "patch",
+            "200",
+            "TicketingOrder",
+        ),
+        (
+            "/ticketing/orders/{orderId}/quote-refresh",
+            "post",
+            "200",
+            "TicketingOrder",
+        ),
+        (
+            "/ticketing/orders/{orderId}/add-ons",
+            "get",
+            "200",
+            "TicketingAddOns",
+        ),
+        (
+            "/ticketing/orders/{orderId}/reservations",
+            "patch",
+            "200",
+            "TicketingAddOns",
+        ),
+        (
+            "/ticketing/orders/{orderId}/bicycles",
+            "patch",
+            "200",
+            "TicketingAddOns",
+        ),
+        (
+            "/ticketing/orders/{orderId}/dogs",
+            "patch",
+            "200",
+            "TicketingAddOns",
+        ),
+        (
+            "/ticketing/orders/{orderId}/coach-schema",
+            "get",
+            "200",
+            "TicketingCoachSchema",
+        ),
+        (
+            "/ticketing/orders/{orderId}/checkout-session",
+            "post",
+            "201",
+            "TicketingCheckoutResult",
+        ),
+        (
+            "/ticketing/orders/{orderId}/complete",
+            "post",
+            "200",
+            "TicketingOrder",
+        ),
+        (
+            "/ticketing/orders/{orderId}/documents",
+            "get",
+            "200",
+            "TicketingIssuedDocuments",
+        ),
+        (
+            "/ticketing/tickets/{ticketId}/refund-quote",
+            "get",
+            "200",
+            "TicketingRefundQuote",
+        ),
+        (
+            "/ticketing/tickets/{ticketId}/refunds",
+            "post",
+            "202",
+            "TicketingRefund",
+        ),
+        (
+            "/ticketing/tickets/{ticketId}/refunds/latest",
+            "get",
+            "200",
+            "TicketingRefundStatus",
+        ),
+    ] {
+        if let Some(responses) = paths
+            .get_mut(path)
+            .and_then(|value| value.get_mut(method))
+            .and_then(|value| value.get_mut("responses"))
+            .and_then(Value::as_object_mut)
+        {
+            responses.insert(status.into(),json!({"description":"Stable normalized response","content":{"application/json":{"schema":{"$ref":format!("#/components/schemas/{schema}")}}}}));
+        }
+    }
+    paths.insert("/auth/register".into(),json!({"post":{"summary":"Register a Cesta account","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthRegisterRequest"}}}},"responses":{"200":{"description":"Access and refresh tokens","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthResponse"}}}},"409":{"description":"Email already registered"}}}}));
+    paths.insert("/auth/login".into(),json!({"post":{"summary":"Log in to a Cesta account","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthLoginRequest"}}}},"responses":{"200":{"description":"Access and refresh tokens","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthResponse"}}}},"401":{"description":"Invalid credentials"}}}}));
+    paths.insert("/auth/refresh".into(),json!({"post":{"summary":"Rotate a Cesta session using a refresh token","description":"Refresh tokens are opaque, stored only as SHA-256 hashes, valid for 30 days, and a successful refresh returns a new token pair.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthRefreshRequest"}}}},"responses":{"200":{"description":"New token pair","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthResponse"}}}},"401":{"description":"Invalid, expired, or revoked refresh token"}}}}));
+    paths.insert("/auth/logout".into(),json!({"post":{"summary":"Revoke a Cesta refresh token","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/AuthRefreshRequest"}}}},"responses":{"200":{"description":"Session revoked"}}}}));
+    if let Some(operation) = paths
+        .get_mut("/journeys/search")
+        .and_then(|value| value.get_mut("post"))
+        .and_then(Value::as_object_mut)
+    {
+        operation.insert("responses".into(),json!({"200":{"description":"Cesta journeys with stable ticketing metadata. Live prices require authentication and POST /ticketing/intents.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/JourneySearchWithTicketingResponse"}}}}}));
+    }
     if let Some(components) = specification
         .get_mut("components")
         .and_then(Value::as_object_mut)
@@ -827,6 +1144,33 @@ pub fn augment_openapi(specification: &mut Value) {
             schemas.insert("TicketingCustomer".into(),json!({"type":"object","additionalProperties":false,"required":["email"],"properties":{"email":{"type":"string","format":"email","maxLength":254},"name":{"type":["string","null"],"maxLength":120},"inCardNumber":{"type":["integer","null"]},"birthDate":{"type":["string","null"]},"companyName":{"type":["string","null"],"maxLength":160}}}));
             schemas.insert("TicketingCheckoutRequest".into(),json!({"type":"object","additionalProperties":false,"required":["customer"],"properties":{"customer":{"$ref":"#/components/schemas/TicketingCustomer"}}}));
             schemas.insert("TicketingRefundRequest".into(),json!({"type":"object","additionalProperties":false,"required":["email"],"properties":{"email":{"type":"string","format":"email","maxLength":254}}}));
+            schemas.insert("TicketingIntentRequest".into(),json!({"type":"object","additionalProperties":false,"required":["journeyReference"],"properties":{"journeyReference":{"type":"string","format":"uuid"},"segmentIndexes":{"type":"array","uniqueItems":true,"items":{"type":"integer","minimum":0}},"class":{"type":"integer","enum":[1,2],"default":2},"passengerGroups":{"type":"array","items":{"$ref":"#/components/schemas/TicketingPassengerGroup"}}}}));
+            schemas.insert("TicketingLocation".into(),json!({"type":"object","additionalProperties":true,"required":["id","name","type"],"properties":{"id":{"type":"string","format":"uuid"},"name":{"type":"string"},"type":{"type":"integer","enum":[1,2,3]},"typeName":{"type":["string","null"]},"state":{"type":["string","null"]},"region":{"type":["string","null"]}}}));
+            schemas.insert("TicketingLocationSuggestions".into(),json!({"type":"object","required":["locations"],"properties":{"locations":{"type":"array","items":{"$ref":"#/components/schemas/TicketingLocation"}}}}));
+            schemas.insert("TicketingPassengerCatalogue".into(),json!({"type":"object","additionalProperties":true,"required":["passengers"],"properties":{"passengers":{}}}));
+            schemas.insert("TicketingConnection".into(),json!({"type":"object","additionalProperties":true,"required":["id"],"properties":{"id":{"type":"string","format":"uuid"},"trains":{"type":"array","items":{"type":"object","additionalProperties":true}},"remarks":{"type":["object","null"],"additionalProperties":true},"priceOffers":{"type":["object","null"],"additionalProperties":true}}}));
+            schemas.insert("TicketingConnectionPage".into(),json!({"type":"object","required":["searchId","connections"],"properties":{"searchId":{"type":"string","format":"uuid"},"allowPrevious":{"type":["boolean","null"]},"allowNext":{"type":["boolean","null"]},"connections":{"type":"array","items":{"$ref":"#/components/schemas/TicketingConnection"}}}}));
+            schemas.insert("TicketingOrder".into(),json!({"type":"object","additionalProperties":false,"required":["id","searchId","connectionId","status","currency","quote","version"],"properties":{"id":{"type":"string","format":"uuid"},"searchId":{"type":"string","format":"uuid"},"connectionId":{"type":"string","format":"uuid"},"status":{"type":"string","enum":["draft","checkout_pending","paid","issued","cancelled","issuance_failed","refunded","refund_pending"]},"selectedOfferType":{"type":["integer","null"]},"amountHellers":{"type":["integer","null"],"minimum":0},"currency":{"const":"CZK"},"quote":{"type":"object","additionalProperties":true},"version":{"type":"integer"},"documents":{"type":"array","items":{"$ref":"#/components/schemas/TicketingDocument"}},"tickets":{"type":"array","items":{"$ref":"#/components/schemas/TicketingTicket"}}}}));
+            schemas.insert("TicketingOrderCollection".into(),json!({"type":"object","required":["orders"],"properties":{"orders":{"type":"array","items":{"$ref":"#/components/schemas/TicketingOrder"}},"nextCursor":{"type":["string","null"],"format":"uuid"}}}));
+            schemas.insert("TicketingIntentResult".into(),json!({"type":"object","required":["journeyReference","searchId","connectionId","order","correlation"],"properties":{"journeyReference":{"type":"string","format":"uuid"},"searchId":{"type":"string","format":"uuid"},"connectionId":{"type":"string","format":"uuid"},"order":{"$ref":"#/components/schemas/TicketingOrder"},"connection":{"oneOf":[{"$ref":"#/components/schemas/TicketingConnection"},{"type":"null"}]},"correlation":{"type":"object","required":["method","toleranceMinutes"],"properties":{"method":{"const":"server_side_schedule_and_train_evidence"},"toleranceMinutes":{"type":"integer"}}}}}));
+            schemas.insert("TicketingAddOns".into(),json!({"type":"object","additionalProperties":true,"properties":{"dogs":{"type":["object","null"]},"reservations":{"type":["object","null"]},"bikes":{"type":["object","null"]}}}));
+            schemas.insert("TicketingCoachSchema".into(),json!({"type":"object","additionalProperties":true,"properties":{"coachSchemas":{"type":"array","items":{"type":"object","additionalProperties":true}},"legend":{"type":"array","items":{"type":"object","additionalProperties":true}}}}));
+            schemas.insert("TicketingDocument".into(),json!({"type":"object","required":["id"],"properties":{"id":{"type":"string","format":"uuid"},"documentType":{"type":["integer","null"]},"contentType":{"type":["string","null"],"enum":["application/pdf","image/png",null]}}}));
+            schemas.insert("TicketingTicket".into(),json!({"type":"object","additionalProperties":false,"required":["id","orderId","returned","details"],"properties":{"id":{"type":"string","format":"uuid"},"orderId":{"type":"string","format":"uuid"},"returned":{"type":"boolean"},"details":{"type":"object","additionalProperties":true},"latestRefund":{"oneOf":[{"$ref":"#/components/schemas/TicketingRefund"},{"type":"null"}]}}}));
+            schemas.insert("TicketingIssuedDocuments".into(),json!({"type":"object","required":["documents","tickets"],"properties":{"documents":{"type":"array","items":{"$ref":"#/components/schemas/TicketingDocument"}},"tickets":{"type":"array","items":{"$ref":"#/components/schemas/TicketingTicket"}}}}));
+            schemas.insert("TicketingCheckoutSession".into(),json!({"type":"object","required":["id","redirectUrl","returnUrl","cancelUrl"],"properties":{"id":{"type":"string"},"redirectUrl":{"type":"string","format":"uri"},"returnUrl":{"type":"string","format":"uri"},"cancelUrl":{"type":"string","format":"uri"},"expiresAt":{"type":["string","null"],"format":"date-time"}}}));
+            schemas.insert("TicketingCheckoutResult".into(),json!({"type":"object","required":["order","checkoutSession"],"properties":{"order":{"$ref":"#/components/schemas/TicketingOrder"},"checkoutSession":{"$ref":"#/components/schemas/TicketingCheckoutSession"}}}));
+            schemas.insert("TicketingRefundQuote".into(),json!({"type":"object","additionalProperties":true,"properties":{"price2Refund":{"type":["integer","null"],"minimum":0},"errors":{"type":"array","items":{"type":"object","additionalProperties":true}}}}));
+            schemas.insert("TicketingRefund".into(),json!({"type":"object","additionalProperties":false,"required":["id","ticketId","status","details"],"properties":{"id":{"type":"string","format":"uuid"},"ticketId":{"type":"string","format":"uuid"},"status":{"type":"string","enum":["requested","processing","settled","rejected"]},"amountHellers":{"type":["integer","null"],"minimum":0},"details":{"type":"object","additionalProperties":true}}}));
+            schemas.insert("TicketingRefundStatus".into(),json!({"type":"object","required":["refund","upstreamStatus"],"properties":{"refund":{"oneOf":[{"$ref":"#/components/schemas/TicketingRefund"},{"type":"null"}]},"upstreamStatus":{"type":"object","additionalProperties":true}}}));
+            schemas.insert("AuthRegisterRequest".into(),json!({"type":"object","additionalProperties":false,"required":["email","password"],"properties":{"email":{"type":"string","format":"email"},"password":{"type":"string","minLength":8},"display_name":{"type":["string","null"]}}}));
+            schemas.insert("AuthLoginRequest".into(),json!({"type":"object","additionalProperties":false,"required":["email","password"],"properties":{"email":{"type":"string","format":"email"},"password":{"type":"string"},"device_name":{"type":["string","null"]}}}));
+            schemas.insert("AuthRefreshRequest".into(),json!({"type":"object","additionalProperties":false,"required":["refresh_token"],"properties":{"refresh_token":{"type":"string"}}}));
+            schemas.insert("PublicUser".into(),json!({"type":"object","required":["id","email","roles"],"properties":{"id":{"type":"string","format":"uuid"},"email":{"type":"string","format":"email"},"display_name":{"type":["string","null"]},"roles":{"type":"array","items":{"type":"string"}}}}));
+            schemas.insert("AuthResponse".into(),json!({"type":"object","required":["access_token","refresh_token","token_type","expires_in_seconds","user"],"properties":{"access_token":{"type":"string","description":"JWT access token valid for 900 seconds"},"refresh_token":{"type":"string","description":"Opaque refresh token; store in platform secure storage"},"token_type":{"const":"Bearer"},"expires_in_seconds":{"const":900},"user":{"$ref":"#/components/schemas/PublicUser"}}}));
+            schemas.insert("JourneyTicketingSegment".into(),json!({"type":"object","required":["legIndex","availability","ticketable"],"properties":{"legIndex":{"type":"integer","minimum":0},"provider":{"type":["string","null"],"enum":["cd",null]},"availability":{"type":"string","enum":["authentication_required","unsupported_mode"]},"ticketable":{"type":"null","description":"Actual sellability is resolved server-side by POST /ticketing/intents"}}}));
+            schemas.insert("JourneyTicketingMetadata".into(),json!({"type":"object","required":["provider","journeyReference","authenticationRequired","availability","indicativePriceHellers","currency","completeJourneyTicketable","segments"],"properties":{"provider":{"type":["string","null"],"enum":["cd",null]},"journeyReference":{"type":["string","null"],"format":"uuid"},"authenticationRequired":{"const":true},"availability":{"type":"string","enum":["authentication_required","not_supported"]},"indicativePriceHellers":{"type":"null","description":"Public route search does not load live ČD fares"},"currency":{"const":"CZK"},"completeJourneyTicketable":{"type":["boolean","null"]},"scope":{"type":["string","null"],"enum":["complete_journey_candidate","segments",null]},"segments":{"type":"array","items":{"$ref":"#/components/schemas/JourneyTicketingSegment"}}}}));
+            schemas.insert("JourneySearchWithTicketingResponse".into(),json!({"type":"object","required":["journeys","data_status","warnings"],"properties":{"journeys":{"type":"array","items":{"type":"object","additionalProperties":true,"required":["ticketing"],"properties":{"ticketing":{"$ref":"#/components/schemas/JourneyTicketingMetadata"}}}},"related":{"type":["object","null"],"additionalProperties":true},"data_status":{"type":"object","additionalProperties":true},"warnings":{"type":"array","items":{"type":"string"}}}}));
         }
     }
 }
@@ -944,6 +1288,54 @@ async fn passengers(
     Ok(Json(
         json!({"passengers":raw.get("passengers").or_else(||raw.get("data")).cloned().unwrap_or(raw)}),
     ))
+}
+
+async fn create_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TicketingIntentRequest>,
+) -> Result<Response, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    state
+        .ticketing
+        .limit(user.id, "mutation", MUTATION_LIMIT)
+        .await?;
+    let body_value = json!(&body);
+    idempotent(&state.ticketing,user.id,"create_intent",&headers,&body_value,||async {
+        let reference=state.ticketing.journey_reference(body.journey_reference).await?;
+        let legs=reference.snapshot.get("legs").and_then(Value::as_array).ok_or_else(||api_error("journey_reference_invalid","Stored journey reference is invalid"))?;
+        let candidates=reference.snapshot.get("candidateSegmentIndexes").and_then(Value::as_array).into_iter().flatten().filter_map(|value|value.as_u64().map(|value|value as usize)).collect::<Vec<_>>();
+        let mut selected=if body.segment_indexes.is_empty(){candidates.clone()}else{body.segment_indexes.clone()};
+        selected.sort_unstable();selected.dedup();
+        if selected.is_empty()||selected.iter().any(|index|!candidates.contains(index)||*index>=legs.len()){return Err(validation("segmentIndexes must select ticketing candidate segments"));}
+        let first=*selected.first().expect("non-empty");let last=*selected.last().expect("non-empty");
+        if legs[first..=last].iter().any(|leg|!matches!(leg.get("mode").and_then(Value::as_str),Some("train"|"walk"))){return Err(api_error("mixed_journey_not_supported","Selected ticketing segments must be contiguous train legs"));}
+        let from_name=legs[first].get("fromName").and_then(Value::as_str).ok_or_else(||api_error("journey_not_correlatable","Journey origin has no station name"))?;
+        let to_name=legs[last].get("toName").and_then(Value::as_str).ok_or_else(||api_error("journey_not_correlatable","Journey destination has no station name"))?;
+        let from=resolve_cd_station(state.ticketing.client()?,from_name).await?;let to=resolve_cd_station(state.ticketing.client()?,to_name).await?;
+        let from_key=from.key.ok_or_else(||api_error("upstream_malformed_response","ČD station has no key"))?;let to_key=to.key.ok_or_else(||api_error("upstream_malformed_response","ČD station has no key"))?;
+        let service_date=reference.snapshot.get("serviceDate").and_then(Value::as_str).and_then(|value|NaiveDate::parse_from_str(value,"%Y-%m-%d").ok()).ok_or_else(||api_error("journey_reference_invalid","Journey service date is invalid"))?;
+        let departure=legs[first].get("departureSeconds").and_then(Value::as_u64).ok_or_else(||api_error("journey_reference_invalid","Journey departure is invalid"))? as u32;
+        let arrival=legs[last].get("arrivalSeconds").and_then(Value::as_u64).ok_or_else(||api_error("journey_reference_invalid","Journey arrival is invalid"))? as u32;
+        let booking=booking_request(&body.passenger_groups,body.class,4097)?;
+        let upstream_request=SearchConnectionsRequest{from_type:3,from:from_key,to_type:3,to:to_key,via_type:None,via:None,change_type:None,change:None,date_time:Some(cd_date_time(service_date,departure)?),previous:false,max_count:10,parameters:ConnectionParameters{max_change:Some(8),..Default::default()},booking:booking.clone()};
+        let(typed,raw)=state.ticketing.client()?.search_connections(&upstream_request).await.map_err(cd_error)?;
+        let handle=typed.handle.ok_or_else(||api_error("upstream_malformed_response","ČD response did not contain a search handle"))?;
+        let tolerance=std::env::var("CD_TICKET_CORRELATION_TOLERANCE_MINUTES").ok().and_then(|value|value.parse::<i64>().ok()).unwrap_or(10).clamp(1,30);
+        let matched=correlate_connection(&raw,legs,&selected,service_date,departure,arrival,tolerance)?;
+        let from_id=store_resolved_location(&state.ticketing,user.id,&from).await?;let to_id=store_resolved_location(&state.ticketing,user.id,&to).await?;
+        let search_id=Uuid::new_v4();let(all_connections,public)=public_connections(typed.conn_info.as_ref().map(|value|&value.connections),raw.get("connInfo").unwrap_or(&raw));
+        let connection_id=all_connections.iter().find_map(|(opaque,upstream)|(*upstream==matched).then_some(*opaque)).ok_or_else(||api_error("journey_not_correlatable","Matched ČD connection is missing from the result map"))?;
+        let request=SearchRequest{from_location_id:from_id,to_location_id:to_id,via_location_id:None,change_location_id:None,date_time:Some(cd_date_time(service_date,departure)?),previous:false,max_count:10,max_changes:Some(8),passenger_groups:body.passenger_groups.clone(),class:body.class};
+        let search=SearchRecord{id:search_id,user_id:user.id,handle,request,raw:raw.clone(),connections:all_connections,expires_at:Utc::now()+chrono::Duration::minutes(30)};
+        state.ticketing.memory.write().await.searches.insert(search_id,search.clone());persist_search(&state.ticketing,&search).await?;
+        let quote_booking=booking_request(&body.passenger_groups,body.class,QUOTE_CREATE_FLAGS)?;
+        let(_,quote)=state.ticketing.client()?.create_price_offer(handle,matched,Some(QUOTE_CREATE_FLAGS),&quote_booking).await.map_err(cd_error)?;
+        let booking_id=quote.get("bookingId").and_then(Value::as_str).ok_or_else(||api_error("upstream_malformed_response","ČD quote has no booking identifier"))?.to_string();
+        let order=OrderRecord{id:Uuid::new_v4(),user_id:user.id,search_id,connection_id,conn_id:matched,booking_id,status:"draft".into(),selected_offer_type:None,amount_hellers:offer_amount(&quote),customer:None,quote,checkout_session_id:None,version:0};
+        state.ticketing.memory.write().await.orders.insert(order.id,order.clone());persist_order(&state.ticketing,&order).await?;
+        Ok((StatusCode::CREATED,json!({"journeyReference":body.journey_reference,"searchId":search_id,"connectionId":connection_id,"order":public_order(&order),"connection":public.into_iter().find(|value|value.get("id")==Some(&json!(connection_id))),"correlation":{"method":"server_side_schedule_and_train_evidence","toleranceMinutes":tolerance}})))
+    }).await
 }
 
 async fn create_search(
@@ -1081,6 +1473,142 @@ async fn connection_detail(
         map.insert("id".into(), json!(cid));
     }
     Ok(Json(raw))
+}
+
+async fn list_orders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrdersQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = current_user(&state, &headers).await?;
+    let allowed = [
+        "draft",
+        "checkout_pending",
+        "paid",
+        "issued",
+        "cancelled",
+        "issuance_failed",
+        "refunded",
+        "refund_pending",
+    ];
+    if query
+        .status
+        .as_ref()
+        .is_some_and(|status| !allowed.contains(&status.as_str()))
+    {
+        return Err(validation("unsupported order status"));
+    }
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=50).contains(&limit) {
+        return Err(validation("limit must be between 1 and 50"));
+    }
+    if let Some(db) = &state.ticketing.db {
+        let cursor_created = if let Some(cursor) = query.cursor {
+            Some(
+                sqlx::query_scalar::<_, DateTime<Utc>>(
+                    "SELECT created_at FROM cd_ticketing_orders WHERE id=$1 AND user_id=$2",
+                )
+                .bind(cursor)
+                .bind(user.id)
+                .fetch_optional(db)
+                .await
+                .map_err(db_error)?
+                .ok_or_else(not_found_owned)?,
+            )
+        } else {
+            None
+        };
+        let rows=sqlx::query("SELECT * FROM cd_ticketing_orders WHERE user_id=$1 AND ($2::text IS NULL OR status=$2) AND ($3::timestamptz IS NULL OR (created_at,id)<($3,$4)) ORDER BY created_at DESC,id DESC LIMIT $5").bind(user.id).bind(query.status.as_deref()).bind(cursor_created).bind(query.cursor.unwrap_or(Uuid::nil())).bind(limit+1).fetch_all(db).await.map_err(db_error)?;
+        let has_more = rows.len() as i64 > limit;
+        let mut orders = Vec::new();
+        for row in rows.into_iter().take(limit as usize) {
+            orders.push(order_collection_item(&state.ticketing, order_from_row(row)?).await?);
+        }
+        let next_cursor = has_more
+            .then(|| orders.last().and_then(|value| value.get("id")).cloned())
+            .flatten();
+        return Ok(Json(json!({"orders":orders,"nextCursor":next_cursor})));
+    }
+    let memory = state.ticketing.memory.read().await;
+    let mut records = memory
+        .orders
+        .values()
+        .filter(|order| {
+            order.user_id == user.id
+                && query
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| &order.status == status)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by_key(|order| std::cmp::Reverse(order.id));
+    if let Some(cursor) = query.cursor {
+        records.retain(|order| order.id < cursor);
+    }
+    let has_more = records.len() as i64 > limit;
+    let selected = records.into_iter().take(limit as usize).collect::<Vec<_>>();
+    drop(memory);
+    let mut orders = Vec::new();
+    for order in selected {
+        orders.push(order_collection_item(&state.ticketing, order).await?);
+    }
+    let next_cursor = has_more
+        .then(|| orders.last().and_then(|value| value.get("id")).cloned())
+        .flatten();
+    Ok(Json(json!({"orders":orders,"nextCursor":next_cursor})))
+}
+
+async fn order_collection_item(
+    service: &TicketingService,
+    order: OrderRecord,
+) -> Result<Value, ApiError> {
+    let mut value = public_order(&order);
+    let (documents, tickets) = if let Some(db) = &service.db {
+        let documents=sqlx::query("SELECT id,document_type FROM cd_ticketing_documents WHERE user_id=$1 AND order_id=$2 ORDER BY created_at").bind(order.user_id).bind(order.id).fetch_all(db).await.map_err(db_error)?.into_iter().map(|row|{let document_type:Option<i32>=row.get("document_type");json!({"id":row.get::<Uuid,_>("id"),"documentType":document_type,"contentType":content_type_for_document_type(document_type)})}).collect::<Vec<_>>();
+        let rows=sqlx::query("SELECT id,user_id,order_id,upstream_ticket_id,payload,returned FROM cd_ticketing_tickets WHERE user_id=$1 AND order_id=$2 ORDER BY created_at").bind(order.user_id).bind(order.id).fetch_all(db).await.map_err(db_error)?;
+        let mut tickets = Vec::new();
+        for row in rows {
+            let ticket = TicketRecord {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                order_id: row.get("order_id"),
+                upstream_id: row.get("upstream_ticket_id"),
+                payload: row.get("payload"),
+                returned: row.get("returned"),
+            };
+            let mut item = public_ticket(&ticket);
+            let refund=sqlx::query("SELECT id,user_id,ticket_id,status,amount_hellers,payload FROM cd_ticketing_refunds WHERE user_id=$1 AND ticket_id=$2 ORDER BY updated_at DESC LIMIT 1").bind(order.user_id).bind(ticket.id).fetch_optional(db).await.map_err(db_error)?.map(|row|public_refund(&RefundRecord{id:row.get("id"),user_id:row.get("user_id"),ticket_id:row.get("ticket_id"),status:row.get("status"),amount_hellers:row.get::<Option<i32>,_>("amount_hellers").map(i64::from),payload:row.get("payload")}));
+            item["latestRefund"] = json!(refund);
+            tickets.push(item);
+        }
+        (documents, tickets)
+    } else {
+        let memory = service.memory.read().await;
+        let documents=memory.documents.values().filter(|document|document.user_id==order.user_id&&document.order_id==order.id).map(|document|json!({"id":document.id,"documentType":document.document_type,"contentType":content_type_for_document_type(document.document_type)})).collect();
+        let tickets = memory
+            .tickets
+            .values()
+            .filter(|ticket| ticket.user_id == order.user_id && ticket.order_id == order.id)
+            .map(|ticket| {
+                let mut item = public_ticket(ticket);
+                let refund = memory
+                    .refunds
+                    .values()
+                    .filter(|refund| {
+                        refund.user_id == order.user_id && refund.ticket_id == ticket.id
+                    })
+                    .max_by_key(|refund| refund.id)
+                    .map(public_refund);
+                item["latestRefund"] = json!(refund);
+                item
+            })
+            .collect();
+        (documents, tickets)
+    };
+    value["documents"] = json!(documents);
+    value["tickets"] = json!(tickets);
+    Ok(value)
 }
 
 async fn create_order(
@@ -1817,6 +2345,194 @@ async fn refund_latest(
     Ok(Json(
         json!({"refund":latest,"upstreamStatus":sanitize_public(status)}),
     ))
+}
+
+async fn resolve_cd_station(client: &Arc<dyn CdApi>, name: &str) -> Result<cd::Location, ApiError> {
+    let (locations, _) = client
+        .search_locations(name, Some(3), 10)
+        .await
+        .map_err(cd_error)?;
+    let expected = transit_model::normalize_czech_name(name);
+    let mut exact = locations
+        .data
+        .iter()
+        .filter(|location| {
+            location.key.is_some()
+                && location
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| transit_model::normalize_czech_name(value) == expected)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Ok(exact.remove(0));
+    }
+    let mut valid = locations
+        .data
+        .into_iter()
+        .filter(|location| location.key.is_some())
+        .collect::<Vec<_>>();
+    if exact.is_empty() && valid.len() == 1 {
+        return Ok(valid.remove(0));
+    }
+    Err(api_error(
+        "station_correlation_ambiguous",
+        "Cesta station name does not resolve to one unique ČD station",
+    ))
+}
+
+async fn store_resolved_location(
+    service: &TicketingService,
+    user_id: Uuid,
+    location: &cd::Location,
+) -> Result<Uuid, ApiError> {
+    let upstream_type = location.r#type.unwrap_or(3);
+    let upstream_key = location
+        .key
+        .ok_or_else(|| api_error("upstream_malformed_response", "ČD station has no key"))?;
+    let id = Uuid::new_v4();
+    let payload = serde_json::to_value(location)
+        .map_err(|_| api_error("internal_error", "Could not store resolved station"))?;
+    service.memory.write().await.locations.insert(
+        id,
+        LocationRecord {
+            user_id,
+            upstream_type,
+            upstream_key,
+            payload: payload.clone(),
+        },
+    );
+    persist_location(service, user_id, id, upstream_type, upstream_key, &payload).await?;
+    Ok(id)
+}
+
+fn journey_naive(date: NaiveDate, seconds: u32) -> Result<NaiveDateTime, ApiError> {
+    let day = date
+        .checked_add_days(chrono::Days::new((seconds / 86400) as u64))
+        .ok_or_else(|| validation("journey date is out of range"))?;
+    let time = NaiveTime::from_num_seconds_from_midnight_opt(seconds % 86400, 0)
+        .ok_or_else(|| validation("journey time is invalid"))?;
+    Ok(day.and_time(time))
+}
+
+fn cd_date_time(date: NaiveDate, seconds: u32) -> Result<String, ApiError> {
+    Ok(journey_naive(date, seconds)?
+        .format("%Y-%m-%d %H:%M")
+        .to_string())
+}
+
+fn parse_cd_date_time(value: &str) -> Option<NaiveDateTime> {
+    [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%-d.%-m.%Y %H:%M",
+    ]
+    .into_iter()
+    .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+}
+
+fn connection_bounds(connection: &Value) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let trains = connection.get("trains")?.as_array()?;
+    let first = trains.first()?;
+    let last = trains.last()?;
+    let first_route = first.pointer("/trainData/route")?.as_array()?;
+    let last_route = last.pointer("/trainData/route")?.as_array()?;
+    let departure = first_route.iter().find_map(|item| {
+        item.get("dep")
+            .and_then(Value::as_str)
+            .and_then(parse_cd_date_time)
+    })?;
+    let arrival = last_route.iter().rev().find_map(|item| {
+        item.get("arr")
+            .and_then(Value::as_str)
+            .and_then(parse_cd_date_time)
+    })?;
+    Some((departure, arrival))
+}
+
+fn train_number(value: &str) -> Option<String> {
+    let digits = value
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then_some(digits)
+}
+
+fn correlate_connection(
+    raw: &Value,
+    legs: &[Value],
+    selected: &[usize],
+    service_date: NaiveDate,
+    departure: u32,
+    arrival: u32,
+    tolerance_minutes: i64,
+) -> Result<i32, ApiError> {
+    let connections = raw
+        .pointer("/connInfo/connections")
+        .or_else(|| raw.get("connections"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            api_error(
+                "upstream_malformed_response",
+                "ČD response has no connection list",
+            )
+        })?;
+    let target_departure = journey_naive(service_date, departure)?;
+    let target_arrival = journey_naive(service_date, arrival)?;
+    let expected_numbers = selected
+        .iter()
+        .filter_map(|index| legs.get(*index))
+        .filter_map(|leg| leg.get("routeName").and_then(Value::as_str))
+        .filter_map(train_number)
+        .collect::<Vec<_>>();
+    let mut matches = connections
+        .iter()
+        .filter_map(|connection| {
+            let id = connection
+                .get("id")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())?;
+            let (bounds_departure, bounds_arrival) = connection_bounds(connection)?;
+            let dep_delta = (bounds_departure - target_departure).num_minutes().abs();
+            let arr_delta = (bounds_arrival - target_arrival).num_minutes().abs();
+            if dep_delta > tolerance_minutes || arr_delta > tolerance_minutes {
+                return None;
+            }
+            let upstream_numbers = connection
+                .get("trains")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|train| {
+                    train
+                        .pointer("/trainData/train/trainNum")
+                        .and_then(Value::as_str)
+                })
+                .filter_map(train_number)
+                .collect::<Vec<_>>();
+            let unmatched = expected_numbers
+                .iter()
+                .filter(|expected| !upstream_numbers.contains(expected))
+                .count() as i64;
+            Some((dep_delta + arr_delta + unmatched * 5, id, unmatched))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    let Some(best) = matches.first().copied() else {
+        return Err(api_error(
+            "journey_not_correlatable",
+            "No ČD connection matches the selected Cesta journey",
+        ));
+    };
+    if matches.get(1).is_some_and(|next| next.0 == best.0) {
+        return Err(api_error(
+            "journey_correlation_ambiguous",
+            "Multiple ČD connections match the selected Cesta journey",
+        ));
+    }
+    Ok(best.1)
 }
 
 fn validate_search(b: &SearchRequest) -> Result<(), ApiError> {
@@ -2628,6 +3344,8 @@ mod tests {
         let provider = HttpPaymentProvider::new(
             format!("http://{address}"),
             "secret".into(),
+            "jedes://ticketing/checkout/return".into(),
+            "jedes://ticketing/checkout/cancel".into(),
             Duration::from_secs(2),
         )
         .unwrap();
@@ -2657,6 +3375,66 @@ mod tests {
         assert_eq!(
             specification["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"
+        );
+        assert_eq!(
+            specification["paths"]["/ticketing/intents"]["post"]["responses"]["201"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/TicketingIntentResult"
+        );
+        assert_eq!(
+            specification["paths"]["/ticketing/orders"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/TicketingOrderCollection"
+        );
+        assert_eq!(
+            specification["paths"]["/auth/login"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/AuthResponse"
+        );
+    }
+
+    #[tokio::test]
+    async fn journey_results_receive_opaque_ticketing_metadata() {
+        let service = TicketingService::new(None, Arc::new(DisabledPaymentProvider), None);
+        let mut journeys = vec![
+            json!({"id":"journey-a","departure_time":3600,"arrival_time":7200,"legs":[{"mode":"train","from_stop_id":"a","to_stop_id":"b","route_id":"r","departure_time":3600,"arrival_time":7200}]}),
+        ];
+        let related = json!({"stops":[{"id":"a","name":"Praha hl. n."},{"id":"b","name":"Brno hl. n."}],"routes":[{"id":"r","short_name":"EC 275"}]});
+        service
+            .annotate_journeys(
+                &mut journeys,
+                &related,
+                NaiveDate::from_ymd_opt(2026, 7, 6).unwrap(),
+            )
+            .await
+            .unwrap();
+        let reference = journeys[0]["ticketing"]["journeyReference"]
+            .as_str()
+            .unwrap();
+        assert!(Uuid::parse_str(reference).is_ok());
+        assert_eq!(
+            journeys[0]["ticketing"]["availability"],
+            "authentication_required"
+        );
+        assert!(journeys[0]["ticketing"]["indicativePriceHellers"].is_null());
+    }
+
+    #[test]
+    fn server_side_connection_correlation_uses_schedule_and_train_number() {
+        let raw = json!({"connInfo":{"connections":[{"id":7,"trains":[{"trainData":{"train":{"trainNum":"275"},"route":[{"dep":"2026-07-06 08:00"},{"arr":"2026-07-06 10:00"}]}}]},{"id":8,"trains":[{"trainData":{"train":{"trainNum":"999"},"route":[{"dep":"2026-07-06 09:00"},{"arr":"2026-07-06 11:00"}]}}]}]}});
+        let legs = vec![json!({"routeName":"EC 275"})];
+        assert_eq!(
+            correlate_connection(
+                &raw,
+                &legs,
+                &[0],
+                NaiveDate::from_ymd_opt(2026, 7, 6).unwrap(),
+                8 * 3600,
+                10 * 3600,
+                10
+            )
+            .unwrap(),
+            7
         );
     }
 }

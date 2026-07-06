@@ -1,13 +1,22 @@
 # ČD Ticket API 1.0.0 capability matrix
 
-The internal client implements all 31 operations in the authoritative specification: all location, connection, ticket, reservation, bicycle, dog, combined-service, schema, payment, document, refund, passenger-constant, and location-constant calls. Signed payment, refund, and OneTicket release calls use RSA-SHA1. Raw responses are stored internally so additive upstream fields are retained.
+The internal typed client implements all 31 operations in the authoritative specification: all location, connection, ticket, reservation, bicycle, dog, combined-service, coach-schema, payment, document, refund, passenger-constant, and location-constant calls. Signed payment, refund, and OneTicket release calls use RSA-SHA1. Additive upstream fields are retained internally.
 
-The authenticated app API implements the complete route inventory in `cd-ticketing-frontend-handoff.md`. Raw `handle`, `connId`, `bookingId`, `documentId`, `ticketId`, partner credentials, and signatures are never app authorization tokens or response fields.
+The mobile API implements:
 
-Backend-only capabilities have no direct mobile route by design:
+- public Cesta journey results with opaque ČD-ticketing intent references and per-segment candidate metadata;
+- authenticated server-side Cesta-to-ČD connection correlation and draft quote creation;
+- location suggestions, passenger/reduction reference data, standalone connection search/paging/details;
+- quote refresh, offer selection, reservations, bicycles, dogs, and coach schemas;
+- verified checkout, ČD issuance, order/ticket collection, document streaming;
+- refund quote, submission, status, and scheduled reconciliation with a durable cursor.
 
-- `connections/set`, location detail/constants, sold-ticket lookup, fixed-offer info, refund reconciliation, and OneTicket reservation release remain typed internal operations.
-- OneTicket reservation release is not automatically invoked because ČD documents it as CENDIS-only and the repository has no product policy indicating that Cesta is an authorized CENDIS partner.
-- Checkout is disabled until the configurable backend payment verifier is configured. The repository contained no existing payment provider; the isolated adapter contract is documented in the handoff.
+Public live fare previews and guest ticketing are intentionally omitted. The selected policy requires a Cesta account before contacting ČD for a fare. Public `/journeys/search` therefore returns `indicativePriceHellers: null` and `authenticationRequired: true`.
 
-Upstream ambiguities are isolated rather than guessed: passenger/reduction and add-on selection payloads preserve the documented ČD named fields, unknown response fields are retained, and operational product policy (including CENDIS eligibility and partner market) remains configuration/application policy.
+Backend-only operations have no direct mobile route by design:
+
+- `connections/set`, location detail/constants, sold-ticket lookup, fixed-offer info, refund reconciliation, and OneTicket reservation release remain internal operations.
+- OneTicket reservation release is not invoked automatically because ČD documents it as CENDIS-only and there is no product authorization establishing Cesta as an eligible CENDIS partner.
+- Checkout remains unavailable until the backend payment adapter and trusted mobile return/cancel URLs are configured.
+
+Raw `handle`, `connId`, `bookingId`, `documentId`, `ticketId`, partner credentials, private keys, and signatures are never client authorization tokens or response identifiers. Upstream ambiguity is isolated through stable errors and configuration; it is not guessed by the client.

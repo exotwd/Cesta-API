@@ -564,15 +564,28 @@ async fn app_state() -> anyhow::Result<AppState> {
     let payment_provider: Arc<dyn ticketing::PaymentProvider> = match (
         env::var("PAYMENT_PROVIDER_BASE_URL").ok(),
         env::var("PAYMENT_PROVIDER_API_KEY").ok(),
+        env::var("MOBILE_CHECKOUT_RETURN_URL").ok(),
+        env::var("MOBILE_CHECKOUT_CANCEL_URL").ok(),
     ) {
-        (Some(base_url), Some(api_key)) if !base_url.is_empty() && !api_key.is_empty() => Arc::new(
-            ticketing::HttpPaymentProvider::new(
-                base_url,
-                api_key,
-                std::time::Duration::from_secs(10),
+        (Some(base_url), Some(api_key), Some(return_url), Some(cancel_url))
+            if !base_url.is_empty()
+                && !api_key.is_empty()
+                && !return_url.is_empty()
+                && !cancel_url.is_empty() =>
+        {
+            Arc::new(
+                ticketing::HttpPaymentProvider::new(
+                    base_url,
+                    api_key,
+                    return_url,
+                    cancel_url,
+                    std::time::Duration::from_secs(10),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid payment provider configuration: {error}")
+                })?,
             )
-            .map_err(|error| anyhow::anyhow!("invalid payment provider configuration: {error}"))?,
-        ),
+        }
         _ => Arc::new(ticketing::DisabledPaymentProvider),
     };
     let ticketing = ticketing::TicketingService::new(cd_client, payment_provider, db.clone());
@@ -757,6 +770,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         pool,
         "0008_cd_ticketing",
         include_str!("../../../infra/postgres/migrations/0008_cd_ticketing.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0009_ticketing_journey_intents",
+        include_str!("../../../infra/postgres/migrations/0009_ticketing_journey_intents.sql"),
     )
     .await
 }
@@ -1194,15 +1213,23 @@ async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    let email = body.email.trim();
+    if email.len() > 254 || !email.contains('@') || body.password.len() < 8 {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "A valid email and a password of at least 8 characters are required"
+                .to_string(),
+        });
+    }
     let exists = if let Some(db) = &state.db {
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL)").bind(&body.email).fetch_one(db).await.map_err(internal_error)?
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL)").bind(email).fetch_one(db).await.map_err(internal_error)?
     } else {
         state
             .users
             .read()
             .await
             .values()
-            .any(|user| user.email.eq_ignore_ascii_case(&body.email) && user.deleted_at.is_none())
+            .any(|user| user.email.eq_ignore_ascii_case(email) && user.deleted_at.is_none())
     };
     if exists {
         return Err(ApiError {
@@ -1211,7 +1238,7 @@ async fn register(
         });
     }
     let user = create_user_record(
-        &body.email,
+        email,
         &body.password,
         body.display_name,
         vec!["user".to_string()],
@@ -1271,14 +1298,20 @@ async fn refresh(
 ) -> Result<Json<AuthResponse>, ApiError> {
     let token_hash = hash_token(&body.refresh_token);
     let user_id = if let Some(db) = &state.db {
-        sqlx::query_scalar::<_,Uuid>("SELECT user_id FROM user_sessions WHERE refresh_token_hash=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY created_at DESC LIMIT 1").bind(&token_hash).fetch_optional(db).await.map_err(internal_error)?.ok_or_else(unauthorized)?
+        sqlx::query_scalar::<_, Uuid>(
+            "UPDATE user_sessions SET revoked_at=now() WHERE id=(SELECT id FROM user_sessions WHERE refresh_token_hash=$1 AND revoked_at IS NULL AND expires_at>now() ORDER BY created_at DESC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING user_id",
+        )
+        .bind(&token_hash)
+        .fetch_optional(db)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(unauthorized)?
     } else {
         state
             .refresh_tokens
-            .read()
+            .write()
             .await
-            .get(&token_hash)
-            .copied()
+            .remove(&token_hash)
             .ok_or_else(unauthorized)?
     };
     let user = if let Some(db) = &state.db {
@@ -1886,8 +1919,12 @@ async fn journey_search(
         validate_journey_point_db(pool, &body.from).await?;
         validate_journey_point_db(pool, &body.to).await?;
         return match query_journeys_db(pool, &body, departure_time, service_date).await {
-            Ok((journeys, warnings, related)) => {
+            Ok((mut journeys, warnings, related)) => {
                 let realtime_status = related["realtime_status"].as_str().unwrap_or("unavailable");
+                state
+                    .ticketing
+                    .annotate_journeys(&mut journeys, &related, service_date)
+                    .await?;
                 Ok(Json(json!({
                     "journeys": journeys,
                     "related": related,
@@ -1957,7 +1994,7 @@ async fn journey_search(
             );
         }
     }
-    let journey_values = if include_intermediate_stops {
+    let mut journey_values = if include_intermediate_stops {
         fixture_journeys_with_stop_calls(&journeys, &state.stops)
     } else {
         journeys
@@ -1965,6 +2002,11 @@ async fn journey_search(
             .map(|journey| serde_json::to_value(journey).unwrap_or_else(|_| json!({})))
             .collect::<Vec<_>>()
     };
+    let fixture_related = json!({"stops":state.stops.iter().map(|stop|json!({"id":stop.id,"name":stop.name})).collect::<Vec<_>>(),"routes":[]});
+    state
+        .ticketing
+        .annotate_journeys(&mut journey_values, &fixture_related, service_date)
+        .await?;
     Ok(Json(json!({
         "journeys": journey_values,
         "data_status": {
@@ -7175,6 +7217,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_are_single_use() {
+        let app = build_router(app_state().await.unwrap());
+        let register_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "email": "refresh-test@example.cz",
+                            "password": "secure-password"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register_response.status(), StatusCode::OK);
+        let register_body = to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registered: Value = serde_json::from_slice(&register_body).unwrap();
+        let refresh_token = registered["refresh_token"].as_str().unwrap();
+        let refresh_body = json!({"refresh_token": refresh_token}).to_string();
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(refresh_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let reused = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/refresh")
+                    .header("content-type", "application/json")
+                    .body(Body::from(refresh_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
