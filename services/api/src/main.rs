@@ -777,6 +777,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0009_ticketing_journey_intents",
         include_str!("../../../infra/postgres/migrations/0009_ticketing_journey_intents.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0010_journey_search_indexes",
+        include_str!("../../../infra/postgres/migrations/0010_journey_search_indexes.sql"),
+    )
     .await
 }
 
@@ -5252,7 +5258,7 @@ async fn one_transfer_journeys_db(
           ORDER BY stop_time.trip_id, stop_time.arrival_time ASC,
                    stop_time.stop_sequence ASC
         ),
-        first_legs AS MATERIALIZED (
+        first_legs AS (
           SELECT
             st_from.trip_id AS first_trip_id,
             r.id AS first_route_id,
@@ -5306,16 +5312,16 @@ async fn one_transfer_journeys_db(
               )
             )
             AND COALESCE(st_mid.drop_off_type, 0) = 0
-          ORDER BY st_from.departure_time ASC, st_mid.arrival_time ASC
-          LIMIT 4000
         ),
-        filtered_first_legs AS (
+        filtered_first_legs AS MATERIALIZED (
           SELECT *
           FROM first_legs
           WHERE first_mode <> 'unknown'
             AND ($4 = false OR first_mode = ANY($5))
+          ORDER BY first_departure_time ASC, first_arrival_time ASC
+          LIMIT 4000
         ),
-        second_legs AS MATERIALIZED (
+        second_legs AS (
           SELECT
             st_transfer.trip_id AS second_trip_id,
             r2.id AS second_route_id,
@@ -5370,14 +5376,14 @@ async fn one_transfer_journeys_db(
               )
             )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
-          ORDER BY st_to.arrival_time ASC, st_transfer.departure_time DESC
-          LIMIT 4000
         ),
-        filtered_second_legs AS (
+        filtered_second_legs AS MATERIALIZED (
           SELECT *
           FROM second_legs
           WHERE second_mode <> 'unknown'
             AND ($4 = false OR second_mode = ANY($5))
+          ORDER BY second_arrival_time ASC, second_departure_time DESC
+          LIMIT 4000
         ),
         candidate_journeys AS (
           SELECT
