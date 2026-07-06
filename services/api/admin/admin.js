@@ -782,9 +782,10 @@
     const search = $("#map-search").value.trim();
     const query = new URLSearchParams({
       q: search,
-      source_feed_id: $("#map-source").value,
       limit: "5000"
     });
+    const sourceFeedId = $("#map-source").value;
+    if (sourceFeedId) query.set("source_feed_id", sourceFeedId);
     const bounds = mapBounds();
     if (bounds && !search) {
       query.set("min_lat", String(bounds.minLat));

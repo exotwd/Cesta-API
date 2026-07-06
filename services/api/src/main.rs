@@ -2783,6 +2783,9 @@ async fn admin_map_stops(
 
     let search = query.q.unwrap_or_default().trim().to_string();
     let search_pattern = format!("%{search}%");
+    let source_feed_id = query
+        .source_feed_id
+        .filter(|value| !value.trim().is_empty());
     let limit = query
         .limit
         .unwrap_or(ADMIN_MAX_MAP_STOPS)
@@ -2812,7 +2815,7 @@ async fn admin_map_stops(
         LIMIT $8
         "#,
     )
-    .bind(query.source_feed_id)
+    .bind(source_feed_id)
     .bind(&search)
     .bind(&search_pattern)
     .bind(query.min_lat)
