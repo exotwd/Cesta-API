@@ -2463,11 +2463,21 @@ async fn query_journeys_db(
     };
 
     let (mut journeys, transfer_search_status) = current_service_day_result?;
-    append_transfer_search_warning(&mut warnings, transfer_search_status, false);
+    append_transfer_search_warning(
+        &mut warnings,
+        transfer_search_status,
+        false,
+        routing_config.transfer_search_timeout_seconds,
+    );
 
     if let Some(next_service_day_result) = next_service_day_result {
         let (next_service_day_journeys, next_transfer_search_status) = next_service_day_result?;
-        append_transfer_search_warning(&mut warnings, next_transfer_search_status, true);
+        append_transfer_search_warning(
+            &mut warnings,
+            next_transfer_search_status,
+            true,
+            routing_config.transfer_search_timeout_seconds,
+        );
         let mut next_service_day_journeys = next_service_day_journeys
             .into_iter()
             .map(|journey| shift_journey_service_day(journey, SERVICE_DAY_SECONDS))
@@ -2492,7 +2502,12 @@ async fn query_journeys_db(
             &routing_config,
         )
         .await?;
-        append_transfer_search_warning(&mut warnings, next_transfer_search_status, true);
+        append_transfer_search_warning(
+            &mut warnings,
+            next_transfer_search_status,
+            true,
+            routing_config.transfer_search_timeout_seconds,
+        );
         let mut next_service_day_journeys =
             next_service_day_journey_results(next_service_day_journeys, departure_time);
         if !next_service_day_journeys.is_empty() {
@@ -2561,6 +2576,7 @@ fn append_transfer_search_warning(
     warnings: &mut Vec<String>,
     status: TransferSearchStatus,
     next_service_day: bool,
+    timeout_seconds: i32,
 ) {
     let prefix = if next_service_day {
         "next service-day transfer search"
@@ -2570,7 +2586,7 @@ fn append_transfer_search_warning(
     match status {
         TransferSearchStatus::Complete => {}
         TransferSearchStatus::TimedOut => warnings.push(format!(
-            "{prefix} timed out; direct journeys are still included"
+            "{prefix} exceeded the configured {timeout_seconds}s timeout; direct journeys are still included"
         )),
         TransferSearchStatus::Failed => warnings.push(format!(
             "{prefix} failed; direct journeys are still included"
@@ -2631,8 +2647,10 @@ async fn service_day_journeys_db(
             return Ok::<_, sqlx::Error>((Vec::new(), TransferSearchStatus::Complete));
         }
 
+        let timeout_seconds = routing_config.transfer_search_timeout_seconds as u64;
+        let started_at = time::Instant::now();
         match time::timeout(
-            std::time::Duration::from_secs(routing_config.transfer_search_timeout_seconds as u64),
+            std::time::Duration::from_secs(timeout_seconds),
             one_transfer_journeys_db(
                 pool,
                 from_stop_ids,
@@ -2647,12 +2665,31 @@ async fn service_day_journeys_db(
         )
         .await
         {
-            Ok(Ok(journeys)) => Ok((journeys, TransferSearchStatus::Complete)),
+            Ok(Ok(journeys)) => {
+                tracing::debug!(
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    timeout_seconds,
+                    candidates = journeys.len(),
+                    from_stops = from_stop_ids.len(),
+                    to_stops = to_stop_ids.len(),
+                    "transfer journey database query completed"
+                );
+                Ok((journeys, TransferSearchStatus::Complete))
+            }
             Ok(Err(error)) => {
                 tracing::warn!(%error, "transfer journey database query failed");
                 Ok((Vec::new(), TransferSearchStatus::Failed))
             }
-            Err(_) => Ok((Vec::new(), TransferSearchStatus::TimedOut)),
+            Err(_) => {
+                tracing::warn!(
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    timeout_seconds,
+                    from_stops = from_stop_ids.len(),
+                    to_stops = to_stop_ids.len(),
+                    "transfer journey database query timed out"
+                );
+                Ok((Vec::new(), TransferSearchStatus::TimedOut))
+            }
         }
     };
 
@@ -3585,14 +3622,25 @@ async fn one_transfer_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
-        origin_departures AS MATERIALIZED (
+        origin_departures_unbounded AS (
           SELECT DISTINCT ON (stop_time.trip_id)
             stop_time.trip_id,
             stop_time.stop_id,
             stop_time.stop_sequence,
-            stop_time.departure_time
+            stop_time.departure_time,
+            CASE
+              WHEN lower(endpoint_route.mode) IN ('train', 'rail') OR endpoint_route.gtfs_route_type = 2 OR endpoint_route.gtfs_route_type BETWEEN 100 AND 199 OR endpoint_route.gtfs_route_type BETWEEN 400 AND 499 OR lower(endpoint_route.id) LIKE '%train%' OR lower(endpoint_route.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(endpoint_route.mode) = 'tram' OR endpoint_route.gtfs_route_type = 0 OR endpoint_route.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
+              WHEN lower(endpoint_route.mode) = 'metro' OR endpoint_route.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(endpoint_route.mode) = 'bus' OR endpoint_route.gtfs_route_type = 3 OR endpoint_route.gtfs_route_type BETWEEN 200 AND 299 OR endpoint_route.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
+              WHEN lower(endpoint_route.mode) = 'ferry' OR endpoint_route.gtfs_route_type = 4 OR endpoint_route.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
+              WHEN lower(endpoint_route.mode) IN ('cable_car', 'cablecar') OR endpoint_route.gtfs_route_type = 5 OR endpoint_route.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
+              WHEN lower(endpoint_route.mode) = 'trolleybus' OR endpoint_route.gtfs_route_type = 11 OR endpoint_route.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS endpoint_mode
           FROM stop_times stop_time
           JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
+          JOIN routes endpoint_route ON endpoint_route.id = endpoint_trip.route_id
           LEFT JOIN latest_import_runs endpoint_import
             ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
@@ -3619,18 +3667,39 @@ async fn one_transfer_journeys_db(
           ORDER BY stop_time.trip_id, stop_time.departure_time ASC,
                    stop_time.stop_sequence ASC
         ),
-        destination_arrivals AS MATERIALIZED (
+        origin_departures AS MATERIALIZED (
+          SELECT *
+          FROM origin_departures_unbounded
+          WHERE endpoint_mode <> 'unknown'
+            AND ($4 = false OR endpoint_mode = ANY($5))
+          ORDER BY departure_time ASC, stop_sequence ASC
+          -- Bound endpoint trips before expanding each trip into all possible transfer stops.
+          LIMIT LEAST(GREATEST($9 * 20, 200), 2000)
+        ),
+        destination_arrivals_unbounded AS (
           SELECT DISTINCT ON (stop_time.trip_id)
             stop_time.trip_id,
             stop_time.stop_id,
             stop_time.stop_sequence,
-            stop_time.arrival_time
+            stop_time.arrival_time,
+            CASE
+              WHEN lower(endpoint_route.mode) IN ('train', 'rail') OR endpoint_route.gtfs_route_type = 2 OR endpoint_route.gtfs_route_type BETWEEN 100 AND 199 OR endpoint_route.gtfs_route_type BETWEEN 400 AND 499 OR lower(endpoint_route.id) LIKE '%train%' OR lower(endpoint_route.source_id) LIKE '%train%' THEN 'train'
+              WHEN lower(endpoint_route.mode) = 'tram' OR endpoint_route.gtfs_route_type = 0 OR endpoint_route.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
+              WHEN lower(endpoint_route.mode) = 'metro' OR endpoint_route.gtfs_route_type = 1 THEN 'metro'
+              WHEN lower(endpoint_route.mode) = 'bus' OR endpoint_route.gtfs_route_type = 3 OR endpoint_route.gtfs_route_type BETWEEN 200 AND 299 OR endpoint_route.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
+              WHEN lower(endpoint_route.mode) = 'ferry' OR endpoint_route.gtfs_route_type = 4 OR endpoint_route.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
+              WHEN lower(endpoint_route.mode) IN ('cable_car', 'cablecar') OR endpoint_route.gtfs_route_type = 5 OR endpoint_route.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
+              WHEN lower(endpoint_route.mode) = 'trolleybus' OR endpoint_route.gtfs_route_type = 11 OR endpoint_route.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
+              ELSE 'unknown'
+            END AS endpoint_mode
           FROM stop_times stop_time
           JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
+          JOIN routes endpoint_route ON endpoint_route.id = endpoint_trip.route_id
           LEFT JOIN latest_import_runs endpoint_import
             ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
           WHERE stop_time.stop_id = ANY($2)
+            AND stop_time.arrival_time >= $3 + $6
             AND COALESCE(stop_time.drop_off_type, 0) = 0
             AND (
               endpoint_trip.service_id IN (SELECT service_id FROM active_services)
@@ -3651,6 +3720,15 @@ async fn one_transfer_journeys_db(
             )
           ORDER BY stop_time.trip_id, stop_time.arrival_time ASC,
                    stop_time.stop_sequence ASC
+        ),
+        destination_arrivals AS MATERIALIZED (
+          SELECT *
+          FROM destination_arrivals_unbounded
+          WHERE endpoint_mode <> 'unknown'
+            AND ($4 = false OR endpoint_mode = ANY($5))
+          ORDER BY arrival_time ASC, stop_sequence ASC
+          -- The former query expanded every destination trip before applying any limit.
+          LIMIT LEAST(GREATEST($9 * 20, 200), 2000)
         ),
         first_legs AS (
           SELECT
@@ -3713,7 +3791,7 @@ async fn one_transfer_journeys_db(
           WHERE first_mode <> 'unknown'
             AND ($4 = false OR first_mode = ANY($5))
           ORDER BY first_departure_time ASC, first_arrival_time ASC
-          LIMIT 4000
+          LIMIT LEAST(GREATEST($9 * 50, 500), 4000)
         ),
         second_legs AS (
           SELECT
@@ -3777,7 +3855,7 @@ async fn one_transfer_journeys_db(
           WHERE second_mode <> 'unknown'
             AND ($4 = false OR second_mode = ANY($5))
           ORDER BY second_arrival_time ASC, second_departure_time DESC
-          LIMIT 4000
+          LIMIT LEAST(GREATEST($9 * 50, 500), 4000)
         ),
         candidate_journeys AS (
           SELECT
@@ -6577,14 +6655,14 @@ mod tests {
     fn transfer_search_warnings_distinguish_timeout_from_database_failure() {
         let mut warnings = Vec::new();
 
-        append_transfer_search_warning(&mut warnings, TransferSearchStatus::TimedOut, false);
-        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Failed, true);
-        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Complete, false);
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::TimedOut, false, 30);
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Failed, true, 30);
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Complete, false, 30);
 
         assert_eq!(
             warnings,
             vec![
-                "transfer search timed out; direct journeys are still included",
+                "transfer search exceeded the configured 30s timeout; direct journeys are still included",
                 "next service-day transfer search failed; direct journeys are still included",
             ]
         );

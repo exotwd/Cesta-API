@@ -127,6 +127,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0010_journey_search_indexes",
         include_str!("../../../../infra/postgres/migrations/0010_journey_search_indexes.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0011_transfer_search_indexes",
+        include_str!("../../../../infra/postgres/migrations/0011_transfer_search_indexes.sql"),
+    )
     .await
 }
 
