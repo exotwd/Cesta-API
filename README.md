@@ -1,5 +1,8 @@
 # Cesta API
 
+The Rust API uses layered routes, controllers, services, repositories, and infrastructure modules.
+See [API architecture](docs/api-architecture.md) for dependency rules and the endpoint workflow.
+
 Cesta API is the backend foundation for Czech public transport data. It includes an embedded operational admin interface while keeping passenger-facing mobile and web applications outside this repository.
 
 ## What Is Implemented
