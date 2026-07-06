@@ -4062,21 +4062,12 @@ async fn query_journeys_db(
         (current_service_day_search.await, None)
     };
 
-    let (mut journeys, transfer_search_timed_out) = current_service_day_result?;
-    if transfer_search_timed_out {
-        warnings.push(
-            "transfer search did not complete; direct journeys are still included".to_string(),
-        );
-    }
+    let (mut journeys, transfer_search_status) = current_service_day_result?;
+    append_transfer_search_warning(&mut warnings, transfer_search_status, false);
 
     if let Some(next_service_day_result) = next_service_day_result {
-        let (next_service_day_journeys, next_transfer_search_timed_out) = next_service_day_result?;
-        if next_transfer_search_timed_out {
-            warnings.push(
-                "next service-day transfer search did not complete; direct journeys are still included"
-                    .to_string(),
-            );
-        }
+        let (next_service_day_journeys, next_transfer_search_status) = next_service_day_result?;
+        append_transfer_search_warning(&mut warnings, next_transfer_search_status, true);
         let mut next_service_day_journeys = next_service_day_journeys
             .into_iter()
             .map(|journey| shift_journey_service_day(journey, SERVICE_DAY_SECONDS))
@@ -4090,7 +4081,7 @@ async fn query_journeys_db(
         }
     }
     if journeys.is_empty() && !include_next_service_day {
-        let (next_service_day_journeys, next_transfer_search_timed_out) = service_day_journeys_db(
+        let (next_service_day_journeys, next_transfer_search_status) = service_day_journeys_db(
             pool,
             &from_stop_ids,
             &to_stop_ids,
@@ -4101,12 +4092,7 @@ async fn query_journeys_db(
             &routing_config,
         )
         .await?;
-        if next_transfer_search_timed_out {
-            warnings.push(
-                "next service-day transfer search did not complete; direct journeys are still included"
-                    .to_string(),
-            );
-        }
+        append_transfer_search_warning(&mut warnings, next_transfer_search_status, true);
         let mut next_service_day_journeys =
             next_service_day_journey_results(next_service_day_journeys, departure_time);
         if !next_service_day_journeys.is_empty() {
@@ -4164,6 +4150,34 @@ async fn query_journeys_db(
     Ok((journey_values, warnings, related))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferSearchStatus {
+    Complete,
+    TimedOut,
+    Failed,
+}
+
+fn append_transfer_search_warning(
+    warnings: &mut Vec<String>,
+    status: TransferSearchStatus,
+    next_service_day: bool,
+) {
+    let prefix = if next_service_day {
+        "next service-day transfer search"
+    } else {
+        "transfer search"
+    };
+    match status {
+        TransferSearchStatus::Complete => {}
+        TransferSearchStatus::TimedOut => warnings.push(format!(
+            "{prefix} timed out; direct journeys are still included"
+        )),
+        TransferSearchStatus::Failed => warnings.push(format!(
+            "{prefix} failed; direct journeys are still included"
+        )),
+    }
+}
+
 async fn unverified_journey_service_count(
     pool: &PgPool,
     journeys: &[Journey],
@@ -4202,7 +4216,7 @@ async fn service_day_journeys_db(
     max_transfers: u32,
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
-) -> Result<(Vec<Journey>, bool), sqlx::Error> {
+) -> Result<(Vec<Journey>, TransferSearchStatus), sqlx::Error> {
     let direct_search = direct_journeys_db(
         pool,
         from_stop_ids,
@@ -4214,7 +4228,7 @@ async fn service_day_journeys_db(
     );
     let transfer_search = async {
         if max_transfers == 0 {
-            return Ok::<_, sqlx::Error>((Vec::new(), false));
+            return Ok::<_, sqlx::Error>((Vec::new(), TransferSearchStatus::Complete));
         }
 
         match time::timeout(
@@ -4233,17 +4247,20 @@ async fn service_day_journeys_db(
         )
         .await
         {
-            Ok(Ok(journeys)) => Ok((journeys, false)),
-            Ok(Err(_)) => Ok((Vec::new(), true)),
-            Err(_) => Ok((Vec::new(), true)),
+            Ok(Ok(journeys)) => Ok((journeys, TransferSearchStatus::Complete)),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "transfer journey database query failed");
+                Ok((Vec::new(), TransferSearchStatus::Failed))
+            }
+            Err(_) => Ok((Vec::new(), TransferSearchStatus::TimedOut)),
         }
     };
 
     let (direct_result, transfer_result) = tokio::join!(direct_search, transfer_search);
     let mut journeys = direct_result?;
-    let (mut transfer_journeys, transfer_search_timed_out) = transfer_result?;
+    let (mut transfer_journeys, transfer_search_status) = transfer_result?;
     journeys.append(&mut transfer_journeys);
-    Ok((journeys, transfer_search_timed_out))
+    Ok((journeys, transfer_search_status))
 }
 
 fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
@@ -5168,6 +5185,73 @@ async fn one_transfer_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
+        origin_departures AS MATERIALIZED (
+          SELECT DISTINCT ON (stop_time.trip_id)
+            stop_time.trip_id,
+            stop_time.stop_id,
+            stop_time.stop_sequence,
+            stop_time.departure_time
+          FROM stop_times stop_time
+          JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
+          LEFT JOIN latest_import_runs endpoint_import
+            ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
+           AND endpoint_import.import_run_id = endpoint_trip.import_run_id
+          WHERE stop_time.stop_id = ANY($1)
+            AND stop_time.departure_time >= $3
+            AND COALESCE(stop_time.pickup_type, 0) = 0
+            AND (
+              endpoint_trip.service_id IN (SELECT service_id FROM active_services)
+              OR NOT EXISTS (
+                SELECT 1 FROM calendars
+                WHERE source_feed_id = endpoint_trip.source_feed_id
+              ) AND NOT EXISTS (
+                SELECT 1 FROM calendar_dates
+                WHERE source_feed_id = endpoint_trip.source_feed_id
+              )
+            )
+            AND (
+              endpoint_import.import_run_id IS NOT NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM latest_import_runs latest_for_feed
+                WHERE latest_for_feed.source_feed_id = endpoint_trip.source_feed_id
+              )
+            )
+          ORDER BY stop_time.trip_id, stop_time.departure_time ASC,
+                   stop_time.stop_sequence ASC
+        ),
+        destination_arrivals AS MATERIALIZED (
+          SELECT DISTINCT ON (stop_time.trip_id)
+            stop_time.trip_id,
+            stop_time.stop_id,
+            stop_time.stop_sequence,
+            stop_time.arrival_time
+          FROM stop_times stop_time
+          JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
+          LEFT JOIN latest_import_runs endpoint_import
+            ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
+           AND endpoint_import.import_run_id = endpoint_trip.import_run_id
+          WHERE stop_time.stop_id = ANY($2)
+            AND COALESCE(stop_time.drop_off_type, 0) = 0
+            AND (
+              endpoint_trip.service_id IN (SELECT service_id FROM active_services)
+              OR NOT EXISTS (
+                SELECT 1 FROM calendars
+                WHERE source_feed_id = endpoint_trip.source_feed_id
+              ) AND NOT EXISTS (
+                SELECT 1 FROM calendar_dates
+                WHERE source_feed_id = endpoint_trip.source_feed_id
+              )
+            )
+            AND (
+              endpoint_import.import_run_id IS NOT NULL
+              OR NOT EXISTS (
+                SELECT 1 FROM latest_import_runs latest_for_feed
+                WHERE latest_for_feed.source_feed_id = endpoint_trip.source_feed_id
+              )
+            )
+          ORDER BY stop_time.trip_id, stop_time.arrival_time ASC,
+                   stop_time.stop_sequence ASC
+        ),
         first_legs AS MATERIALIZED (
           SELECT
             st_from.trip_id AS first_trip_id,
@@ -5197,7 +5281,7 @@ async fn one_transfer_journeys_db(
               WHEN lower(r.mode) = 'trolleybus' OR r.gtfs_route_type = 11 OR r.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
               ELSE 'unknown'
             END AS first_mode
-          FROM stop_times st_from
+          FROM origin_departures st_from
           JOIN stop_times st_mid
             ON st_mid.trip_id = st_from.trip_id
            AND st_mid.stop_sequence > st_from.stop_sequence
@@ -5209,9 +5293,7 @@ async fn one_transfer_journeys_db(
             ON lir.source_feed_id = t.source_feed_id
            AND lir.import_run_id = t.import_run_id
           JOIN routes r ON r.id = t.route_id
-          WHERE st_from.stop_id = ANY($1)
-            AND st_from.departure_time >= $3
-            AND (
+          WHERE (
               t.service_id IN (SELECT service_id FROM active_services)
               OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = t.source_feed_id)
                  AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = t.source_feed_id)
@@ -5223,7 +5305,6 @@ async fn one_transfer_journeys_db(
                 WHERE latest_for_feed.source_feed_id = t.source_feed_id
               )
             )
-            AND COALESCE(st_from.pickup_type, 0) = 0
             AND COALESCE(st_mid.drop_off_type, 0) = 0
           ORDER BY st_from.departure_time ASC, st_mid.arrival_time ASC
           LIMIT 4000
@@ -5263,7 +5344,7 @@ async fn one_transfer_journeys_db(
               WHEN lower(r2.mode) = 'trolleybus' OR r2.gtfs_route_type = 11 OR r2.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
               ELSE 'unknown'
             END AS second_mode
-          FROM stop_times st_to
+          FROM destination_arrivals st_to
           JOIN stop_times st_transfer
             ON st_transfer.trip_id = st_to.trip_id
            AND st_transfer.stop_sequence < st_to.stop_sequence
@@ -5275,8 +5356,7 @@ async fn one_transfer_journeys_db(
             ON lir2.source_feed_id = t2.source_feed_id
            AND lir2.import_run_id = t2.import_run_id
           JOIN routes r2 ON r2.id = t2.route_id
-          WHERE st_to.stop_id = ANY($2)
-            AND st_transfer.departure_time >= $3 + $6
+          WHERE st_transfer.departure_time >= $3 + $6
             AND (
               t2.service_id IN (SELECT service_id FROM active_services)
               OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = t2.source_feed_id)
@@ -5290,7 +5370,6 @@ async fn one_transfer_journeys_db(
               )
             )
             AND COALESCE(st_transfer.pickup_type, 0) = 0
-            AND COALESCE(st_to.drop_off_type, 0) = 0
           ORDER BY st_to.arrival_time ASC, st_transfer.departure_time DESC
           LIMIT 4000
         ),
@@ -8089,6 +8168,23 @@ mod tests {
         };
         assert!(no_time_objective.validate().is_err());
         assert!(RoutingAlgorithmConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn transfer_search_warnings_distinguish_timeout_from_database_failure() {
+        let mut warnings = Vec::new();
+
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::TimedOut, false);
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Failed, true);
+        append_transfer_search_warning(&mut warnings, TransferSearchStatus::Complete, false);
+
+        assert_eq!(
+            warnings,
+            vec![
+                "transfer search timed out; direct journeys are still included",
+                "next service-day transfer search failed; direct journeys are still included",
+            ]
+        );
     }
 
     #[test]
