@@ -8,15 +8,17 @@ pub(crate) async fn search_stops(
     let normalized = normalize_search_text(&q);
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
     if let Some(pool) = &state.db {
-        return match search_stops_db(pool, &q, &normalized, 50).await {
+        let (stops_result, cities) = if query.include_cities {
+            let (stops, cities) = tokio::join!(
+                search_stops_db(pool, &q, &normalized, 50),
+                search_cities_db(pool, &q, &normalized, 50)
+            );
+            (stops, cities.unwrap_or_default())
+        } else {
+            (search_stops_db(pool, &q, &normalized, 50).await, Vec::new())
+        };
+        return match stops_result {
             Ok(stops) => {
-                let cities = if query.include_cities {
-                    search_cities_db(pool, &q, &normalized, 50)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
                 let (results, visible_cities, visible_stops) =
                     ranked_place_suggestions(&cities, &stops, &normalized, limit);
                 let related = stop_search_related_data_db(pool, &visible_stops)

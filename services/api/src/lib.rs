@@ -4677,7 +4677,7 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         }));
     }
 
-    let source_ids = sqlx::query(
+    let source_ids_query = sqlx::query(
         r#"
         SELECT stop_id, source_feed_id, original_source_id, import_run_id, priority,
                confidence, suppressed_as_duplicate
@@ -4687,53 +4687,29 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         "#,
     )
     .bind(&stop_ids)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|row| {
-        let feed_id = row.get::<String, _>("source_feed_id");
-        source_feed_ids.insert(feed_id.clone());
-        json!({
-            "stop_id": row.get::<String, _>("stop_id"),
-            "source_feed_id": feed_id,
-            "original_source_id": row.get::<String, _>("original_source_id"),
-            "import_run_id": row.get::<Option<Uuid>, _>("import_run_id"),
-            "priority": row.get::<i32, _>("priority"),
-            "confidence": row.get::<Option<String>, _>("confidence"),
-            "suppressed_as_duplicate": row.get::<bool, _>("suppressed_as_duplicate")
-        })
-    })
-    .collect::<Vec<_>>();
+    .fetch_all(pool);
 
-    let stop_areas = if stop_area_ids.is_empty() {
-        Vec::new()
-    } else {
-        sqlx::query(
-            r#"
-            SELECT id, name,
-                   CASE WHEN geom IS NULL THEN NULL ELSE ST_Y(geom::geometry) END AS lat,
-                   CASE WHEN geom IS NULL THEN NULL ELSE ST_X(geom::geometry) END AS lon
-            FROM stop_areas
-            WHERE id = ANY($1)
-            ORDER BY name ASC
-            "#,
-        )
-        .bind(&stop_area_ids)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            json!({
-                "id": row.get::<String, _>("id"),
-                "name": row.get::<String, _>("name"),
-                "lat": row.get::<Option<f64>, _>("lat"),
-                "lon": row.get::<Option<f64>, _>("lon")
-            })
-        })
-        .collect::<Vec<_>>()
+    let stop_areas_query = async {
+        if stop_area_ids.is_empty() {
+            Ok(Vec::new())
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, name,
+                       CASE WHEN geom IS NULL THEN NULL ELSE ST_Y(geom::geometry) END AS lat,
+                       CASE WHEN geom IS NULL THEN NULL ELSE ST_X(geom::geometry) END AS lon
+                FROM stop_areas
+                WHERE id = ANY($1)
+                ORDER BY name ASC
+                "#,
+            )
+            .bind(&stop_area_ids)
+            .fetch_all(pool)
+            .await
+        }
     };
 
-    let route_rows = sqlx::query(
+    let routes_query = sqlx::query(
         r#"
         SELECT DISTINCT r.id, r.source_feed_id, r.source_id, r.agency_id, r.operator_id,
                r.short_name, r.long_name, r.mode, r.gtfs_route_type, r.color, r.text_color,
@@ -4747,8 +4723,40 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         "#,
     )
     .bind(&stop_ids)
-    .fetch_all(pool)
-    .await?;
+    .fetch_all(pool);
+
+    let (source_id_rows, stop_area_rows, route_rows) =
+        tokio::try_join!(source_ids_query, stop_areas_query, routes_query)?;
+
+    let source_ids = source_id_rows
+        .into_iter()
+        .map(|row| {
+            let feed_id = row.get::<String, _>("source_feed_id");
+            source_feed_ids.insert(feed_id.clone());
+            json!({
+                "stop_id": row.get::<String, _>("stop_id"),
+                "source_feed_id": feed_id,
+                "original_source_id": row.get::<String, _>("original_source_id"),
+                "import_run_id": row.get::<Option<Uuid>, _>("import_run_id"),
+                "priority": row.get::<i32, _>("priority"),
+                "confidence": row.get::<Option<String>, _>("confidence"),
+                "suppressed_as_duplicate": row.get::<bool, _>("suppressed_as_duplicate")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let stop_areas = stop_area_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<String, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "lat": row.get::<Option<f64>, _>("lat"),
+                "lon": row.get::<Option<f64>, _>("lon")
+            })
+        })
+        .collect::<Vec<_>>();
+
     let routes = route_rows
         .into_iter()
         .map(|row| {
