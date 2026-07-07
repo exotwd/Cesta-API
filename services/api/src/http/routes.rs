@@ -107,6 +107,7 @@ fn transit_routes() -> Router<AppState> {
     Router::new()
         .route("/stops/search", get(search_stops))
         .route("/stops/nearby", get(nearby_stops))
+        .route("/stops/in-bounds", get(stops_in_bounds))
         .route("/stops/{id}", get(stop_detail))
         .route("/stop-areas/{id}", get(stop_area))
         .route("/departures", get(departures))

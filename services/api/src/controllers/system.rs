@@ -59,6 +59,25 @@ pub(crate) async fn openapi() -> Json<Value> {
                     "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PlaceSearchResponse"}}}
                 }}
             }},
+            "/stops/in-bounds": {"get": {
+                "summary": "List stops in map bounds",
+                "description": "Returns active stops inside the visible rectangular map bounds, ordered by ID for cursor pagination. Repeat the same bounds with nextCursor as cursor until nextCursor is null.",
+                "parameters": [
+                    {"name": "south", "in": "query", "required": true, "schema": {"type": "number", "minimum": -90, "maximum": 90}},
+                    {"name": "west", "in": "query", "required": true, "schema": {"type": "number", "minimum": -180, "maximum": 180}},
+                    {"name": "north", "in": "query", "required": true, "schema": {"type": "number", "minimum": -90, "maximum": 90}},
+                    {"name": "east", "in": "query", "required": true, "schema": {"type": "number", "minimum": -180, "maximum": 180}},
+                    {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 500}},
+                    {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Stops in the requested viewport",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StopsInBoundsResponse"}}}
+                    },
+                    "400": {"description": "Invalid or reversed bounds"}
+                }
+            }},
             "/departures": {"get": {"summary": "Stop departures"}},
             "/journeys/search": {"post": {
                 "summary": "Search journeys",
@@ -197,6 +216,49 @@ pub(crate) async fn openapi() -> Json<Value> {
                         },
                         "cities": {"type": "array", "items": {"$ref": "#/components/schemas/CitySearchResult"}},
                         "stops": {"type": "array", "items": {"$ref": "#/components/schemas/StopSearchResult"}}
+                    }
+                },
+                "StopsInBoundsResponse": {
+                    "type": "object",
+                    "required": ["stops", "nextCursor", "data_status"],
+                    "properties": {
+                        "stops": {"type": "array", "items": {"$ref": "#/components/schemas/Stop"}},
+                        "nextCursor": {"type": ["string", "null"]},
+                        "data_status": {"type": "object"}
+                    }
+                },
+                "Stop": {
+                    "type": "object",
+                    "required": ["id", "source_ids", "name", "normalized_name", "modes", "coordinate_confidence", "is_active"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "source_ids": {"type": "array", "items": {"$ref": "#/components/schemas/StopSourceRef"}},
+                        "name": {"type": "string"},
+                        "normalized_name": {"type": "string"},
+                        "municipality": {"type": ["string", "null"]},
+                        "district": {"type": ["string", "null"]},
+                        "region": {"type": ["string", "null"]},
+                        "lat": {"type": ["number", "null"]},
+                        "lon": {"type": ["number", "null"]},
+                        "geom": {"type": ["object", "null"]},
+                        "coordinate_confidence": {"type": "string", "enum": ["exact", "high", "medium", "low", "unresolved"]},
+                        "coordinate_source": {"type": ["string", "null"]},
+                        "stop_area_id": {"type": ["string", "null"]},
+                        "platform_code": {"type": ["string", "null"]},
+                        "modes": {"type": "array", "items": {"type": "string"}},
+                        "is_active": {"type": "boolean"}
+                    }
+                },
+                "StopSourceRef": {
+                    "type": "object",
+                    "required": ["feed_id", "original_id", "priority", "suppressed_as_duplicate"],
+                    "properties": {
+                        "feed_id": {"type": "string"},
+                        "original_id": {"type": "string"},
+                        "import_run_id": {"type": ["string", "null"], "format": "uuid"},
+                        "priority": {"type": "integer"},
+                        "confidence": {"type": ["string", "null"]},
+                        "suppressed_as_duplicate": {"type": "boolean"}
                     }
                 },
                 "RoutingAlgorithmConfig": {

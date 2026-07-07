@@ -304,6 +304,61 @@ struct NearbyQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct StopsInBoundsQuery {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+impl StopsInBoundsQuery {
+    fn validate(&self) -> Result<(), ApiError> {
+        let valid_latitude = |value: f64| value.is_finite() && (-90.0..=90.0).contains(&value);
+        let valid_longitude = |value: f64| value.is_finite() && (-180.0..=180.0).contains(&value);
+
+        if !valid_latitude(self.south) || !valid_latitude(self.north) {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "south and north must be finite latitudes between -90 and 90".to_string(),
+            });
+        }
+        if !valid_longitude(self.west) || !valid_longitude(self.east) {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "west and east must be finite longitudes between -180 and 180".to_string(),
+            });
+        }
+        if self.south >= self.north {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "south must be less than north".to_string(),
+            });
+        }
+        if self.west >= self.east {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "west must be less than east".to_string(),
+            });
+        }
+        if self.limit.is_some_and(|limit| !(1..=1000).contains(&limit)) {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "limit must be between 1 and 1000".to_string(),
+            });
+        }
+        if self.cursor.as_ref().is_some_and(|cursor| cursor.is_empty()) {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "cursor must not be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct DeparturesQuery {
     #[serde(rename = "stopId")]
     stop_id: String,
@@ -4857,6 +4912,38 @@ async fn nearby_stops_db(
     rows.into_iter().map(stop_from_row).collect()
 }
 
+async fn stops_in_bounds_db(
+    pool: &PgPool,
+    bounds: &StopsInBoundsQuery,
+    limit: usize,
+) -> Result<Vec<Stop>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, modes, source_priority, is_active
+        FROM stops
+        WHERE is_active = true
+          AND geom IS NOT NULL
+          AND geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)::geography
+          AND ST_Covers(ST_MakeEnvelope($1, $2, $3, $4, 4326), geom::geometry)
+          AND ($5::text IS NULL OR id > $5)
+        ORDER BY id ASC
+        LIMIT $6
+        "#,
+    )
+    .bind(bounds.west)
+    .bind(bounds.south)
+    .bind(bounds.east)
+    .bind(bounds.north)
+    .bind(bounds.cursor.as_deref())
+    .bind((limit + 1) as i64)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(stop_from_row).collect()
+}
+
 async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Error> {
     let row = sqlx::query(
         r#"
@@ -5858,6 +5945,8 @@ mod tests {
         );
         assert!(payload["paths"]["/realtime/vehicles"].is_object());
         assert!(payload["paths"]["/data-sources/status"].is_object());
+        assert!(payload["paths"]["/stops/in-bounds"]["get"].is_object());
+        assert!(payload["components"]["schemas"]["StopsInBoundsResponse"].is_object());
         assert!(payload["components"]["schemas"]["JourneyLegRealtime"].is_object());
         assert_eq!(
             payload["paths"]["/journeys/search"]["post"]["requestBody"]["content"]["application/json"]
@@ -5866,6 +5955,82 @@ mod tests {
         );
         assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
         assert!(payload["paths"]["/admin/routing-algorithm"]["put"].is_object());
+    }
+
+    #[tokio::test]
+    async fn stops_in_bounds_returns_only_visible_fixture_stops() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/in-bounds?south=50.0&west=14.3&north=50.2&east=14.6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["stops"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["stops"][0]["id"], "stop-praha");
+        assert_eq!(payload["stops"][1]["id"], "stop-praha-hl-n");
+        assert!(payload["nextCursor"].is_null());
+        assert_eq!(payload["data_status"]["source"], "mock");
+    }
+
+    #[tokio::test]
+    async fn stops_in_bounds_cursor_pages_without_skipping_stops() {
+        let app = build_router(app_state().await.unwrap());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/in-bounds?south=50.0&west=14.3&north=50.2&east=14.6&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_payload: Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_payload["stops"][0]["id"], "stop-praha");
+        assert_eq!(first_payload["nextCursor"], "stop-praha");
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/in-bounds?south=50.0&west=14.3&north=50.2&east=14.6&limit=1&cursor=stop-praha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_payload: Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_payload["stops"][0]["id"], "stop-praha-hl-n");
+        assert!(second_payload["nextCursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn stops_in_bounds_rejects_reversed_bounds() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/in-bounds?south=50.2&west=14.3&north=50.0&east=14.6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], "validation_error");
+        assert_eq!(payload["message"], "south must be less than north");
     }
 
     #[tokio::test]

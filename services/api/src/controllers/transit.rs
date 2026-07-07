@@ -199,6 +199,73 @@ pub(crate) async fn nearby_stops(
     Json(json!({"stops": stops, "radius": radius, "data_status": mock_status(state.use_mock_data)}))
 }
 
+pub(crate) async fn stops_in_bounds(
+    State(state): State<AppState>,
+    Query(query): Query<StopsInBoundsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    query.validate()?;
+    let limit = query.limit.unwrap_or(500);
+
+    if let Some(pool) = &state.db {
+        return match stops_in_bounds_db(pool, &query, limit).await {
+            Ok(mut stops) => Ok(Json(stops_in_bounds_response(
+                &mut stops,
+                limit,
+                database_data_status(),
+            ))),
+            Err(error) => Ok(Json(json!({
+                "stops": [],
+                "nextCursor": null,
+                "data_status": {
+                    "source": "database",
+                    "schedule": "unknown",
+                    "realtime": "unavailable",
+                    "warnings": [format!("database in-bounds stop query failed: {error}")]
+                }
+            }))),
+        };
+    }
+
+    let mut stops = state
+        .stops
+        .iter()
+        .filter(|stop| stop.is_active)
+        .filter(|stop| {
+            stop.lat.zip(stop.lon).is_some_and(|(lat, lon)| {
+                lat >= query.south && lat <= query.north && lon >= query.west && lon <= query.east
+            })
+        })
+        .filter(|stop| {
+            query
+                .cursor
+                .as_ref()
+                .is_none_or(|cursor| stop.id.as_str() > cursor.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    stops.sort_by(|left, right| left.id.cmp(&right.id));
+    stops.truncate(limit + 1);
+
+    Ok(Json(stops_in_bounds_response(
+        &mut stops,
+        limit,
+        mock_status(state.use_mock_data),
+    )))
+}
+
+fn stops_in_bounds_response(stops: &mut Vec<Stop>, limit: usize, data_status: Value) -> Value {
+    let has_more = stops.len() > limit;
+    stops.truncate(limit);
+    let next_cursor = has_more
+        .then(|| stops.last().map(|stop| stop.id.clone()))
+        .flatten();
+    json!({
+        "stops": stops,
+        "nextCursor": next_cursor,
+        "data_status": data_status
+    })
+}
+
 pub(crate) async fn stop_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
