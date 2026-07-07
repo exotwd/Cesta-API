@@ -48,7 +48,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             "/auth/login": {"post": {"summary": "Login user"}},
             "/stops/search": {"get": {
                 "summary": "Search stops and cities",
-                "description": "Returns ranked stop suggestions. When includeCities is true, cities and stops are returned together in results and separately for backwards compatibility.",
+                "description": "Returns ranked stop suggestions. The canonical search parameter is q; query, text and term are accepted as compatibility aliases. When includeCities (or include_cities) is true, cities and stops are returned together in results and separately for backwards compatibility.",
                 "parameters": [
                     {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}},
                     {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}},

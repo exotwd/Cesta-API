@@ -19,7 +19,10 @@ use routing_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
-use tokio::{sync::RwLock, time};
+use tokio::{
+    sync::{OnceCell, RwLock},
+    time,
+};
 use transit_model::{
     CoordinateConfidence, Journey, JourneyLeg, OfflinePackage, RealtimeStatus, Stop, TicketOption,
     Transfer, TransportMode, normalize_czech_name,
@@ -75,6 +78,10 @@ const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
 const ADMIN_VALIDATION_SOURCE_FILE: &str = "admin_database_validation";
 const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
+
+type RaptorCacheKey = (chrono::NaiveDate, Option<DateTime<Utc>>);
+type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
+type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
 
 struct AdminEntitySpec {
     key: &'static str,
@@ -165,8 +172,7 @@ struct AppState {
     jwt_secret: String,
     use_mock_data: bool,
     ticketing: ticketing::TicketingService,
-    raptor_cache:
-        Arc<RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>>,
+    raptor_cache: RaptorCache,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,9 +283,10 @@ struct FavoriteStop {
 
 #[derive(Debug, Deserialize)]
 struct StopSearchQuery {
+    #[serde(default, alias = "query", alias = "text", alias = "term")]
     q: Option<String>,
     limit: Option<usize>,
-    #[serde(rename = "includeCities", default)]
+    #[serde(rename = "includeCities", alias = "include_cities", default)]
     include_cities: bool,
 }
 
@@ -641,6 +648,15 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         ticketing,
         raptor_cache: Arc::new(RwLock::new(HashMap::new())),
     };
+    if let Some(pool) = state.db.clone() {
+        let cache = state.raptor_cache.clone();
+        tokio::spawn(async move {
+            let service_date = chrono::Local::now().date_naive();
+            if let Err(error) = raptor_timetable_cached_db(&pool, &cache, service_date).await {
+                tracing::warn!(%error, %service_date, "background RAPTOR timetable warmup failed");
+            }
+        });
+    }
     state
         .ticketing
         .start_refund_reconciliation(std::time::Duration::from_secs(
@@ -2412,9 +2428,7 @@ async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error>
 
 async fn query_journeys_db(
     pool: &PgPool,
-    raptor_cache: &Arc<
-        RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>,
-    >,
+    raptor_cache: &RaptorCache,
     body: &JourneySearchBody,
     departure_time: u32,
     service_date: chrono::NaiveDate,
@@ -2638,9 +2652,7 @@ async fn unverified_journey_service_count(
 #[allow(clippy::too_many_arguments)]
 async fn service_day_journeys_db(
     pool: &PgPool,
-    raptor_cache: &Arc<
-        RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>,
-    >,
+    raptor_cache: &RaptorCache,
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
@@ -2669,7 +2681,7 @@ async fn service_day_journeys_db(
     tracing::debug!(
         elapsed_ms = started_at.elapsed().as_millis(),
         candidates = journeys.len(),
-        trips = timetable.trips.len(),
+        trips = timetable.trip_count(),
         service_date = %service_date,
         "RAPTOR journey search completed"
     );
@@ -2679,7 +2691,7 @@ async fn service_day_journeys_db(
 
 async fn raptor_timetable_cached_db(
     pool: &PgPool,
-    cache: &Arc<RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>>,
+    cache: &RaptorCache,
     service_date: chrono::NaiveDate,
 ) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
     let latest_import = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
@@ -2688,14 +2700,17 @@ async fn raptor_timetable_cached_db(
     .fetch_one(pool)
     .await?;
     let key = (service_date, latest_import);
-    if let Some(timetable) = cache.read().await.get(&key).cloned() {
-        return Ok(timetable);
-    }
-    let timetable = Arc::new(raptor_timetable_db(pool, service_date).await?);
-    let mut cache = cache.write().await;
-    cache.retain(|(date, import), _| *date != service_date || *import == latest_import);
-    cache.insert(key, timetable.clone());
-    Ok(timetable)
+    let cell = {
+        let mut cache = cache.write().await;
+        cache.retain(|(date, import), _| *date != service_date || *import == latest_import);
+        cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+    cell.get_or_try_init(|| async { raptor_timetable_db(pool, service_date).await.map(Arc::new) })
+        .await
+        .cloned()
 }
 
 async fn raptor_timetable_db(
@@ -2808,7 +2823,7 @@ async fn raptor_timetable_db(
         source: row.get("source"),
     })
     .collect();
-    Ok(RaptorTimetable { trips, transfers })
+    Ok(RaptorTimetable::new(trips, transfers))
 }
 
 fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
@@ -6243,6 +6258,47 @@ mod tests {
                 result["place_type"] != "city" && result["id"] != "city:CZ:554782"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn stop_suggester_accepts_common_query_parameter_aliases() {
+        for parameter in ["query", "text", "term"] {
+            let app = build_router(app_state().await.unwrap());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/stops/search?{parameter}=Brno&limit=1"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            let stops = payload["stops"].as_array().unwrap();
+            assert_eq!(stops.len(), 1);
+            assert_eq!(stops[0]["id"], "stop-brno-hl-n");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_suggester_accepts_snake_case_city_flag() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/search?query=Praha&include_cities=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| result["place_type"] == "city")
+        }));
     }
 
     fn journey_search_request(

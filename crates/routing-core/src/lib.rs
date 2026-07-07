@@ -47,10 +47,78 @@ pub struct RaptorTrip {
     pub stop_times: Vec<RaptorStopTime>,
 }
 
+#[derive(Debug, Clone)]
+struct RaptorRoute {
+    trips: Vec<RaptorTrip>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RaptorTimetable {
-    pub trips: Vec<RaptorTrip>,
-    pub transfers: Vec<Transfer>,
+    routes: Vec<RaptorRoute>,
+    stop_routes: HashMap<String, Vec<(usize, usize)>>,
+    transfers_by_stop: HashMap<String, Vec<Transfer>>,
+    trip_count: usize,
+}
+
+impl RaptorTimetable {
+    pub fn new(trips: Vec<RaptorTrip>, transfers: Vec<Transfer>) -> Self {
+        let trip_count = trips.len();
+        let mut grouped = HashMap::<(TransportMode, Vec<String>), Vec<RaptorTrip>>::new();
+        for trip in trips {
+            let key = (
+                trip.mode.clone(),
+                trip.stop_times
+                    .iter()
+                    .map(|stop| stop.stop_id.clone())
+                    .collect(),
+            );
+            grouped.entry(key).or_default().push(trip);
+        }
+        let mut routes = grouped
+            .into_values()
+            .map(|mut trips| {
+                trips.sort_by_key(|trip| {
+                    trip.stop_times
+                        .first()
+                        .map_or(u32::MAX, |stop| stop.departure_time)
+                });
+                RaptorRoute { trips }
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by(|left, right| {
+            left.trips[0]
+                .route_id
+                .cmp(&right.trips[0].route_id)
+                .then_with(|| left.trips[0].trip_id.cmp(&right.trips[0].trip_id))
+        });
+
+        let mut stop_routes = HashMap::<String, Vec<(usize, usize)>>::new();
+        for (route_index, route) in routes.iter().enumerate() {
+            for (stop_index, stop) in route.trips[0].stop_times.iter().enumerate() {
+                stop_routes
+                    .entry(stop.stop_id.clone())
+                    .or_default()
+                    .push((route_index, stop_index));
+            }
+        }
+        let mut transfers_by_stop = HashMap::<String, Vec<Transfer>>::new();
+        for transfer in transfers {
+            transfers_by_stop
+                .entry(transfer.from_stop_id.clone())
+                .or_default()
+                .push(transfer);
+        }
+        Self {
+            routes,
+            stop_routes,
+            transfers_by_stop,
+            trip_count,
+        }
+    }
+
+    pub fn trip_count(&self) -> usize {
+        self.trip_count
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,21 +154,6 @@ enum RaptorParent {
 /// Each round boards one additional trip; walking transfers stay in the same round.
 pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journey> {
     let allowed_modes = request.modes.into_iter().collect::<HashSet<_>>();
-    let mut route_groups = HashMap::<(TransportMode, Vec<String>), Vec<&RaptorTrip>>::new();
-    for trip in &timetable.trips {
-        if allowed_modes.is_empty() || allowed_modes.contains(&trip.mode) {
-            route_groups
-                .entry((
-                    trip.mode.clone(),
-                    trip.stop_times
-                        .iter()
-                        .map(|stop| stop.stop_id.clone())
-                        .collect(),
-                ))
-                .or_default()
-                .push(trip);
-        }
-    }
     let target_stops = request.to_stop_ids.iter().cloned().collect::<HashSet<_>>();
     let max_rounds = request.max_transfers as usize + 1;
     let mut best = HashMap::<String, u32>::new();
@@ -119,7 +172,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
         &mut best,
         &mut marked,
         &mut parents,
-        &timetable.transfers,
+        &timetable.transfers_by_stop,
         u32::MAX,
     );
 
@@ -128,6 +181,16 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             break;
         }
         let previous_marked = std::mem::take(&mut marked);
+        let mut routes_to_scan = HashMap::<usize, usize>::new();
+        for stop in &previous_marked {
+            for &(route_index, stop_index) in timetable.stop_routes.get(stop).into_iter().flatten()
+            {
+                routes_to_scan
+                    .entry(route_index)
+                    .and_modify(|earliest| *earliest = (*earliest).min(stop_index))
+                    .or_insert(stop_index);
+            }
+        }
         let best_target = target_stops
             .iter()
             .filter_map(|stop| best.get(stop))
@@ -135,14 +198,12 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             .min()
             .unwrap_or(u32::MAX);
 
-        for trips in route_groups.values() {
-            let stops = &trips[0].stop_times;
-            let Some(start_index) = stops
-                .iter()
-                .position(|stop| previous_marked.contains(&stop.stop_id))
-            else {
+        for (route_index, start_index) in routes_to_scan {
+            let trips = &timetable.routes[route_index].trips;
+            if !allowed_modes.is_empty() && !allowed_modes.contains(&trips[0].mode) {
                 continue;
-            };
+            }
+            let stops = &trips[0].stop_times;
             let mut current_trip: Option<(&RaptorTrip, usize)> = None;
             for index in start_index..stops.len() {
                 let stop_id = &stops[index].stop_id;
@@ -186,7 +247,6 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
                 let ready_time = previous_arrival.saturating_add(transfer_slack);
                 let catchable = trips
                     .iter()
-                    .copied()
                     .filter(|trip| {
                         let stop = &trip.stop_times[index];
                         stop.pickup_allowed && ready_time <= stop.departure_time
@@ -215,7 +275,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             &mut best,
             &mut marked,
             &mut parents,
-            &timetable.transfers,
+            &timetable.transfers_by_stop,
             best_target,
         );
     }
@@ -259,7 +319,7 @@ fn relax_raptor_transfers(
     best: &mut HashMap<String, u32>,
     marked: &mut HashSet<String>,
     parents: &mut HashMap<(usize, String), RaptorParent>,
-    transfers: &[Transfer],
+    transfers_by_stop: &HashMap<String, Vec<Transfer>>,
     best_target: u32,
 ) {
     let mut queue = marked.iter().cloned().collect::<Vec<_>>();
@@ -267,10 +327,7 @@ fn relax_raptor_transfers(
         let Some(departure_time) = rounds[round].get(&from).copied() else {
             continue;
         };
-        for transfer in transfers
-            .iter()
-            .filter(|transfer| transfer.from_stop_id == from)
-        {
+        for transfer in transfers_by_stop.get(&from).into_iter().flatten() {
             let arrival_time = departure_time.saturating_add(transfer.min_transfer_seconds);
             if arrival_time >= best_target
                 || arrival_time >= best.get(&transfer.to_stop_id).copied().unwrap_or(u32::MAX)
@@ -703,8 +760,8 @@ mod tests {
             pickup_allowed: true,
             drop_off_allowed: true,
         };
-        let timetable = RaptorTimetable {
-            trips: vec![
+        let timetable = RaptorTimetable::new(
+            vec![
                 RaptorTrip {
                     trip_id: "direct".into(),
                     route_id: "r-direct".into(),
@@ -733,8 +790,8 @@ mod tests {
                     ],
                 },
             ],
-            transfers: Vec::new(),
-        };
+            Vec::new(),
+        );
         let journeys = raptor(
             &timetable,
             RaptorRequest {
