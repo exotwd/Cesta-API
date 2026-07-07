@@ -389,7 +389,15 @@ pub(crate) async fn journey_search(
     if let Some(pool) = &state.db {
         validate_journey_point_db(pool, &body.from).await?;
         validate_journey_point_db(pool, &body.to).await?;
-        return match query_journeys_db(pool, &body, departure_time, service_date).await {
+        return match query_journeys_db(
+            pool,
+            &state.raptor_cache,
+            &body,
+            departure_time,
+            service_date,
+        )
+        .await
+        {
             Ok((mut journeys, warnings, related)) => {
                 let realtime_status = related["realtime_status"].as_str().unwrap_or("unavailable");
                 state

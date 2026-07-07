@@ -12,14 +12,17 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
-use routing_core::{SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot};
+use routing_core::{
+    RaptorRequest, RaptorStopTime, RaptorTimetable, RaptorTrip,
+    SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot, raptor,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use tokio::{sync::RwLock, time};
 use transit_model::{
     CoordinateConfidence, Journey, JourneyLeg, OfflinePackage, RealtimeStatus, Stop, TicketOption,
-    TransportMode, normalize_czech_name,
+    Transfer, TransportMode, normalize_czech_name,
 };
 use uuid::Uuid;
 
@@ -162,6 +165,8 @@ struct AppState {
     jwt_secret: String,
     use_mock_data: bool,
     ticketing: ticketing::TicketingService,
+    raptor_cache:
+        Arc<RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -634,6 +639,7 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         jwt_secret: config.jwt_secret.clone(),
         use_mock_data: config.use_mock_data,
         ticketing,
+        raptor_cache: Arc::new(RwLock::new(HashMap::new())),
     };
     state
         .ticketing
@@ -2406,6 +2412,9 @@ async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error>
 
 async fn query_journeys_db(
     pool: &PgPool,
+    raptor_cache: &Arc<
+        RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>,
+    >,
     body: &JourneySearchBody,
     departure_time: u32,
     service_date: chrono::NaiveDate,
@@ -2433,6 +2442,7 @@ async fn query_journeys_db(
         .collect::<Vec<_>>();
     let current_service_day_search = service_day_journeys_db(
         pool,
+        raptor_cache,
         &from_stop_ids,
         &to_stop_ids,
         departure_time,
@@ -2448,6 +2458,7 @@ async fn query_journeys_db(
     let (current_service_day_result, next_service_day_result) = if include_next_service_day {
         let next_service_day_search = service_day_journeys_db(
             pool,
+            raptor_cache,
             &from_stop_ids,
             &to_stop_ids,
             0,
@@ -2493,6 +2504,7 @@ async fn query_journeys_db(
     if journeys.is_empty() && !include_next_service_day {
         let (next_service_day_journeys, next_transfer_search_status) = service_day_journeys_db(
             pool,
+            raptor_cache,
             &from_stop_ids,
             &to_stop_ids,
             0,
@@ -2566,6 +2578,7 @@ async fn query_journeys_db(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TransferSearchStatus {
     Complete,
     TimedOut,
@@ -2625,6 +2638,9 @@ async fn unverified_journey_service_count(
 #[allow(clippy::too_many_arguments)]
 async fn service_day_journeys_db(
     pool: &PgPool,
+    raptor_cache: &Arc<
+        RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>,
+    >,
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
@@ -2633,71 +2649,166 @@ async fn service_day_journeys_db(
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
 ) -> Result<(Vec<Journey>, TransferSearchStatus), sqlx::Error> {
-    let direct_search = direct_journeys_db(
-        pool,
-        from_stop_ids,
-        to_stop_ids,
-        departure_time,
-        mode_filters,
-        service_date,
-        routing_config.max_direct_candidates as i64,
+    let started_at = time::Instant::now();
+    let timetable = raptor_timetable_cached_db(pool, raptor_cache, service_date).await?;
+    let modes = mode_filters
+        .iter()
+        .map(|mode| db_mode_to_model(mode))
+        .collect();
+    let journeys = raptor(
+        timetable.as_ref(),
+        RaptorRequest {
+            from_stop_ids: from_stop_ids.to_vec(),
+            to_stop_ids: to_stop_ids.to_vec(),
+            departure_time,
+            max_transfers,
+            min_transfer_seconds: routing_config.min_transfer_seconds as u32,
+            modes,
+        },
     );
-    let transfer_search = async {
-        if max_transfers == 0 {
-            return Ok::<_, sqlx::Error>((Vec::new(), TransferSearchStatus::Complete));
-        }
+    tracing::debug!(
+        elapsed_ms = started_at.elapsed().as_millis(),
+        candidates = journeys.len(),
+        trips = timetable.trips.len(),
+        service_date = %service_date,
+        "RAPTOR journey search completed"
+    );
+    let _ = routing_config;
+    Ok((journeys, TransferSearchStatus::Complete))
+}
 
-        let timeout_seconds = routing_config.transfer_search_timeout_seconds as u64;
-        let started_at = time::Instant::now();
-        match time::timeout(
-            std::time::Duration::from_secs(timeout_seconds),
-            one_transfer_journeys_db(
-                pool,
-                from_stop_ids,
-                to_stop_ids,
-                departure_time,
-                mode_filters,
-                service_date,
-                routing_config.min_transfer_seconds,
-                routing_config.max_transfer_wait_seconds,
-                routing_config.max_transfer_candidates as i64,
-            ),
+async fn raptor_timetable_cached_db(
+    pool: &PgPool,
+    cache: &Arc<RwLock<HashMap<(chrono::NaiveDate, Option<DateTime<Utc>>), Arc<RaptorTimetable>>>>,
+    service_date: chrono::NaiveDate,
+) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
+    let latest_import = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT max(finished_at) FROM import_runs WHERE status = 'success'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let key = (service_date, latest_import);
+    if let Some(timetable) = cache.read().await.get(&key).cloned() {
+        return Ok(timetable);
+    }
+    let timetable = Arc::new(raptor_timetable_db(pool, service_date).await?);
+    let mut cache = cache.write().await;
+    cache.retain(|(date, import), _| *date != service_date || *import == latest_import);
+    cache.insert(key, timetable.clone());
+    Ok(timetable)
+}
+
+async fn raptor_timetable_db(
+    pool: &PgPool,
+    service_date: chrono::NaiveDate,
+) -> Result<RaptorTimetable, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        WITH active_services AS (
+          SELECT calendar.service_id
+          FROM calendars calendar
+          WHERE $1::date BETWEEN calendar.start_date AND calendar.end_date
+            AND CASE EXTRACT(ISODOW FROM $1::date)::integer
+              WHEN 1 THEN calendar.monday WHEN 2 THEN calendar.tuesday
+              WHEN 3 THEN calendar.wednesday WHEN 4 THEN calendar.thursday
+              WHEN 5 THEN calendar.friday WHEN 6 THEN calendar.saturday
+              WHEN 7 THEN calendar.sunday
+            END
+            AND NOT EXISTS (
+              SELECT 1 FROM calendar_dates exception
+              WHERE exception.service_id = calendar.service_id
+                AND exception.date = $1::date AND exception.exception_type = 2
+            )
+          UNION
+          SELECT service_id FROM calendar_dates
+          WHERE date = $1::date AND exception_type = 1
+        ),
+        latest_import_runs AS (
+          SELECT DISTINCT ON (summary->>'feed_id')
+            summary->>'feed_id' AS source_feed_id, id AS import_run_id
+          FROM import_runs
+          WHERE status = 'success' AND summary ? 'feed_id'
+          ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         )
-        .await
-        {
-            Ok(Ok(journeys)) => {
-                tracing::debug!(
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    timeout_seconds,
-                    candidates = journeys.len(),
-                    from_stops = from_stop_ids.len(),
-                    to_stops = to_stop_ids.len(),
-                    "transfer journey database query completed"
-                );
-                Ok((journeys, TransferSearchStatus::Complete))
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "transfer journey database query failed");
-                Ok((Vec::new(), TransferSearchStatus::Failed))
-            }
-            Err(_) => {
-                tracing::warn!(
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    timeout_seconds,
-                    from_stops = from_stop_ids.len(),
-                    to_stops = to_stop_ids.len(),
-                    "transfer journey database query timed out"
-                );
-                Ok((Vec::new(), TransferSearchStatus::TimedOut))
-            }
-        }
-    };
+        SELECT trip.id AS trip_id, route.id AS route_id, route.mode,
+               route.gtfs_route_type, stop_time.stop_id, stop_time.stop_sequence,
+               stop_time.arrival_time, stop_time.departure_time,
+               stop_time.pickup_type, stop_time.drop_off_type
+        FROM trips trip
+        JOIN routes route ON route.id = trip.route_id AND route.is_active = true
+        JOIN stop_times stop_time ON stop_time.trip_id = trip.id
+        LEFT JOIN latest_import_runs latest
+          ON latest.source_feed_id = trip.source_feed_id
+         AND latest.import_run_id = trip.import_run_id
+        WHERE (
+          trip.service_id IN (SELECT service_id FROM active_services)
+          OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
+             AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = trip.source_feed_id)
+        )
+          AND (
+            latest.import_run_id IS NOT NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM latest_import_runs known
+              WHERE known.source_feed_id = trip.source_feed_id
+            )
+          )
+        ORDER BY trip.id, stop_time.stop_sequence
+        "#,
+    )
+    .bind(service_date)
+    .fetch_all(pool)
+    .await?;
 
-    let (direct_result, transfer_result) = tokio::join!(direct_search, transfer_search);
-    let mut journeys = direct_result?;
-    let (mut transfer_journeys, transfer_search_status) = transfer_result?;
-    journeys.append(&mut transfer_journeys);
-    Ok((journeys, transfer_search_status))
+    let mut trips = Vec::<RaptorTrip>::new();
+    for row in rows {
+        let trip_id = row.get::<String, _>("trip_id");
+        if trips.last().is_none_or(|trip| trip.trip_id != trip_id) {
+            let mode = db_route_mode_to_model(
+                &row.get::<String, _>("mode"),
+                row.get::<Option<i32>, _>("gtfs_route_type"),
+            );
+            trips.push(RaptorTrip {
+                trip_id: trip_id.clone(),
+                route_id: row.get("route_id"),
+                mode,
+                stop_times: Vec::new(),
+            });
+        }
+        trips.last_mut().unwrap().stop_times.push(RaptorStopTime {
+            stop_id: row.get("stop_id"),
+            arrival_time: row.get::<i32, _>("arrival_time") as u32,
+            departure_time: row.get::<i32, _>("departure_time") as u32,
+            pickup_allowed: row.get::<Option<i16>, _>("pickup_type").unwrap_or(0) == 0,
+            drop_off_allowed: row.get::<Option<i16>, _>("drop_off_type").unwrap_or(0) == 0,
+        });
+    }
+
+    let transfers = sqlx::query(
+        r#"
+        SELECT transfer.from_stop_id, transfer.to_stop_id,
+               transfer.min_transfer_seconds, transfer.distance_meters,
+               transfer.walking_geometry, transfer.confidence,
+               transfer.accessibility_level, transfer.source
+        FROM transfers transfer
+        JOIN stops origin ON origin.id = transfer.from_stop_id AND origin.is_active = true
+        JOIN stops destination ON destination.id = transfer.to_stop_id AND destination.is_active = true
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| Transfer {
+        from_stop_id: row.get("from_stop_id"),
+        to_stop_id: row.get("to_stop_id"),
+        min_transfer_seconds: row.get::<i32, _>("min_transfer_seconds") as u32,
+        distance_meters: row.get::<Option<i32>, _>("distance_meters").map(|value| value as u32),
+        walking_geometry: row.get("walking_geometry"),
+        confidence: db_confidence_to_model(&row.get::<String, _>("confidence")),
+        accessibility_level: row.get("accessibility_level"),
+        source: row.get("source"),
+    })
+    .collect();
+    Ok(RaptorTimetable { trips, transfers })
 }
 
 fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
@@ -3426,6 +3537,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
     Ok(ids)
 }
 
+#[allow(dead_code)] // Retained temporarily for rollback comparison while RAPTOR is deployed.
 async fn direct_journeys_db(
     pool: &PgPool,
     from_stop_ids: &[String],
@@ -3576,6 +3688,7 @@ async fn direct_journeys_db(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Retained temporarily for rollback comparison while RAPTOR is deployed.
 async fn one_transfer_journeys_db(
     pool: &PgPool,
     from_stop_ids: &[String],
@@ -5111,6 +5224,19 @@ fn db_mode_to_model(mode: &str) -> TransportMode {
         "ferry" => TransportMode::Ferry,
         "cable_car" => TransportMode::CableCar,
         _ => TransportMode::Unknown,
+    }
+}
+
+fn db_route_mode_to_model(mode: &str, gtfs_route_type: Option<i32>) -> TransportMode {
+    match gtfs_route_type {
+        Some(0 | 900..=999) => TransportMode::Tram,
+        Some(1) => TransportMode::Metro,
+        Some(2 | 100..=199 | 400..=499) => TransportMode::Train,
+        Some(3 | 200..=299 | 700..=799) => TransportMode::Bus,
+        Some(4 | 1000..=1099) => TransportMode::Ferry,
+        Some(5 | 1300..=1399) => TransportMode::CableCar,
+        Some(11 | 800..=899) => TransportMode::Trolleybus,
+        _ => db_mode_to_model(mode),
     }
 }
 
