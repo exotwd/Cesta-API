@@ -3622,25 +3622,14 @@ async fn one_transfer_journeys_db(
             AND summary ? 'feed_id'
           ORDER BY summary->>'feed_id', finished_at DESC NULLS LAST, started_at DESC
         ),
-        origin_departures_unbounded AS (
+        origin_departures AS MATERIALIZED (
           SELECT DISTINCT ON (stop_time.trip_id)
             stop_time.trip_id,
             stop_time.stop_id,
             stop_time.stop_sequence,
-            stop_time.departure_time,
-            CASE
-              WHEN lower(endpoint_route.mode) IN ('train', 'rail') OR endpoint_route.gtfs_route_type = 2 OR endpoint_route.gtfs_route_type BETWEEN 100 AND 199 OR endpoint_route.gtfs_route_type BETWEEN 400 AND 499 OR lower(endpoint_route.id) LIKE '%train%' OR lower(endpoint_route.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(endpoint_route.mode) = 'tram' OR endpoint_route.gtfs_route_type = 0 OR endpoint_route.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
-              WHEN lower(endpoint_route.mode) = 'metro' OR endpoint_route.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(endpoint_route.mode) = 'bus' OR endpoint_route.gtfs_route_type = 3 OR endpoint_route.gtfs_route_type BETWEEN 200 AND 299 OR endpoint_route.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
-              WHEN lower(endpoint_route.mode) = 'ferry' OR endpoint_route.gtfs_route_type = 4 OR endpoint_route.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
-              WHEN lower(endpoint_route.mode) IN ('cable_car', 'cablecar') OR endpoint_route.gtfs_route_type = 5 OR endpoint_route.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
-              WHEN lower(endpoint_route.mode) = 'trolleybus' OR endpoint_route.gtfs_route_type = 11 OR endpoint_route.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
-              ELSE 'unknown'
-            END AS endpoint_mode
+            stop_time.departure_time
           FROM stop_times stop_time
           JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
-          JOIN routes endpoint_route ON endpoint_route.id = endpoint_trip.route_id
           LEFT JOIN latest_import_runs endpoint_import
             ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
@@ -3667,34 +3656,14 @@ async fn one_transfer_journeys_db(
           ORDER BY stop_time.trip_id, stop_time.departure_time ASC,
                    stop_time.stop_sequence ASC
         ),
-        origin_departures AS MATERIALIZED (
-          SELECT *
-          FROM origin_departures_unbounded
-          WHERE endpoint_mode <> 'unknown'
-            AND ($4 = false OR endpoint_mode = ANY($5))
-          ORDER BY departure_time ASC, stop_sequence ASC
-          -- Bound endpoint trips before expanding each trip into all possible transfer stops.
-          LIMIT LEAST(GREATEST($9 * 20, 200), 2000)
-        ),
-        destination_arrivals_unbounded AS (
+        destination_arrivals AS MATERIALIZED (
           SELECT DISTINCT ON (stop_time.trip_id)
             stop_time.trip_id,
             stop_time.stop_id,
             stop_time.stop_sequence,
-            stop_time.arrival_time,
-            CASE
-              WHEN lower(endpoint_route.mode) IN ('train', 'rail') OR endpoint_route.gtfs_route_type = 2 OR endpoint_route.gtfs_route_type BETWEEN 100 AND 199 OR endpoint_route.gtfs_route_type BETWEEN 400 AND 499 OR lower(endpoint_route.id) LIKE '%train%' OR lower(endpoint_route.source_id) LIKE '%train%' THEN 'train'
-              WHEN lower(endpoint_route.mode) = 'tram' OR endpoint_route.gtfs_route_type = 0 OR endpoint_route.gtfs_route_type BETWEEN 900 AND 999 THEN 'tram'
-              WHEN lower(endpoint_route.mode) = 'metro' OR endpoint_route.gtfs_route_type = 1 THEN 'metro'
-              WHEN lower(endpoint_route.mode) = 'bus' OR endpoint_route.gtfs_route_type = 3 OR endpoint_route.gtfs_route_type BETWEEN 200 AND 299 OR endpoint_route.gtfs_route_type BETWEEN 700 AND 799 THEN 'bus'
-              WHEN lower(endpoint_route.mode) = 'ferry' OR endpoint_route.gtfs_route_type = 4 OR endpoint_route.gtfs_route_type BETWEEN 1000 AND 1099 THEN 'ferry'
-              WHEN lower(endpoint_route.mode) IN ('cable_car', 'cablecar') OR endpoint_route.gtfs_route_type = 5 OR endpoint_route.gtfs_route_type BETWEEN 1300 AND 1399 THEN 'cable_car'
-              WHEN lower(endpoint_route.mode) = 'trolleybus' OR endpoint_route.gtfs_route_type = 11 OR endpoint_route.gtfs_route_type BETWEEN 800 AND 899 THEN 'trolleybus'
-              ELSE 'unknown'
-            END AS endpoint_mode
+            stop_time.arrival_time
           FROM stop_times stop_time
           JOIN trips endpoint_trip ON endpoint_trip.id = stop_time.trip_id
-          JOIN routes endpoint_route ON endpoint_route.id = endpoint_trip.route_id
           LEFT JOIN latest_import_runs endpoint_import
             ON endpoint_import.source_feed_id = endpoint_trip.source_feed_id
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
@@ -3720,15 +3689,6 @@ async fn one_transfer_journeys_db(
             )
           ORDER BY stop_time.trip_id, stop_time.arrival_time ASC,
                    stop_time.stop_sequence ASC
-        ),
-        destination_arrivals AS MATERIALIZED (
-          SELECT *
-          FROM destination_arrivals_unbounded
-          WHERE endpoint_mode <> 'unknown'
-            AND ($4 = false OR endpoint_mode = ANY($5))
-          ORDER BY arrival_time ASC, stop_sequence ASC
-          -- The former query expanded every destination trip before applying any limit.
-          LIMIT LEAST(GREATEST($9 * 20, 200), 2000)
         ),
         first_legs AS (
           SELECT
@@ -3791,7 +3751,7 @@ async fn one_transfer_journeys_db(
           WHERE first_mode <> 'unknown'
             AND ($4 = false OR first_mode = ANY($5))
           ORDER BY first_departure_time ASC, first_arrival_time ASC
-          LIMIT LEAST(GREATEST($9 * 50, 500), 4000)
+          LIMIT 4000
         ),
         second_legs AS (
           SELECT
@@ -3855,7 +3815,7 @@ async fn one_transfer_journeys_db(
           WHERE second_mode <> 'unknown'
             AND ($4 = false OR second_mode = ANY($5))
           ORDER BY second_arrival_time ASC, second_departure_time DESC
-          LIMIT LEAST(GREATEST($9 * 50, 500), 4000)
+          LIMIT 4000
         ),
         candidate_journeys AS (
           SELECT
