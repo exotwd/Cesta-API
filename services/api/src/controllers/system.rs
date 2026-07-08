@@ -159,14 +159,20 @@ pub(crate) async fn openapi() -> Json<Value> {
             "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
             "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
             "/admin/routing-algorithm": {
-                "get": {"summary": "Read the active journey-search algorithm configuration"},
+                "get": {
+                    "summary": "Read the active journey-search algorithm configuration and RAPTOR cache status",
+                    "responses": {"200": {"description": "Active configuration and snapshot warmup status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RoutingAlgorithmPayload"}}}}}
+                },
                 "put": {
                     "summary": "Replace and immediately activate the journey-search algorithm configuration",
                     "description": "Validates and persists candidate-generation limits, transfer constraints, scoring weights, dominance pruning and result-diversity guarantees. Requires an admin or data_admin token.",
                     "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"}}}},
-                    "responses": {"200": {"description": "Validated configuration is active for new searches"}, "400": {"description": "Invalid or unsafe parameter combination"}}
+                    "responses": {"200": {"description": "Validated configuration is active for new searches", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RoutingAlgorithmPayload"}}}}, "400": {"description": "Invalid or unsafe parameter combination"}}
                 },
-                "delete": {"summary": "Reset the journey-search algorithm to safe defaults"}
+                "delete": {
+                    "summary": "Reset the journey-search algorithm to safe defaults",
+                    "responses": {"200": {"description": "Default configuration is active for new searches", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RoutingAlgorithmPayload"}}}}}
+                }
             },
             "/public/boards/{stopId}": {"get": {"summary": "Public departure board data"}}
         },
@@ -351,6 +357,79 @@ pub(crate) async fn openapi() -> Json<Value> {
             }
         }
     });
+    let schemas = specification["components"]["schemas"]
+        .as_object_mut()
+        .expect("OpenAPI schemas object");
+    schemas.insert(
+        "RoutingAlgorithmPayload".to_string(),
+        json!({
+            "type": "object",
+            "required": ["configuration", "defaults", "database_available", "snapshot_status"],
+            "properties": {
+                "configuration": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"},
+                "defaults": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"},
+                "database_available": {"type": "boolean"},
+                "updated_at": {"type": ["string", "null"], "format": "date-time"},
+                "updated_by": {"type": ["string", "null"]},
+                "snapshot_status": {"$ref": "#/components/schemas/RoutingSnapshotStatus"},
+                "activation": {"type": "string"},
+                "scoring_formula": {"type": "string"},
+                "fare_note": {"type": "string"}
+            }
+        }),
+    );
+    schemas.insert(
+        "RoutingSnapshotStatus".to_string(),
+        json!({
+            "type": "object",
+            "required": ["database_available", "directory", "snapshot_version", "warmup_interval_seconds", "total_size_bytes", "snapshots", "warmup"],
+            "properties": {
+                "database_available": {"type": "boolean"},
+                "directory": {"type": "string"},
+                "latest_import": {"type": ["string", "null"], "format": "date-time"},
+                "latest_import_error": {"type": ["string", "null"]},
+                "snapshot_version": {"type": "integer"},
+                "warmup_interval_seconds": {"type": "integer"},
+                "total_size_bytes": {"type": "integer", "minimum": 0},
+                "snapshots": {"type": "array", "items": {"$ref": "#/components/schemas/RoutingSnapshotFile"}},
+                "warmup": {"$ref": "#/components/schemas/RoutingWarmupStatus"}
+            }
+        }),
+    );
+    schemas.insert(
+        "RoutingSnapshotFile".to_string(),
+        json!({
+            "type": "object",
+            "required": ["service_date", "path", "exists", "memory_cached"],
+            "properties": {
+                "service_date": {"type": "string", "format": "date"},
+                "file_name": {"type": ["string", "null"]},
+                "path": {"type": "string"},
+                "exists": {"type": "boolean"},
+                "size_bytes": {"type": ["integer", "null"], "minimum": 0},
+                "modified_at": {"type": ["string", "null"], "format": "date-time"},
+                "memory_cached": {"type": "boolean"}
+            }
+        }),
+    );
+    schemas.insert(
+        "RoutingWarmupStatus".to_string(),
+        json!({
+            "type": "object",
+            "required": ["active", "stage", "total_dates"],
+            "properties": {
+                "active": {"type": "boolean"},
+                "stage": {"type": "string"},
+                "service_date": {"type": ["string", "null"], "format": "date"},
+                "current_index": {"type": ["integer", "null"]},
+                "total_dates": {"type": "integer"},
+                "started_at": {"type": ["string", "null"], "format": "date-time"},
+                "finished_at": {"type": ["string", "null"], "format": "date-time"},
+                "elapsed_seconds": {"type": ["integer", "null"], "minimum": 0},
+                "error": {"type": ["string", "null"]}
+            }
+        }),
+    );
     ticketing::augment_openapi(&mut specification);
     Json(specification)
 }

@@ -409,6 +409,18 @@ tbody tr:hover .row-action { background: #f7f9fb; }
 .routing-summary-grid > div:nth-last-child(-n + 3) { border-bottom: 0; }
 .routing-summary-grid span { color: var(--muted); font-size: 10px; font-weight: 750; text-transform: uppercase; }
 .routing-summary-grid strong { overflow-wrap: anywhere; font-size: 13px; }
+.routing-cache-grid { display: grid; }
+.routing-cache-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
+.routing-cache-overview > div { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--border); display: grid; gap: 5px; }
+.routing-cache-overview > div:last-child { border-right: 0; }
+.routing-cache-overview span, .routing-cache-file span { color: var(--muted); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+.routing-cache-overview strong, .routing-cache-file strong { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.routing-cache-overview small, .routing-cache-file small { min-width: 0; color: #536170; overflow-wrap: anywhere; font-size: 11px; line-height: 1.4; }
+.routing-cache-alert, .routing-cache-empty { padding: 12px 16px; border-bottom: 1px solid var(--border); color: var(--warning); background: var(--warning-soft); font-size: 12px; }
+.routing-cache-files { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.routing-cache-file { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--border); display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; }
+.routing-cache-file:nth-child(2n) { border-right: 0; }
+.routing-cache-file > div { min-width: 0; display: grid; gap: 5px; }
 .routing-groups { display: grid; gap: 16px; }
 .routing-field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .routing-field { min-width: 0; min-height: 190px; padding: 16px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
@@ -506,11 +518,16 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .source-editor .toggle-field { grid-column: 3; }
   .validation-check-list { grid-template-columns: 1fr; }
   .validation-check:nth-child(odd) { border-right: 0; }
-  .routing-field-grid, .routing-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .routing-field-grid, .routing-summary-grid, .routing-cache-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .routing-field:nth-child(3n), .routing-summary-grid > div:nth-child(3n) { border-right: 1px solid var(--border); }
   .routing-field:nth-child(2n), .routing-summary-grid > div:nth-child(2n) { border-right: 0; }
   .routing-summary-grid > div:nth-last-child(-n + 3) { border-bottom: 1px solid var(--border); }
   .routing-summary-grid > div:nth-last-child(-n + 2) { border-bottom: 0; }
+  .routing-cache-overview > div:nth-child(2n) { border-right: 0; }
+  .routing-cache-overview > div:last-child { grid-column: span 2; border-top: 1px solid var(--border); }
+  .routing-cache-files { grid-template-columns: 1fr; }
+  .routing-cache-file { border-right: 0; border-bottom: 1px solid var(--border); }
+  .routing-cache-file:last-child { border-bottom: 0; }
 }
 
 @media (max-width: 760px) {
@@ -532,10 +549,12 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .map-results { max-height: 360px; border-left: 0; border-top: 1px solid var(--border); }
   .source-editor { grid-template-columns: 1fr; align-items: stretch; }
   .source-editor .toggle-field { grid-column: auto; }
-  .routing-field-grid, .routing-summary-grid { grid-template-columns: 1fr; }
+  .routing-field-grid, .routing-summary-grid, .routing-cache-overview { grid-template-columns: 1fr; }
   .routing-field, .routing-field:nth-child(2n), .routing-field:nth-child(3n), .routing-summary-grid > div, .routing-summary-grid > div:nth-child(2n), .routing-summary-grid > div:nth-child(3n) { border-right: 0; }
   .routing-summary-grid > div:nth-last-child(-n + 2) { border-bottom: 1px solid var(--border); }
   .routing-summary-grid > div:last-child { border-bottom: 0; }
+  .routing-cache-overview > div, .routing-cache-overview > div:nth-child(2n), .routing-cache-overview > div:last-child { grid-column: auto; border-right: 0; border-top: 0; border-bottom: 1px solid var(--border); }
+  .routing-cache-file { grid-template-columns: 1fr; }
   .routing-actions { width: 100%; }
   .pagination { justify-content: space-between; }
   .pagination #entity-range, .page-button { display: none; }

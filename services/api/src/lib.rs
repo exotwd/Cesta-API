@@ -87,6 +87,34 @@ const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 type RaptorCacheKey = (chrono::NaiveDate, Option<DateTime<Utc>>);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
 type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
+type RoutingWarmupStatus = Arc<RwLock<RoutingWarmupState>>;
+
+#[derive(Debug, Clone, Serialize)]
+struct RoutingWarmupState {
+    active: bool,
+    stage: String,
+    service_date: Option<chrono::NaiveDate>,
+    current_index: Option<u32>,
+    total_dates: u32,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    error: Option<String>,
+}
+
+impl Default for RoutingWarmupState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            stage: "idle".to_string(),
+            service_date: None,
+            current_index: None,
+            total_dates: 2,
+            started_at: None,
+            finished_at: None,
+            error: None,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RaptorTimetableSnapshot {
@@ -186,6 +214,7 @@ struct AppState {
     use_mock_data: bool,
     ticketing: ticketing::TicketingService,
     raptor_cache: RaptorCache,
+    routing_warmup_status: RoutingWarmupStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -717,11 +746,15 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         use_mock_data: config.use_mock_data,
         ticketing,
         raptor_cache: Arc::new(RwLock::new(HashMap::new())),
+        routing_warmup_status: Arc::new(RwLock::new(RoutingWarmupState::default())),
     };
     if let Some(pool) = state.db.clone() {
         let cache = state.raptor_cache.clone();
         let snapshot_dir = state.config.routing_snapshot_dir.clone();
-        tokio::spawn(async move { warm_raptor_timetables(pool, cache, snapshot_dir).await });
+        let warmup_status = state.routing_warmup_status.clone();
+        tokio::spawn(async move {
+            warm_raptor_timetables(pool, cache, snapshot_dir, warmup_status).await
+        });
     }
     state
         .ticketing
@@ -1977,21 +2010,37 @@ async fn admin_routing_algorithm(
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     let Some(pool) = &state.db else {
+        let snapshot_status = routing_snapshot_status(
+            None,
+            &state.raptor_cache,
+            &state.config.routing_snapshot_dir,
+            &state.routing_warmup_status,
+        )
+        .await;
         return Ok(Json(routing_algorithm_payload(
             RoutingAlgorithmConfig::default(),
             false,
             None,
             None,
+            snapshot_status,
         )));
     };
     let (configuration, updated_at, updated_by) = routing_algorithm_config_db(pool)
         .await
         .map_err(internal_error)?;
+    let snapshot_status = routing_snapshot_status(
+        Some(pool),
+        &state.raptor_cache,
+        &state.config.routing_snapshot_dir,
+        &state.routing_warmup_status,
+    )
+    .await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         updated_at,
         updated_by,
+        snapshot_status,
     )))
 }
 
@@ -2012,11 +2061,19 @@ async fn admin_routing_algorithm_update(
     persist_routing_algorithm_config(pool, &configuration, &user.email)
         .await
         .map_err(internal_error)?;
+    let snapshot_status = routing_snapshot_status(
+        Some(pool),
+        &state.raptor_cache,
+        &state.config.routing_snapshot_dir,
+        &state.routing_warmup_status,
+    )
+    .await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         Some(Utc::now()),
         Some(user.email),
+        snapshot_status,
     )))
 }
 
@@ -2036,11 +2093,19 @@ async fn admin_routing_algorithm_reset(
     persist_routing_algorithm_config(pool, &configuration, &user.email)
         .await
         .map_err(internal_error)?;
+    let snapshot_status = routing_snapshot_status(
+        Some(pool),
+        &state.raptor_cache,
+        &state.config.routing_snapshot_dir,
+        &state.routing_warmup_status,
+    )
+    .await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         Some(Utc::now()),
         Some(user.email),
+        snapshot_status,
     )))
 }
 
@@ -2160,6 +2225,7 @@ fn routing_algorithm_payload(
     database_available: bool,
     updated_at: Option<DateTime<Utc>>,
     updated_by: Option<String>,
+    snapshot_status: Value,
 ) -> Value {
     json!({
         "configuration": configuration,
@@ -2167,9 +2233,92 @@ fn routing_algorithm_payload(
         "database_available": database_available,
         "updated_at": updated_at,
         "updated_by": updated_by,
+        "snapshot_status": snapshot_status,
         "activation": "New journey searches read this profile immediately; running searches are not changed.",
         "scoring_formula": "arrival_time × arrival_time_weight + duration × duration_weight + transfers × transfer_penalty_seconds",
         "fare_note": "No real fare data is imported. Carrier diversity preserves potentially cheaper operators without claiming a cheapest fare."
+    })
+}
+
+async fn routing_snapshot_status(
+    pool: Option<&PgPool>,
+    cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
+    warmup_status: &RoutingWarmupStatus,
+) -> Value {
+    let (latest_import, latest_import_error) = match pool {
+        Some(pool) => match latest_successful_import_timestamp(pool).await {
+            Ok(value) => (value, None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        None => (None, None),
+    };
+    let today = chrono::Local::now().date_naive();
+    let dates = [
+        today,
+        today
+            .checked_add_days(chrono::Days::new(1))
+            .unwrap_or(today),
+    ];
+    let memory_cached_by_date = {
+        let cache = cache.read().await;
+        dates
+            .iter()
+            .map(|date| (*date, cache.contains_key(&(*date, latest_import))))
+            .collect::<HashMap<_, _>>()
+    };
+    let mut snapshots = Vec::new();
+    let mut total_size_bytes: u64 = 0;
+    for service_date in dates {
+        let path =
+            raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, latest_import);
+        let metadata = tokio::fs::metadata(&path).await.ok();
+        let size_bytes = metadata.as_ref().map(|metadata| metadata.len());
+        if let Some(size_bytes) = size_bytes {
+            total_size_bytes = total_size_bytes.saturating_add(size_bytes);
+        }
+        let modified_at = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from);
+        snapshots.push(json!({
+            "service_date": service_date,
+            "file_name": path.file_name().and_then(|value| value.to_str()),
+            "path": path.display().to_string(),
+            "exists": metadata.is_some(),
+            "size_bytes": size_bytes,
+            "modified_at": modified_at,
+            "memory_cached": memory_cached_by_date.get(&service_date).copied().unwrap_or(false)
+        }));
+    }
+    let warmup = warmup_status.read().await.clone();
+    let elapsed_seconds = match (warmup.started_at, warmup.finished_at, warmup.active) {
+        (Some(started_at), Some(finished_at), false) => {
+            Some((finished_at - started_at).num_seconds().max(0))
+        }
+        (Some(started_at), _, _) => Some((Utc::now() - started_at).num_seconds().max(0)),
+        _ => None,
+    };
+    json!({
+        "database_available": pool.is_some(),
+        "directory": routing_snapshot_dir,
+        "latest_import": latest_import,
+        "latest_import_error": latest_import_error,
+        "snapshot_version": RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
+        "warmup_interval_seconds": RAPTOR_WARMUP_INTERVAL_SECONDS,
+        "total_size_bytes": total_size_bytes,
+        "snapshots": snapshots,
+        "warmup": {
+            "active": warmup.active,
+            "stage": warmup.stage,
+            "service_date": warmup.service_date,
+            "current_index": warmup.current_index,
+            "total_dates": warmup.total_dates,
+            "started_at": warmup.started_at,
+            "finished_at": warmup.finished_at,
+            "elapsed_seconds": elapsed_seconds,
+            "error": warmup.error
+        }
     })
 }
 
@@ -2963,18 +3112,57 @@ async fn raptor_timetable_cached_db(
     .cloned()
 }
 
-async fn warm_raptor_timetables(pool: PgPool, cache: RaptorCache, routing_snapshot_dir: PathBuf) {
+async fn warm_raptor_timetables(
+    pool: PgPool,
+    cache: RaptorCache,
+    routing_snapshot_dir: PathBuf,
+    warmup_status: RoutingWarmupStatus,
+) {
     loop {
         let service_date = chrono::Local::now().date_naive();
+        let pass_started_at = Utc::now();
+        let mut last_error = None;
         for offset_days in 0..=1 {
             let warmup_date = service_date
                 .checked_add_days(chrono::Days::new(offset_days))
                 .unwrap_or(service_date);
+            {
+                let mut status = warmup_status.write().await;
+                *status = RoutingWarmupState {
+                    active: true,
+                    stage: "loading_or_building_snapshot".to_string(),
+                    service_date: Some(warmup_date),
+                    current_index: Some(offset_days as u32 + 1),
+                    total_dates: 2,
+                    started_at: Some(pass_started_at),
+                    finished_at: None,
+                    error: None,
+                };
+            }
             if let Err(error) =
                 raptor_timetable_cached_db(&pool, &cache, &routing_snapshot_dir, warmup_date).await
             {
+                last_error = Some(error.to_string());
                 tracing::warn!(%error, service_date = %warmup_date, "background RAPTOR timetable warmup failed");
             }
+        }
+        {
+            let mut status = warmup_status.write().await;
+            let started_at = status.started_at;
+            *status = RoutingWarmupState {
+                active: false,
+                stage: if last_error.is_some() {
+                    "idle_after_error".to_string()
+                } else {
+                    "idle".to_string()
+                },
+                service_date: None,
+                current_index: None,
+                total_dates: 2,
+                started_at,
+                finished_at: Some(Utc::now()),
+                error: last_error,
+            };
         }
         tokio::time::sleep(std::time::Duration::from_secs(
             RAPTOR_WARMUP_INTERVAL_SECONDS,

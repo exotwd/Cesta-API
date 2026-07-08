@@ -21,7 +21,8 @@
     sources: [],
     routingConfiguration: null,
     routingDefaults: null,
-    routingDatabaseAvailable: false
+    routingDatabaseAvailable: false,
+    routingRefreshTimer: null
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -142,6 +143,17 @@
     if (!value) return "—";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function formatDurationSeconds(value) {
+    const seconds = Math.max(0, Math.round(Number(value || 0)));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    if (minutes < 60) return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const minuteRemainder = minutes % 60;
+    return minuteRemainder ? `${hours}h ${minuteRemainder}m` : `${hours}h`;
   }
 
   function escapeHtml(value) {
@@ -1001,6 +1013,45 @@
       <div><span>Search envelope</span><strong>${config.max_direct_candidates} direct + ${config.max_transfer_candidates} transfer → ${config.max_results} results</strong></div>`;
   }
 
+  function renderRoutingCache(payload) {
+    const status = payload.snapshot_status;
+    const target = $("#routing-cache");
+    if (!status) {
+      target.innerHTML = `<div class="routing-cache-empty">No RAPTOR cache status is available.</div>`;
+      return;
+    }
+    const warmup = status.warmup || {};
+    const warmupLabel = warmup.active
+      ? `Warming ${warmup.service_date || "service day"} (${warmup.current_index || "?"}/${warmup.total_dates || 2})`
+      : warmup.error ? "Idle after error" : "Idle";
+    const warmupDetail = warmup.active
+      ? `Running for ${formatDurationSeconds(warmup.elapsed_seconds)}`
+      : warmup.finished_at ? `Last pass finished ${formatDate(warmup.finished_at)} after ${formatDurationSeconds(warmup.elapsed_seconds)}` : "Waiting for first background pass";
+    const snapshots = Array.isArray(status.snapshots) ? status.snapshots : [];
+    target.innerHTML = `
+      <div class="routing-cache-overview">
+        <div><span>Warmup</span><strong>${escapeHtml(warmupLabel)}</strong><small>${escapeHtml(warmupDetail)}</small></div>
+        <div><span>Snapshot files</span><strong>${formatBytes(status.total_size_bytes)}</strong><small>${escapeHtml(status.directory || "No directory configured")}</small></div>
+        <div><span>Latest import</span><strong>${escapeHtml(status.latest_import ? formatDate(status.latest_import) : "No successful import")}</strong><small>Version ${escapeHtml(status.snapshot_version || "")}; refresh ${formatDurationSeconds(status.warmup_interval_seconds)}</small></div>
+      </div>
+      ${status.latest_import_error ? `<div class="routing-cache-alert">${escapeHtml(status.latest_import_error)}</div>` : ""}
+      ${warmup.error ? `<div class="routing-cache-alert">${escapeHtml(warmup.error)}</div>` : ""}
+      <div class="routing-cache-files">
+        ${snapshots.map((snapshot) => `
+          <div class="routing-cache-file">
+            <div>
+              <span>${escapeHtml(snapshot.service_date || "")}</span>
+              <strong>${snapshot.exists ? formatBytes(snapshot.size_bytes) : "No file"}</strong>
+            </div>
+            <div>
+              <span>${snapshot.memory_cached ? "In memory" : "Cold"}</span>
+              <strong>${escapeHtml(snapshot.file_name || "snapshot not written yet")}</strong>
+              <small>${snapshot.modified_at ? `Modified ${escapeHtml(formatDate(snapshot.modified_at))}` : "Will be created after first warmup/search"}</small>
+            </div>
+          </div>`).join("")}
+      </div>`;
+  }
+
   function renderRoutingForm(payload) {
     state.routingConfiguration = payload.configuration;
     state.routingDefaults = payload.defaults;
@@ -1041,11 +1092,19 @@
       $("#routing-status").classList.add("warning");
     }));
     renderRoutingSummary();
+    renderRoutingCache(payload);
     iconRefresh();
   }
 
   async function loadRouting() {
-    renderRoutingForm(await api("/admin/routing-algorithm"));
+    clearTimeout(state.routingRefreshTimer);
+    const payload = await api("/admin/routing-algorithm");
+    renderRoutingForm(payload);
+    if (state.view === "routing") {
+      state.routingRefreshTimer = setTimeout(() => {
+        if (state.view === "routing") loadRouting().catch((error) => toast(error.message, "error"));
+      }, 5000);
+    }
   }
 
   async function loadView(view) {
@@ -1073,6 +1132,10 @@
   }
 
   function navigate(view) {
+    if (view !== "routing") {
+      clearTimeout(state.routingRefreshTimer);
+      state.routingRefreshTimer = null;
+    }
     const labels = {
       dashboard: ["Overview", "Transport database status and recent activity"],
       data: ["Data browser", "Search and inspect every managed entity"],

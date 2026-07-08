@@ -33,6 +33,9 @@ snapshot, and stores it in the in-memory cache. A background warmer refreshes to
 every minute so new imports are picked up before most user searches; it never runs an import on API
 startup.
 
+`GET /admin/routing-algorithm` also reports `snapshot_status`: configured snapshot directory,
+latest-import key, file sizes, per-date in-memory status, and the current background warmup stage.
+
 The admin page separates controls into:
 
 - candidate generation: direct/transfer query limits, valid transfer time window, transfer-query
