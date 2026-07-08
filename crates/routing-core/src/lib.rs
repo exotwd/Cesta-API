@@ -44,6 +44,7 @@ pub struct RaptorTrip {
     pub trip_id: String,
     pub route_id: String,
     pub mode: TransportMode,
+    pub service_verified: bool,
     pub stop_times: Vec<RaptorStopTime>,
 }
 
@@ -130,6 +131,7 @@ pub struct RaptorRequest {
     pub max_transfers: u32,
     pub min_transfer_seconds: u32,
     pub modes: Vec<TransportMode>,
+    pub allow_unverified_services: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +156,7 @@ enum RaptorParent {
 /// Round-based public-transit routing following Algorithm 1 in Delling et al.
 /// Each round boards one additional trip; walking transfers stay in the same round.
 pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journey> {
+    let allow_unverified_services = request.allow_unverified_services;
     let allowed_modes = request.modes.into_iter().collect::<HashSet<_>>();
     let target_stops = request.to_stop_ids.iter().cloned().collect::<HashSet<_>>();
     let mut extra_transfers_by_stop = HashMap::<String, Vec<Transfer>>::new();
@@ -258,7 +261,9 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
                     .iter()
                     .filter(|trip| {
                         let stop = &trip.stop_times[index];
-                        stop.pickup_allowed && ready_time <= stop.departure_time
+                        (allow_unverified_services || trip.service_verified)
+                            && stop.pickup_allowed
+                            && ready_time <= stop.departure_time
                     })
                     .min_by_key(|trip| trip.stop_times[index].departure_time);
                 if let Some(candidate) = catchable
@@ -792,6 +797,7 @@ mod tests {
                     trip_id: "direct".into(),
                     route_id: "r-direct".into(),
                     mode: TransportMode::Train,
+                    service_verified: true,
                     stop_times: vec![
                         stop_time("a", 8 * 3600, 8 * 3600),
                         stop_time("c", 10 * 3600, 10 * 3600),
@@ -801,6 +807,7 @@ mod tests {
                     trip_id: "first".into(),
                     route_id: "r-first".into(),
                     mode: TransportMode::Train,
+                    service_verified: true,
                     stop_times: vec![
                         stop_time("a", 8 * 3600 + 60, 8 * 3600 + 60),
                         stop_time("b", 9 * 3600, 9 * 3600),
@@ -810,6 +817,7 @@ mod tests {
                     trip_id: "second".into(),
                     route_id: "r-second".into(),
                     mode: TransportMode::Train,
+                    service_verified: true,
                     stop_times: vec![
                         stop_time("b", 9 * 3600 + 300, 9 * 3600 + 300),
                         stop_time("c", 9 * 3600 + 1800, 9 * 3600 + 1800),
@@ -828,6 +836,7 @@ mod tests {
                 max_transfers: 2,
                 min_transfer_seconds: 5 * 60,
                 modes: vec![TransportMode::Train],
+                allow_unverified_services: false,
             },
         );
 
@@ -851,6 +860,7 @@ mod tests {
                 trip_id: "nearby-trip".into(),
                 route_id: "nearby-route".into(),
                 mode: TransportMode::Bus,
+                service_verified: true,
                 stop_times: vec![
                     stop_time("nearby", 8 * 3600 + 180, 8 * 3600 + 180),
                     stop_time("target", 8 * 3600 + 1800, 8 * 3600 + 1800),
@@ -878,6 +888,7 @@ mod tests {
                 max_transfers: 1,
                 min_transfer_seconds: 5 * 60,
                 modes: vec![TransportMode::Bus],
+                allow_unverified_services: false,
             },
         );
 
@@ -885,5 +896,52 @@ mod tests {
         assert_eq!(journeys[0].legs[0].from_stop_id, "selected");
         assert_eq!(journeys[0].legs[0].to_stop_id, "nearby");
         assert_eq!(journeys[0].walking_distance_meters, 150);
+    }
+
+    #[test]
+    fn raptor_excludes_faster_unverified_trip_from_verified_search() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![
+                RaptorTrip {
+                    trip_id: "ghost".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: false,
+                    stop_times: vec![stop_time("a", 5 * 3600), stop_time("b", 8 * 3600)],
+                },
+                RaptorTrip {
+                    trip_id: "real".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![stop_time("a", 6 * 3600), stop_time("b", 9 * 3600)],
+                },
+            ],
+            Vec::new(),
+        );
+
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["a".into()],
+                to_stop_ids: vec!["b".into()],
+                extra_transfers: Vec::new(),
+                departure_time: 4 * 3600,
+                max_transfers: 0,
+                min_transfer_seconds: 300,
+                modes: vec![TransportMode::Train],
+                allow_unverified_services: false,
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].legs[0].trip_id.as_deref(), Some("real"));
     }
 }

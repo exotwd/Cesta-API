@@ -35,8 +35,9 @@ snapshot, and stores it in the in-memory cache. A background warmer refreshes to
 every minute so new imports are picked up before most user searches; it never runs an import on API
 startup.
 
-Calendar-verified journeys always replace legacy candidates when both can serve a request. Legacy
-journeys are returned only when no fully verified candidate is available, with a response warning.
+RAPTOR first searches only calendar-verified trips, preventing a faster legacy trip from suppressing
+a real service during round scanning. It reruns with legacy trips enabled only when the verified
+search returns no journey, and any resulting fallback is returned with a response warning.
 
 On API startup, snapshot files with a lower format version than the running API are deleted before
 warmup. Current-version files, files from a newer version, and unrelated files are preserved.

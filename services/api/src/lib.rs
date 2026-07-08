@@ -77,7 +77,7 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 3;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 4;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2990,7 +2990,15 @@ async fn query_journeys_profiled_db(
     timing.stages.push(RouteSearchStageTiming {
         stage: "current_raptor".to_string(),
         elapsed_ms: current_timing.raptor_ms,
-        detail: Some(format!("{} candidates", journeys.len())),
+        detail: Some(format!(
+            "{} candidates; {}",
+            journeys.len(),
+            if current_timing.legacy_search_attempted {
+                "legacy fallback attempted"
+            } else {
+                "verified-only search succeeded"
+            }
+        )),
     });
     append_transfer_search_warning(
         &mut warnings,
@@ -3017,7 +3025,15 @@ async fn query_journeys_profiled_db(
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
-            detail: Some(format!("{} candidates", next_service_day_journeys.len())),
+            detail: Some(format!(
+                "{} candidates; {}",
+                next_service_day_journeys.len(),
+                if next_timing.legacy_search_attempted {
+                    "legacy fallback attempted"
+                } else {
+                    "verified-only search succeeded"
+                }
+            )),
         });
         append_transfer_search_warning(
             &mut warnings,
@@ -3069,7 +3085,15 @@ async fn query_journeys_profiled_db(
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
-            detail: Some(format!("{} candidates", next_service_day_journeys.len())),
+            detail: Some(format!(
+                "{} candidates; {}",
+                next_service_day_journeys.len(),
+                if next_timing.legacy_search_attempted {
+                    "legacy fallback attempted"
+                } else {
+                    "verified-only search succeeded"
+                }
+            )),
         });
         append_transfer_search_warning(
             &mut warnings,
@@ -3455,9 +3479,9 @@ async fn service_day_journeys_db(
     let modes = mode_filters
         .iter()
         .map(|mode| db_mode_to_model(mode))
-        .collect();
+        .collect::<Vec<_>>();
     let raptor_started = time::Instant::now();
-    let journeys = raptor(
+    let mut journeys = raptor(
         timetable.as_ref(),
         RaptorRequest {
             from_stop_ids: from_stop_ids.to_vec(),
@@ -3466,9 +3490,26 @@ async fn service_day_journeys_db(
             departure_time,
             max_transfers,
             min_transfer_seconds: routing_config.min_transfer_seconds as u32,
-            modes,
+            modes: modes.clone(),
+            allow_unverified_services: false,
         },
     );
+    let legacy_search_attempted = journeys.is_empty();
+    if legacy_search_attempted {
+        journeys = raptor(
+            timetable.as_ref(),
+            RaptorRequest {
+                from_stop_ids: from_stop_ids.to_vec(),
+                to_stop_ids: to_stop_ids.to_vec(),
+                extra_transfers: extra_transfers.to_vec(),
+                departure_time,
+                max_transfers,
+                min_transfer_seconds: routing_config.min_transfer_seconds as u32,
+                modes,
+                allow_unverified_services: true,
+            },
+        );
+    }
     let raptor_ms = elapsed_millis(raptor_started);
     tracing::debug!(
         timetable_ms,
@@ -3487,6 +3528,7 @@ async fn service_day_journeys_db(
             raptor_ms,
             memory_cache_hit,
             trip_count: timetable.trip_count(),
+            legacy_search_attempted,
         },
     ))
 }
@@ -3497,6 +3539,7 @@ struct ServiceDaySearchTiming {
     raptor_ms: u64,
     memory_cache_hit: bool,
     trip_count: usize,
+    legacy_search_attempted: bool,
 }
 
 async fn raptor_timetable_cached_db(
@@ -3849,7 +3892,8 @@ async fn raptor_timetable_db(
         SELECT trip.id AS trip_id, route.id AS route_id, route.mode,
                route.gtfs_route_type, stop_time.stop_id, stop_time.stop_sequence,
                stop_time.arrival_time, stop_time.departure_time,
-               stop_time.pickup_type, stop_time.drop_off_type
+               stop_time.pickup_type, stop_time.drop_off_type,
+               trip.service_id IN (SELECT service_id FROM active_services) AS service_verified
         FROM trips trip
         JOIN routes route ON route.id = trip.route_id AND route.is_active = true
         JOIN source_feeds feed ON feed.id = trip.source_feed_id AND feed.enabled = true
@@ -3889,6 +3933,7 @@ async fn raptor_timetable_db(
                 trip_id: trip_id.clone(),
                 route_id: row.get("route_id"),
                 mode,
+                service_verified: row.get("service_verified"),
                 stop_times: Vec::new(),
             });
         }
@@ -7014,7 +7059,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v3-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v4-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -7025,8 +7070,9 @@ mod tests {
         for file_name in [
             "raptor-v1-2026-07-08-old.json",
             "raptor-v2-2026-07-08-old.json.tmp",
-            "raptor-v3-2026-07-08-current.json",
-            "raptor-v4-2026-07-08-newer.json",
+            "raptor-v3-2026-07-08-old.json",
+            "raptor-v4-2026-07-08-current.json",
+            "raptor-v5-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -7036,12 +7082,13 @@ mod tests {
 
         assert_eq!(
             prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            2
+            3
         );
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
-        assert!(directory.join("raptor-v3-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v4-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
+        assert!(directory.join("raptor-v4-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v5-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
