@@ -716,6 +716,20 @@ async fn shutdown_signal() {
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     init_tracing(config.production)?;
+    match prune_obsolete_raptor_snapshots(&config.routing_snapshot_dir).await {
+        Ok(removed) if removed > 0 => tracing::info!(
+            removed,
+            current_version = RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
+            directory = %config.routing_snapshot_dir.display(),
+            "deleted obsolete RAPTOR snapshots"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            directory = %config.routing_snapshot_dir.display(),
+            "failed to inspect RAPTOR snapshots for version cleanup"
+        ),
+    }
     let app = app_state_with_config(config.clone()).await?;
     let router = build_router(app);
     tracing::info!(address = %config.bind_address, "starting Cesta API");
@@ -3075,6 +3089,23 @@ async fn query_journeys_profiled_db(
     }
     let candidate_count = journeys.len();
     let stage_started = time::Instant::now();
+    let legacy_trip_ids = legacy_journey_trip_ids_db(pool, &journeys).await?;
+    let (preferred_journeys, verified_candidate_count, legacy_candidate_count) =
+        prefer_calendar_verified_journeys(journeys, &legacy_trip_ids);
+    journeys = preferred_journeys;
+    if verified_candidate_count > 0 && legacy_candidate_count > 0 {
+        warnings.push(format!(
+            "discarded {legacy_candidate_count} calendar-unverified journey candidates because verified alternatives were available"
+        ));
+    }
+    timing.push(
+        "legacy_service_validation",
+        stage_started,
+        Some(format!(
+            "{verified_candidate_count} verified, {legacy_candidate_count} legacy candidates"
+        )),
+    );
+    let stage_started = time::Instant::now();
     journeys = dedupe_relevant_journeys_db(pool, journeys, &routing_config).await?;
     timing.push(
         "dedupe_candidates",
@@ -3099,16 +3130,16 @@ async fn query_journeys_profiled_db(
         Some(format!("{} final journeys", journeys.len())),
     );
 
-    let stage_started = time::Instant::now();
-    let unverified_services = unverified_journey_service_count(pool, &journeys).await?;
-    timing.push(
-        "legacy_service_validation",
-        stage_started,
-        Some(format!("{unverified_services} unverified services")),
-    );
-    if unverified_services > 0 {
+    let selected_legacy_services = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.as_ref())
+        .filter(|trip_id| legacy_trip_ids.contains(*trip_id))
+        .collect::<HashSet<_>>()
+        .len();
+    if selected_legacy_services > 0 {
         warnings.push(format!(
-            "{unverified_services} selected trip services come from the latest import of a feed without calendar data; service dates cannot be verified"
+            "no calendar-verified journey was available; using {selected_legacy_services} services from the latest import of feeds without calendar data"
         ));
     }
 
@@ -3173,10 +3204,33 @@ async fn query_journeys_profiled_db(
     Ok((journey_values, warnings, related))
 }
 
-async fn unverified_journey_service_count(
+fn journey_uses_legacy_trip(journey: &Journey, legacy_trip_ids: &HashSet<String>) -> bool {
+    journey
+        .legs
+        .iter()
+        .filter_map(|leg| leg.trip_id.as_ref())
+        .any(|trip_id| legacy_trip_ids.contains(trip_id))
+}
+
+fn prefer_calendar_verified_journeys(
+    mut journeys: Vec<Journey>,
+    legacy_trip_ids: &HashSet<String>,
+) -> (Vec<Journey>, usize, usize) {
+    let legacy_count = journeys
+        .iter()
+        .filter(|journey| journey_uses_legacy_trip(journey, legacy_trip_ids))
+        .count();
+    let verified_count = journeys.len().saturating_sub(legacy_count);
+    if verified_count > 0 {
+        journeys.retain(|journey| !journey_uses_legacy_trip(journey, legacy_trip_ids));
+    }
+    (journeys, verified_count, legacy_count)
+}
+
+async fn legacy_journey_trip_ids_db(
     pool: &PgPool,
     journeys: &[Journey],
-) -> Result<i64, sqlx::Error> {
+) -> Result<HashSet<String>, sqlx::Error> {
     let trip_ids = journeys
         .iter()
         .flat_map(|journey| journey.legs.iter())
@@ -3185,11 +3239,11 @@ async fn unverified_journey_service_count(
         .into_iter()
         .collect::<Vec<_>>();
     if trip_ids.is_empty() {
-        return Ok(0);
+        return Ok(HashSet::new());
     }
-    sqlx::query_scalar(
+    Ok(sqlx::query_scalar(
         r#"
-        SELECT COUNT(*)
+        SELECT trip.id
         FROM trips trip
         WHERE trip.id = ANY($1)
           AND NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
@@ -3197,8 +3251,10 @@ async fn unverified_journey_service_count(
         "#,
     )
     .bind(trip_ids)
-    .fetch_one(pool)
-    .await
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3624,6 +3680,51 @@ fn raptor_timetable_snapshot_path(
         "raptor-v{RAPTOR_TIMETABLE_SNAPSHOT_VERSION}-{service_date}-{import_token}-{}.json",
         revision.token
     ))
+}
+
+fn raptor_snapshot_file_version(file_name: &str) -> Option<u32> {
+    let remainder = file_name.strip_prefix("raptor-v")?;
+    let (version, suffix) = remainder.split_once('-')?;
+    if !suffix.ends_with(".json") && !suffix.ends_with(".json.tmp") {
+        return None;
+    }
+    version.parse().ok()
+}
+
+async fn prune_obsolete_raptor_snapshots(
+    routing_snapshot_dir: &FsPath,
+) -> Result<usize, std::io::Error> {
+    let mut entries = match tokio::fs::read_dir(routing_snapshot_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(version) = raptor_snapshot_file_version(file_name) else {
+            continue;
+        };
+        if version >= RAPTOR_TIMETABLE_SNAPSHOT_VERSION {
+            continue;
+        }
+        match tokio::fs::remove_file(entry.path()).await {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::warn!(
+                %error,
+                path = %entry.path().display(),
+                version,
+                "failed to delete obsolete RAPTOR snapshot"
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 async fn load_raptor_timetable_snapshot(
@@ -6918,6 +7019,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn obsolete_raptor_snapshots_are_deleted_without_touching_other_files() {
+        let directory = std::env::temp_dir().join(format!("cesta-raptor-prune-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        for file_name in [
+            "raptor-v1-2026-07-08-old.json",
+            "raptor-v2-2026-07-08-old.json.tmp",
+            "raptor-v3-2026-07-08-current.json",
+            "raptor-v4-2026-07-08-newer.json",
+            "notes.json",
+        ] {
+            tokio::fs::write(directory.join(file_name), b"test")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
+            2
+        );
+        assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
+        assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
+        assert!(directory.join("raptor-v3-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v4-2026-07-08-newer.json").exists());
+        assert!(directory.join("notes.json").exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn health_endpoint() {
         let app = build_router(app_state().await.unwrap());
         let response = app
@@ -7832,6 +7961,35 @@ mod tests {
             risk_score: 0.0,
             labels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn calendar_verified_journeys_replace_legacy_candidates_when_available() {
+        let verified = test_journey("verified", 0, 1_000, 2_000);
+        let legacy = test_journey("legacy", 0, 900, 1_500);
+        let legacy_trip_ids = HashSet::from(["trip-legacy".to_string()]);
+
+        let (journeys, verified_count, legacy_count) =
+            prefer_calendar_verified_journeys(vec![legacy, verified], &legacy_trip_ids);
+
+        assert_eq!(verified_count, 1);
+        assert_eq!(legacy_count, 1);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].id, "verified");
+    }
+
+    #[test]
+    fn legacy_journeys_remain_as_last_resort_without_verified_candidates() {
+        let legacy = test_journey("legacy", 0, 900, 1_500);
+        let legacy_trip_ids = HashSet::from(["trip-legacy".to_string()]);
+
+        let (journeys, verified_count, legacy_count) =
+            prefer_calendar_verified_journeys(vec![legacy], &legacy_trip_ids);
+
+        assert_eq!(verified_count, 0);
+        assert_eq!(legacy_count, 1);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].id, "legacy");
     }
 
     #[test]
