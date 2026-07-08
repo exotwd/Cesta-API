@@ -290,6 +290,8 @@ struct StopSearchQuery {
     limit: Option<usize>,
     #[serde(rename = "includeCities", alias = "include_cities", default)]
     include_cities: bool,
+    #[serde(rename = "includeRelated", alias = "include_related", default)]
+    include_related: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4962,6 +4964,25 @@ async fn search_stops_db(
     limit: usize,
 ) -> Result<Vec<Stop>, sqlx::Error> {
     let normalized = normalize_czech_name(raw_query);
+    let candidate_limit = stop_search_candidate_limit(limit);
+    if normalized.is_empty() {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+                   lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+                   platform_code, modes, source_priority, is_active
+            FROM stops
+            WHERE is_active = true
+            ORDER BY source_priority ASC, name ASC, platform_code ASC NULLS FIRST, id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(candidate_limit)
+        .fetch_all(pool)
+        .await?;
+        return rows.into_iter().map(stop_from_row).collect();
+    }
+
     let like = format!("%{normalized}%");
     let raw_like = format!("%{}%", raw_query.trim());
     let first_token = normalized_query
@@ -4993,7 +5014,7 @@ async fn search_stops_db(
           platform_code IS NULL DESC,
           source_priority ASC,
           name ASC
-        LIMIT 250
+        LIMIT $7
         "#,
     )
     .bind(&normalized)
@@ -5002,6 +5023,7 @@ async fn search_stops_db(
     .bind(raw_query.trim())
     .bind(&first_token_like)
     .bind(raw_query.trim())
+    .bind(candidate_limit)
     .fetch_all(pool)
     .await?;
 
@@ -5014,6 +5036,10 @@ async fn search_stops_db(
         normalized_query,
         limit,
     ))
+}
+
+fn stop_search_candidate_limit(limit: usize) -> i64 {
+    (limit.max(1) * 6).clamp(20, 100) as i64
 }
 
 async fn search_cities_db(
@@ -6119,6 +6145,13 @@ mod tests {
                 .iter()
                 .any(|parameter| parameter["name"] == "includeCities")
         );
+        assert!(
+            payload["paths"]["/stops/search"]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["name"] == "includeRelated")
+        );
         assert_eq!(
             payload["components"]["schemas"]["JourneyPoint"]["properties"]["type"]["enum"],
             json!(["stop", "city"])
@@ -6513,6 +6546,13 @@ mod tests {
         let suggestions = ranked_stop_suggestions([&prague, &brno].into_iter(), "namesti", 10);
 
         assert_eq!(suggestions.len(), 2);
+    }
+
+    #[test]
+    fn stop_search_candidate_limit_stays_small_for_autocomplete() {
+        assert_eq!(stop_search_candidate_limit(1), 20);
+        assert_eq!(stop_search_candidate_limit(10), 60);
+        assert_eq!(stop_search_candidate_limit(50), 100);
     }
 
     #[tokio::test]

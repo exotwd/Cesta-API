@@ -8,38 +8,58 @@ pub(crate) async fn search_stops(
     let normalized = normalize_search_text(&q);
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
     if let Some(pool) = &state.db {
+        let stop_limit = if query.include_cities {
+            limit.saturating_mul(2).min(50)
+        } else {
+            limit
+        };
         let (stops_result, cities) = if query.include_cities {
             let (stops, cities) = tokio::join!(
-                search_stops_db(pool, &q, &normalized, 50),
-                search_cities_db(pool, &q, &normalized, 50)
+                search_stops_db(pool, &q, &normalized, stop_limit),
+                search_cities_db(pool, &q, &normalized, limit)
             );
             (stops, cities.unwrap_or_default())
         } else {
-            (search_stops_db(pool, &q, &normalized, 50).await, Vec::new())
+            (
+                search_stops_db(pool, &q, &normalized, stop_limit).await,
+                Vec::new(),
+            )
         };
         return match stops_result {
             Ok(stops) => {
                 let (results, visible_cities, visible_stops) =
                     ranked_place_suggestions(&cities, &stops, &normalized, limit);
-                let related = stop_search_related_data_db(pool, &visible_stops)
-                    .await
-                    .unwrap_or_else(|error| {
-                        json!({"warnings": [format!("database stop related data failed: {error}")]})
-                    });
+                let related = if query.include_related {
+                    Some(
+                        stop_search_related_data_db(pool, &visible_stops)
+                            .await
+                            .unwrap_or_else(|error| {
+                                json!({"warnings": [format!("database stop related data failed: {error}")]})
+                            }),
+                    )
+                } else {
+                    None
+                };
                 if query.include_cities {
-                    Json(json!({
+                    let mut response = json!({
                         "results": results,
                         "cities": visible_cities.into_iter().map(|city| city_search_json(&city)).collect::<Vec<_>>(),
                         "stops": visible_stops.iter().map(stop_search_json).collect::<Vec<_>>(),
-                        "related": related,
                         "data_status": database_data_status()
-                    }))
+                    });
+                    if let Some(related) = related {
+                        response["related"] = related;
+                    }
+                    Json(response)
                 } else {
-                    Json(json!({
+                    let mut response = json!({
                         "stops": visible_stops.iter().map(stop_search_json).collect::<Vec<_>>(),
-                        "related": related,
                         "data_status": database_data_status()
-                    }))
+                    });
+                    if let Some(related) = related {
+                        response["related"] = related;
+                    }
+                    Json(response)
                 }
             }
             Err(error) => {
