@@ -125,6 +125,7 @@ impl RaptorTimetable {
 pub struct RaptorRequest {
     pub from_stop_ids: Vec<String>,
     pub to_stop_ids: Vec<String>,
+    pub extra_transfers: Vec<Transfer>,
     pub departure_time: u32,
     pub max_transfers: u32,
     pub min_transfer_seconds: u32,
@@ -155,6 +156,13 @@ enum RaptorParent {
 pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journey> {
     let allowed_modes = request.modes.into_iter().collect::<HashSet<_>>();
     let target_stops = request.to_stop_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut extra_transfers_by_stop = HashMap::<String, Vec<Transfer>>::new();
+    for transfer in request.extra_transfers {
+        extra_transfers_by_stop
+            .entry(transfer.from_stop_id.clone())
+            .or_default()
+            .push(transfer);
+    }
     let max_rounds = request.max_transfers as usize + 1;
     let mut best = HashMap::<String, u32>::new();
     let mut rounds = vec![HashMap::<String, u32>::new(); max_rounds + 1];
@@ -173,6 +181,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
         &mut marked,
         &mut parents,
         &timetable.transfers_by_stop,
+        &extra_transfers_by_stop,
         u32::MAX,
     );
 
@@ -276,6 +285,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             &mut marked,
             &mut parents,
             &timetable.transfers_by_stop,
+            &extra_transfers_by_stop,
             best_target,
         );
     }
@@ -295,6 +305,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
         let departure_time = legs
             .first()
             .map_or(request.departure_time, |leg| leg.departure_time);
+        let walking_distance_meters = journey_walking_distance_meters(&legs);
         journeys.push(Journey {
             id: String::new(),
             legs,
@@ -302,7 +313,7 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             arrival_time,
             duration_seconds: arrival_time.saturating_sub(departure_time),
             transfer_count: round.saturating_sub(1) as u32,
-            walking_distance_meters: 0,
+            walking_distance_meters,
             realtime_status: RealtimeStatus::Unavailable,
             risk_score: 0.0,
             labels: Vec::new(),
@@ -320,6 +331,7 @@ fn relax_raptor_transfers(
     marked: &mut HashSet<String>,
     parents: &mut HashMap<(usize, String), RaptorParent>,
     transfers_by_stop: &HashMap<String, Vec<Transfer>>,
+    extra_transfers_by_stop: &HashMap<String, Vec<Transfer>>,
     best_target: u32,
 ) {
     let mut queue = marked.iter().cloned().collect::<Vec<_>>();
@@ -327,7 +339,12 @@ fn relax_raptor_transfers(
         let Some(departure_time) = rounds[round].get(&from).copied() else {
             continue;
         };
-        for transfer in transfers_by_stop.get(&from).into_iter().flatten() {
+        for transfer in transfers_by_stop
+            .get(&from)
+            .into_iter()
+            .flatten()
+            .chain(extra_transfers_by_stop.get(&from).into_iter().flatten())
+        {
             let arrival_time = departure_time.saturating_add(transfer.min_transfer_seconds);
             if arrival_time >= best_target
                 || arrival_time >= best.get(&transfer.to_stop_id).copied().unwrap_or(u32::MAX)
@@ -406,6 +423,15 @@ fn reconstruct_raptor_journey(
         legs.reverse();
         legs
     })
+}
+
+fn journey_walking_distance_meters(legs: &[JourneyLeg]) -> u32 {
+    legs.iter()
+        .filter(|leg| leg.route_id.is_none() && leg.trip_id.is_none())
+        .flat_map(|leg| leg.warnings.iter())
+        .filter_map(|warning| warning.strip_prefix("walking_transfer:"))
+        .filter_map(|distance| distance.parse::<u32>().ok())
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -797,6 +823,7 @@ mod tests {
             RaptorRequest {
                 from_stop_ids: vec!["a".into()],
                 to_stop_ids: vec!["c".into()],
+                extra_transfers: Vec::new(),
                 departure_time: 8 * 3600,
                 max_transfers: 2,
                 min_transfer_seconds: 5 * 60,
@@ -808,5 +835,55 @@ mod tests {
         assert_eq!(journeys[0].transfer_count, 1);
         assert_eq!(journeys[0].arrival_time, 9 * 3600 + 1800);
         assert_eq!(journeys[1].transfer_count, 0);
+    }
+
+    #[test]
+    fn raptor_can_start_from_nearby_stop_with_request_transfer() {
+        let stop_time = |stop: &str, arrival, departure| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: arrival,
+            departure_time: departure,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![RaptorTrip {
+                trip_id: "nearby-trip".into(),
+                route_id: "nearby-route".into(),
+                mode: TransportMode::Bus,
+                stop_times: vec![
+                    stop_time("nearby", 8 * 3600 + 180, 8 * 3600 + 180),
+                    stop_time("target", 8 * 3600 + 1800, 8 * 3600 + 1800),
+                ],
+            }],
+            Vec::new(),
+        );
+
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["selected".into()],
+                to_stop_ids: vec!["target".into()],
+                extra_transfers: vec![Transfer {
+                    from_stop_id: "selected".into(),
+                    to_stop_id: "nearby".into(),
+                    min_transfer_seconds: 120,
+                    distance_meters: Some(150),
+                    walking_geometry: None,
+                    confidence: CoordinateConfidence::Medium,
+                    accessibility_level: None,
+                    source: "test".into(),
+                }],
+                departure_time: 8 * 3600,
+                max_transfers: 1,
+                min_transfer_seconds: 5 * 60,
+                modes: vec![TransportMode::Bus],
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].legs[0].from_stop_id, "selected");
+        assert_eq!(journeys[0].legs[0].to_stop_id, "nearby");
+        assert_eq!(journeys[0].walking_distance_meters, 150);
     }
 }

@@ -73,6 +73,8 @@ const NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS: u32 = 18 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
+const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
+const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
@@ -2500,9 +2502,19 @@ async fn query_journeys_db(
         return Ok((
             Vec::new(),
             warnings,
-            json!({"query_context": journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids)}),
+            json!({"query_context": journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids, 0)}),
         ));
     }
+
+    let nearby_transfers = nearby_journey_transfers_db(
+        pool,
+        &body.from,
+        &from_stop_ids,
+        &body.to,
+        &to_stop_ids,
+        walking_speed_meters_per_second(&body.walking_speed),
+    )
+    .await?;
 
     let mode_filters = body
         .transport_modes
@@ -2519,6 +2531,7 @@ async fn query_journeys_db(
         body.max_transfers,
         service_date,
         &routing_config,
+        &nearby_transfers.transfers,
     );
     let include_next_service_day = should_search_next_service_day(
         departure_time,
@@ -2535,6 +2548,7 @@ async fn query_journeys_db(
             body.max_transfers,
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
+            &nearby_transfers.transfers,
         );
         let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
         (current, Some(next))
@@ -2581,6 +2595,7 @@ async fn query_journeys_db(
             body.max_transfers,
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
+            &nearby_transfers.transfers,
         )
         .await?;
         append_transfer_search_warning(
@@ -2600,7 +2615,7 @@ async fn query_journeys_db(
         }
     }
     let candidate_count = journeys.len();
-    journeys = dedupe_relevant_journeys_db(pool, journeys).await?;
+    journeys = dedupe_relevant_journeys_db(pool, journeys, &routing_config).await?;
     let removed_candidates = candidate_count.saturating_sub(journeys.len());
     if removed_candidates > 0 {
         warnings.push(format!(
@@ -2640,8 +2655,13 @@ async fn query_journeys_db(
     related["realtime_updates"] = Value::Array(realtime_updates);
     related["realtime_status"] = json!(journeys_realtime_status(&journey_values));
     related["intermediate_stops_included"] = json!(body.include_intermediate_stops);
-    related["query_context"] =
-        journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids);
+    related["query_context"] = journey_query_context(
+        body,
+        departure_time,
+        &from_stop_ids,
+        &to_stop_ids,
+        nearby_transfers.transfers.len(),
+    );
 
     Ok((journey_values, warnings, related))
 }
@@ -2652,6 +2672,139 @@ enum TransferSearchStatus {
     Complete,
     TimedOut,
     Failed,
+}
+
+#[derive(Debug, Default)]
+struct NearbyJourneyTransfers {
+    transfers: Vec<Transfer>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn nearby_journey_transfers_db(
+    pool: &PgPool,
+    from_point: &JourneyPoint,
+    from_stop_ids: &[String],
+    to_point: &JourneyPoint,
+    to_stop_ids: &[String],
+    walking_speed_mps: f64,
+) -> Result<NearbyJourneyTransfers, sqlx::Error> {
+    let mut transfers = Vec::new();
+    if from_point.point_type == "stop" {
+        transfers.extend(
+            nearby_endpoint_transfers_db(pool, from_stop_ids, true, walking_speed_mps).await?,
+        );
+    }
+    if to_point.point_type == "stop" {
+        transfers.extend(
+            nearby_endpoint_transfers_db(pool, to_stop_ids, false, walking_speed_mps).await?,
+        );
+    }
+
+    transfers.sort_by(|left, right| {
+        left.from_stop_id
+            .cmp(&right.from_stop_id)
+            .then_with(|| left.to_stop_id.cmp(&right.to_stop_id))
+            .then_with(|| left.min_transfer_seconds.cmp(&right.min_transfer_seconds))
+    });
+    transfers.dedup_by(|left, right| {
+        left.from_stop_id == right.from_stop_id && left.to_stop_id == right.to_stop_id
+    });
+
+    Ok(NearbyJourneyTransfers { transfers })
+}
+
+async fn nearby_endpoint_transfers_db(
+    pool: &PgPool,
+    selected_stop_ids: &[String],
+    access_to_origin: bool,
+    walking_speed_mps: f64,
+) -> Result<Vec<Transfer>, sqlx::Error> {
+    if selected_stop_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sql = if access_to_origin {
+        r#"
+        SELECT from_stop_id, to_stop_id, distance_meters
+        FROM (
+          SELECT DISTINCT ON (candidate.id)
+            selected.id AS from_stop_id,
+            candidate.id AS to_stop_id,
+            ST_Distance(selected.geom, candidate.geom)::integer AS distance_meters
+          FROM stops selected
+          JOIN stops candidate
+            ON candidate.is_active = true
+           AND candidate.geom IS NOT NULL
+           AND candidate.id <> ALL($1)
+           AND ST_DWithin(selected.geom, candidate.geom, $2)
+          WHERE selected.id = ANY($1)
+            AND selected.is_active = true
+            AND selected.geom IS NOT NULL
+          ORDER BY candidate.id, ST_Distance(selected.geom, candidate.geom) ASC
+        ) candidates
+        ORDER BY distance_meters ASC
+        LIMIT $3
+        "#
+    } else {
+        r#"
+        SELECT from_stop_id, to_stop_id, distance_meters
+        FROM (
+          SELECT DISTINCT ON (candidate.id)
+            candidate.id AS from_stop_id,
+            selected.id AS to_stop_id,
+            ST_Distance(candidate.geom, selected.geom)::integer AS distance_meters
+          FROM stops selected
+          JOIN stops candidate
+            ON candidate.is_active = true
+           AND candidate.geom IS NOT NULL
+           AND candidate.id <> ALL($1)
+           AND ST_DWithin(candidate.geom, selected.geom, $2)
+          WHERE selected.id = ANY($1)
+            AND selected.is_active = true
+            AND selected.geom IS NOT NULL
+          ORDER BY candidate.id, ST_Distance(candidate.geom, selected.geom) ASC
+        ) candidates
+        ORDER BY distance_meters ASC
+        LIMIT $3
+        "#
+    };
+
+    let rows = sqlx::query(sql)
+        .bind(selected_stop_ids.to_vec())
+        .bind(NEARBY_JOURNEY_STOP_RADIUS_M)
+        .bind(MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let distance = row.get::<i32, _>("distance_meters").max(0) as u32;
+            Transfer {
+                from_stop_id: row.get("from_stop_id"),
+                to_stop_id: row.get("to_stop_id"),
+                min_transfer_seconds: walking_transfer_seconds(distance, walking_speed_mps),
+                distance_meters: Some(distance),
+                walking_geometry: None,
+                confidence: CoordinateConfidence::Medium,
+                accessibility_level: None,
+                source: "journey_nearby_stop_fallback".to_string(),
+            }
+        })
+        .collect())
+}
+
+fn walking_speed_meters_per_second(value: &str) -> f64 {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "slow" | "relaxed" | "accessible" => 0.9,
+        "fast" => 1.6,
+        _ => 1.25,
+    }
+}
+
+fn walking_transfer_seconds(distance_meters: u32, walking_speed_mps: f64) -> u32 {
+    let speed = walking_speed_mps.clamp(0.5, 2.5);
+    ((distance_meters as f64 * 1.2) / speed).ceil().max(30.0) as u32
 }
 
 fn append_transfer_search_warning(
@@ -2715,6 +2868,7 @@ async fn service_day_journeys_db(
     max_transfers: u32,
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
+    extra_transfers: &[Transfer],
 ) -> Result<(Vec<Journey>, TransferSearchStatus), sqlx::Error> {
     let started_at = time::Instant::now();
     let timetable = raptor_timetable_cached_db(pool, raptor_cache, service_date).await?;
@@ -2727,6 +2881,7 @@ async fn service_day_journeys_db(
         RaptorRequest {
             from_stop_ids: from_stop_ids.to_vec(),
             to_stop_ids: to_stop_ids.to_vec(),
+            extra_transfers: extra_transfers.to_vec(),
             departure_time,
             max_transfers,
             min_transfer_seconds: routing_config.min_transfer_seconds as u32,
@@ -2890,6 +3045,7 @@ fn journey_query_context(
     departure_time: u32,
     from_stop_ids: &[String],
     to_stop_ids: &[String],
+    nearby_transfer_count: usize,
 ) -> Value {
     json!({
         "requested_datetime": body.datetime,
@@ -2898,7 +3054,8 @@ fn journey_query_context(
         "transport_modes": body.transport_modes,
         "include_intermediate_stops": body.include_intermediate_stops,
         "from_stop_ids": from_stop_ids,
-        "to_stop_ids": to_stop_ids
+        "to_stop_ids": to_stop_ids,
+        "nearby_walking_transfer_count": nearby_transfer_count
     })
 }
 
@@ -2930,6 +3087,7 @@ fn shift_journey_service_day(mut journey: Journey, offset_seconds: u32) -> Journ
 async fn dedupe_relevant_journeys_db(
     pool: &PgPool,
     journeys: Vec<Journey>,
+    routing_config: &RoutingAlgorithmConfig,
 ) -> Result<Vec<Journey>, sqlx::Error> {
     let stop_ids = journeys
         .iter()
@@ -3015,6 +3173,7 @@ async fn dedupe_relevant_journeys_db(
         journeys,
         &stop_signatures,
         &route_priorities,
+        routing_config,
     ))
 }
 
@@ -3022,8 +3181,9 @@ fn dedupe_relevant_journeys(
     mut journeys: Vec<Journey>,
     stop_signatures: &HashMap<String, String>,
     route_priorities: &HashMap<String, i32>,
+    routing_config: &RoutingAlgorithmConfig,
 ) -> Vec<Journey> {
-    journeys.retain(|journey| journey_is_relevant(journey, stop_signatures));
+    journeys.retain(|journey| journey_is_relevant(journey, stop_signatures, routing_config));
     journeys.sort_by_key(|journey| {
         journey
             .legs
@@ -3043,7 +3203,11 @@ fn dedupe_relevant_journeys(
     journeys
 }
 
-fn journey_is_relevant(journey: &Journey, stop_signatures: &HashMap<String, String>) -> bool {
+fn journey_is_relevant(
+    journey: &Journey,
+    stop_signatures: &HashMap<String, String>,
+    routing_config: &RoutingAlgorithmConfig,
+) -> bool {
     let Some(first_leg) = journey.legs.first() else {
         return false;
     };
@@ -3059,8 +3223,11 @@ fn journey_is_relevant(journey: &Journey, stop_signatures: &HashMap<String, Stri
     }
     let mut trip_ids = HashSet::new();
     for (index, leg) in journey.legs.iter().enumerate() {
-        if leg.arrival_time < leg.departure_time
-            || stop_signature(&leg.from_stop_id, stop_signatures)
+        if leg.arrival_time < leg.departure_time {
+            return false;
+        }
+        if !is_walking_leg(leg)
+            && stop_signature(&leg.from_stop_id, stop_signatures)
                 == stop_signature(&leg.to_stop_id, stop_signatures)
         {
             return false;
@@ -3073,15 +3240,27 @@ fn journey_is_relevant(journey: &Journey, stop_signatures: &HashMap<String, Stri
         if let Some(next_leg) = journey.legs.get(index + 1) {
             let wait = next_leg.departure_time.saturating_sub(leg.arrival_time);
             if next_leg.departure_time < leg.arrival_time
-                || !(MIN_TRANSFER_SECONDS..=MAX_TRANSFER_WAIT_SECONDS).contains(&wait)
                 || stop_signature(&leg.to_stop_id, stop_signatures)
                     != stop_signature(&next_leg.from_stop_id, stop_signatures)
             {
                 return false;
             }
+            let max_wait = routing_config.max_transfer_wait_seconds.max(0) as u32;
+            let min_wait = routing_config.min_transfer_seconds.max(0) as u32;
+            if is_walking_leg(leg) || is_walking_leg(next_leg) {
+                if wait > max_wait {
+                    return false;
+                }
+            } else if !(min_wait..=max_wait).contains(&wait) {
+                return false;
+            }
         }
     }
     true
+}
+
+fn is_walking_leg(leg: &JourneyLeg) -> bool {
+    leg.route_id.is_none() && leg.trip_id.is_none()
 }
 
 fn visible_journey_key(journey: &Journey, stop_signatures: &HashMap<String, String>) -> String {
@@ -7174,6 +7353,7 @@ mod tests {
             vec![aggregate, official],
             &stop_signatures,
             &route_priorities,
+            &RoutingAlgorithmConfig::default(),
         );
 
         assert_eq!(deduplicated.len(), 1);
@@ -7190,7 +7370,70 @@ mod tests {
             ("transfer-bad-transfer".to_string(), "transfer".to_string()),
         ]);
 
-        assert!(!journey_is_relevant(&journey, &signatures));
+        assert!(!journey_is_relevant(
+            &journey,
+            &signatures,
+            &RoutingAlgorithmConfig::default()
+        ));
+    }
+
+    #[test]
+    fn relevance_filter_allows_immediate_walking_interchange() {
+        let journey = Journey {
+            id: "walk-transfer".to_string(),
+            legs: vec![
+                JourneyLeg {
+                    from_stop_id: "a".to_string(),
+                    to_stop_id: "b".to_string(),
+                    route_id: Some("route-a".to_string()),
+                    trip_id: Some("trip-a".to_string()),
+                    departure_time: 3_600,
+                    arrival_time: 4_200,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+                JourneyLeg {
+                    from_stop_id: "b".to_string(),
+                    to_stop_id: "c".to_string(),
+                    route_id: None,
+                    trip_id: None,
+                    departure_time: 4_200,
+                    arrival_time: 4_320,
+                    mode: TransportMode::Unknown,
+                    warnings: vec!["walking_transfer:120".to_string()],
+                },
+                JourneyLeg {
+                    from_stop_id: "c".to_string(),
+                    to_stop_id: "d".to_string(),
+                    route_id: Some("route-b".to_string()),
+                    trip_id: Some("trip-b".to_string()),
+                    departure_time: 4_320,
+                    arrival_time: 5_400,
+                    mode: TransportMode::Train,
+                    warnings: Vec::new(),
+                },
+            ],
+            departure_time: 3_600,
+            arrival_time: 5_400,
+            duration_seconds: 1_800,
+            transfer_count: 1,
+            walking_distance_meters: 120,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: Vec::new(),
+        };
+        let signatures = HashMap::from([
+            ("a".to_string(), "a".to_string()),
+            ("b".to_string(), "b".to_string()),
+            ("c".to_string(), "c".to_string()),
+            ("d".to_string(), "d".to_string()),
+        ]);
+
+        assert!(journey_is_relevant(
+            &journey,
+            &signatures,
+            &RoutingAlgorithmConfig::default()
+        ));
     }
 
     #[test]
