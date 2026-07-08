@@ -127,4 +127,4 @@ class JourneyStopCall {
 
 The API removes source-level duplicate connections and invalid transfer candidates before ranking. The app should not independently merge journeys with different times or transfer patterns.
 
-The requested `datetime` date is checked against GTFS `calendar.txt` and `calendar_dates.txt`. Always display top-level API `warnings`; a legacy source imported before calendar support is marked as unverified until that source is refreshed.
+The requested `datetime` date is checked against GTFS `calendar.txt` and `calendar_dates.txt`. Sources imported before calendar support are excluded from route results until they are refreshed. Always display top-level API `warnings`.

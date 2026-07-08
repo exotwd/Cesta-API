@@ -1052,6 +1052,49 @@
       </div>`;
   }
 
+  function formatMilliseconds(value) {
+    const milliseconds = Number(value || 0);
+    return milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(2)} s` : `${milliseconds} ms`;
+  }
+
+  function renderRoutingDebug(payload) {
+    const diagnostics = payload.search_diagnostics || {};
+    const target = $("#routing-debug");
+    const stages = Array.isArray(diagnostics.stage_aggregates) ? diagnostics.stage_aggregates : [];
+    const recent = Array.isArray(diagnostics.recent) ? diagnostics.recent : [];
+    const improvements = Array.isArray(diagnostics.implemented_improvements) ? diagnostics.implemented_improvements : [];
+    if (!diagnostics.sample_count) {
+      target.innerHTML = `<div class="routing-debug-empty">No route searches have been measured since this API process started.</div>`;
+      return;
+    }
+    const bottleneck = diagnostics.bottleneck || {};
+    target.innerHTML = `
+      <div class="routing-debug-overview">
+        <div><span>Average total</span><strong>${formatMilliseconds(diagnostics.average_total_ms)}</strong><small>${escapeHtml(diagnostics.sample_count)} samples retained</small></div>
+        <div><span>Slowest search</span><strong>${formatMilliseconds(diagnostics.max_total_ms)}</strong><small>Latest ${escapeHtml(Math.min(recent.length, 10))} shown below</small></div>
+        <div><span>Observed bottleneck</span><strong>${escapeHtml(bottleneck.stage || "Unknown")}</strong><small>${formatMilliseconds(bottleneck.average_ms)} average; ${formatMilliseconds(bottleneck.max_ms)} maximum</small></div>
+      </div>
+      <div class="routing-debug-columns">
+        <div>
+          <h3>Stage aggregates</h3>
+          <div class="routing-debug-rows">
+            ${stages.map((stage) => `<div class="routing-debug-row"><strong>${escapeHtml(stage.stage)}</strong><span>${formatMilliseconds(stage.average_ms)} avg</span><span>${formatMilliseconds(stage.max_ms)} max</span><small>${escapeHtml(stage.samples)} samples</small></div>`).join("")}
+          </div>
+        </div>
+        <div>
+          <h3>Applied improvements</h3>
+          <div class="routing-debug-improvements">${improvements.map((item) => `<div><i data-lucide="check"></i><span>${escapeHtml(item)}</span></div>`).join("")}</div>
+        </div>
+      </div>
+      <div class="routing-debug-recent">
+        <h3>Recent searches</h3>
+        ${recent.map((search) => `<div class="routing-debug-search">
+          <div><strong>${formatMilliseconds(search.total_ms)}</strong><span>${escapeHtml(formatDate(search.started_at))}</span><small>${search.success ? `${escapeHtml(search.result_count)} results` : "Failed"}</small></div>
+          <div>${(search.stages || []).map((stage) => `<span title="${escapeHtml(stage.detail || "")}">${escapeHtml(stage.stage)} <strong>${formatMilliseconds(stage.elapsed_ms)}</strong></span>`).join("")}</div>
+        </div>`).join("")}
+      </div>`;
+  }
+
   function renderRoutingForm(payload) {
     state.routingConfiguration = payload.configuration;
     state.routingDefaults = payload.defaults;
@@ -1093,6 +1136,7 @@
     }));
     renderRoutingSummary();
     renderRoutingCache(payload);
+    renderRoutingDebug(payload);
     iconRefresh();
   }
 

@@ -27,7 +27,8 @@ All three endpoints require an `admin` or `data_admin` access token.
 
 The API keeps route search fast by serving RAPTOR from memory. On cache miss it first tries a
 serialized timetable snapshot from `ROUTING_SNAPSHOT_DIR` (default
-`storage/processed/routing`) keyed by service date and latest successful import timestamp. If the
+`storage/processed/routing`) keyed by service date, latest successful imports, and enabled source
+state. Only enabled feeds with calendar-confirmed service on the requested date are included. If the
 snapshot is missing or stale, the API rebuilds the timetable from PostgreSQL, writes a replacement
 snapshot, and stores it in the in-memory cache. A background warmer refreshes today and tomorrow
 every minute so new imports are picked up before most user searches; it never runs an import on API
@@ -35,6 +36,11 @@ startup.
 
 `GET /admin/routing-algorithm` also reports `snapshot_status`: configured snapshot directory,
 latest-import key, file sizes, per-date in-memory status, and the current background warmup stage.
+
+The endpoint also reports bounded in-memory `search_diagnostics` for the latest 50 route searches.
+It includes total latency, per-stage timings, cache-hit detail, stage averages and maxima, and the
+currently observed bottleneck. Diagnostics reset when the API process restarts and are not exposed
+on the public journey response.
 
 The admin page separates controls into:
 

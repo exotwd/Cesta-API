@@ -364,7 +364,7 @@ pub(crate) async fn openapi() -> Json<Value> {
         "RoutingAlgorithmPayload".to_string(),
         json!({
             "type": "object",
-            "required": ["configuration", "defaults", "database_available", "snapshot_status"],
+            "required": ["configuration", "defaults", "database_available", "snapshot_status", "search_diagnostics"],
             "properties": {
                 "configuration": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"},
                 "defaults": {"$ref": "#/components/schemas/RoutingAlgorithmConfig"},
@@ -372,9 +372,27 @@ pub(crate) async fn openapi() -> Json<Value> {
                 "updated_at": {"type": ["string", "null"], "format": "date-time"},
                 "updated_by": {"type": ["string", "null"]},
                 "snapshot_status": {"$ref": "#/components/schemas/RoutingSnapshotStatus"},
+                "search_diagnostics": {"$ref": "#/components/schemas/RouteSearchDiagnostics"},
                 "activation": {"type": "string"},
                 "scoring_formula": {"type": "string"},
                 "fare_note": {"type": "string"}
+            }
+        }),
+    );
+    schemas.insert(
+        "RouteSearchDiagnostics".to_string(),
+        json!({
+            "type": "object",
+            "required": ["retained_limit", "sample_count", "average_total_ms", "max_total_ms", "stage_aggregates", "recent", "implemented_improvements"],
+            "properties": {
+                "retained_limit": {"type": "integer", "minimum": 1},
+                "sample_count": {"type": "integer", "minimum": 0},
+                "average_total_ms": {"type": "integer", "minimum": 0},
+                "max_total_ms": {"type": "integer", "minimum": 0},
+                "bottleneck": {"type": ["object", "null"], "additionalProperties": true},
+                "stage_aggregates": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                "recent": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+                "implemented_improvements": {"type": "array", "items": {"type": "string"}}
             }
         }),
     );

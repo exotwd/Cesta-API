@@ -573,6 +573,7 @@ impl TicketingService {
                 ))
             })
             .collect::<HashMap<_, _>>();
+        let mut records = Vec::new();
         for journey in journeys {
             let legs = journey
                 .get("legs")
@@ -608,14 +609,7 @@ impl TicketingService {
                 snapshot: json!({"journeyId":journey.get("id"),"serviceDate":service_date,"departureSeconds":journey.get("departure_time"),"arrivalSeconds":journey.get("arrival_time"),"legs":snapshot_legs,"candidateSegmentIndexes":candidate_indexes}),
                 expires_at: Utc::now() + chrono::Duration::minutes(30),
             };
-            self.memory
-                .write()
-                .await
-                .journey_refs
-                .insert(reference, record.clone());
-            if let Some(db) = &self.db {
-                sqlx::query("INSERT INTO cd_ticketing_journey_refs(id,journey_snapshot,expires_at) VALUES($1,$2,$3)").bind(record.id).bind(&record.snapshot).bind(record.expires_at).execute(db).await.map_err(db_error)?;
-            }
+            records.push(record);
             let all_supported = legs.iter().all(|leg| {
                 matches!(
                     leg.get("mode").and_then(Value::as_str),
@@ -623,6 +617,36 @@ impl TicketingService {
                 )
             });
             journey["ticketing"] = json!({"provider":"cd","journeyReference":reference,"authenticationRequired":true,"availability":"authentication_required","indicativePriceHellers":Value::Null,"currency":"CZK","completeJourneyTicketable":Value::Null,"scope":if all_supported{"complete_journey_candidate"}else{"segments"},"segments":segments});
+        }
+        if !records.is_empty() {
+            let mut memory = self.memory.write().await;
+            for record in &records {
+                memory.journey_refs.insert(record.id, record.clone());
+            }
+            drop(memory);
+            if let Some(db) = &self.db {
+                let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+                let snapshots = records
+                    .iter()
+                    .map(|record| record.snapshot.clone())
+                    .collect::<Vec<_>>();
+                let expirations = records
+                    .iter()
+                    .map(|record| record.expires_at)
+                    .collect::<Vec<_>>();
+                sqlx::query(
+                    r#"
+                    INSERT INTO cd_ticketing_journey_refs (id, journey_snapshot, expires_at)
+                    SELECT * FROM UNNEST($1::uuid[], $2::jsonb[], $3::timestamptz[])
+                    "#,
+                )
+                .bind(ids)
+                .bind(snapshots)
+                .bind(expirations)
+                .execute(db)
+                .await
+                .map_err(db_error)?;
+            }
         }
         Ok(())
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -19,6 +19,7 @@ use routing_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tokio::{
     sync::{OnceCell, RwLock},
@@ -76,18 +77,78 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 1;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 2;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
+const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
 const ADMIN_VALIDATION_SOURCE_FILE: &str = "admin_database_validation";
 const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 
-type RaptorCacheKey = (chrono::NaiveDate, Option<DateTime<Utc>>);
+type RaptorCacheKey = (chrono::NaiveDate, String);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
 type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
 type RoutingWarmupStatus = Arc<RwLock<RoutingWarmupState>>;
+type RouteSearchDiagnostics = Arc<RwLock<VecDeque<RouteSearchTiming>>>;
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteSearchStageTiming {
+    stage: String,
+    elapsed_ms: u64,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RouteSearchTiming {
+    started_at: DateTime<Utc>,
+    service_date: chrono::NaiveDate,
+    total_ms: u64,
+    success: bool,
+    result_count: usize,
+    stages: Vec<RouteSearchStageTiming>,
+}
+
+struct RouteSearchTimingBuilder {
+    started_at: DateTime<Utc>,
+    started: time::Instant,
+    service_date: chrono::NaiveDate,
+    stages: Vec<RouteSearchStageTiming>,
+}
+
+impl RouteSearchTimingBuilder {
+    fn new(service_date: chrono::NaiveDate) -> Self {
+        Self {
+            started_at: Utc::now(),
+            started: time::Instant::now(),
+            service_date,
+            stages: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, stage: &str, started: time::Instant, detail: Option<String>) {
+        self.stages.push(RouteSearchStageTiming {
+            stage: stage.to_string(),
+            elapsed_ms: elapsed_millis(started),
+            detail,
+        });
+    }
+
+    fn finish(self, success: bool, result_count: usize) -> RouteSearchTiming {
+        RouteSearchTiming {
+            started_at: self.started_at,
+            service_date: self.service_date,
+            total_ms: elapsed_millis(self.started),
+            success,
+            result_count,
+            stages: self.stages,
+        }
+    }
+}
+
+fn elapsed_millis(started: time::Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct RoutingWarmupState {
@@ -121,7 +182,14 @@ struct RaptorTimetableSnapshot {
     version: u32,
     service_date: chrono::NaiveDate,
     latest_import: Option<DateTime<Utc>>,
+    revision_token: String,
     timetable: RaptorTimetable,
+}
+
+#[derive(Debug, Clone)]
+struct RoutingDataRevision {
+    latest_import: Option<DateTime<Utc>>,
+    token: String,
 }
 
 struct AdminEntitySpec {
@@ -215,6 +283,7 @@ struct AppState {
     ticketing: ticketing::TicketingService,
     raptor_cache: RaptorCache,
     routing_warmup_status: RoutingWarmupStatus,
+    route_search_diagnostics: RouteSearchDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -747,6 +816,7 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         ticketing,
         raptor_cache: Arc::new(RwLock::new(HashMap::new())),
         routing_warmup_status: Arc::new(RwLock::new(RoutingWarmupState::default())),
+        route_search_diagnostics: Arc::new(RwLock::new(VecDeque::new())),
     };
     if let Some(pool) = state.db.clone() {
         let cache = state.raptor_cache.clone();
@@ -2017,12 +2087,15 @@ async fn admin_routing_algorithm(
             &state.routing_warmup_status,
         )
         .await;
+        let search_diagnostics =
+            route_search_diagnostics_payload(&state.route_search_diagnostics).await;
         return Ok(Json(routing_algorithm_payload(
             RoutingAlgorithmConfig::default(),
             false,
             None,
             None,
             snapshot_status,
+            search_diagnostics,
         )));
     };
     let (configuration, updated_at, updated_by) = routing_algorithm_config_db(pool)
@@ -2035,12 +2108,15 @@ async fn admin_routing_algorithm(
         &state.routing_warmup_status,
     )
     .await;
+    let search_diagnostics =
+        route_search_diagnostics_payload(&state.route_search_diagnostics).await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         updated_at,
         updated_by,
         snapshot_status,
+        search_diagnostics,
     )))
 }
 
@@ -2068,12 +2144,15 @@ async fn admin_routing_algorithm_update(
         &state.routing_warmup_status,
     )
     .await;
+    let search_diagnostics =
+        route_search_diagnostics_payload(&state.route_search_diagnostics).await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         Some(Utc::now()),
         Some(user.email),
         snapshot_status,
+        search_diagnostics,
     )))
 }
 
@@ -2100,12 +2179,15 @@ async fn admin_routing_algorithm_reset(
         &state.routing_warmup_status,
     )
     .await;
+    let search_diagnostics =
+        route_search_diagnostics_payload(&state.route_search_diagnostics).await;
     Ok(Json(routing_algorithm_payload(
         configuration,
         true,
         Some(Utc::now()),
         Some(user.email),
         snapshot_status,
+        search_diagnostics,
     )))
 }
 
@@ -2226,6 +2308,7 @@ fn routing_algorithm_payload(
     updated_at: Option<DateTime<Utc>>,
     updated_by: Option<String>,
     snapshot_status: Value,
+    search_diagnostics: Value,
 ) -> Value {
     json!({
         "configuration": configuration,
@@ -2234,9 +2317,86 @@ fn routing_algorithm_payload(
         "updated_at": updated_at,
         "updated_by": updated_by,
         "snapshot_status": snapshot_status,
+        "search_diagnostics": search_diagnostics,
         "activation": "New journey searches read this profile immediately; running searches are not changed.",
         "scoring_formula": "arrival_time × arrival_time_weight + duration × duration_weight + transfers × transfer_penalty_seconds",
         "fare_note": "No real fare data is imported. Carrier diversity preserves potentially cheaper operators without claiming a cheapest fare."
+    })
+}
+
+async fn record_route_search_timing(
+    diagnostics: &RouteSearchDiagnostics,
+    timing: RouteSearchTiming,
+) {
+    let mut recent = diagnostics.write().await;
+    recent.push_front(timing);
+    recent.truncate(ROUTE_SEARCH_TIMING_HISTORY);
+}
+
+async fn append_route_search_timing(
+    diagnostics: &RouteSearchDiagnostics,
+    started_at: DateTime<Utc>,
+    stage: &str,
+    elapsed_ms: u64,
+    detail: Option<String>,
+    success: bool,
+) {
+    let mut recent = diagnostics.write().await;
+    if let Some(search) = recent
+        .iter_mut()
+        .find(|search| search.started_at == started_at)
+    {
+        search.total_ms = search.total_ms.saturating_add(elapsed_ms);
+        search.success &= success;
+        search.stages.push(RouteSearchStageTiming {
+            stage: stage.to_string(),
+            elapsed_ms,
+            detail,
+        });
+    }
+}
+
+async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) -> Value {
+    let recent = diagnostics.read().await;
+    let mut stage_totals = HashMap::<String, (u64, u64, u64)>::new();
+    let mut total_sum = 0_u64;
+    let mut total_max = 0_u64;
+    for search in recent.iter() {
+        total_sum = total_sum.saturating_add(search.total_ms);
+        total_max = total_max.max(search.total_ms);
+        for stage in &search.stages {
+            let entry = stage_totals.entry(stage.stage.clone()).or_default();
+            entry.0 = entry.0.saturating_add(stage.elapsed_ms);
+            entry.1 = entry.1.max(stage.elapsed_ms);
+            entry.2 += 1;
+        }
+    }
+    let mut stages = stage_totals
+        .into_iter()
+        .map(|(stage, (sum, max, samples))| {
+            json!({
+                "stage": stage,
+                "average_ms": if samples == 0 { 0 } else { sum / samples },
+                "max_ms": max,
+                "samples": samples
+            })
+        })
+        .collect::<Vec<_>>();
+    stages.sort_by_key(|stage| std::cmp::Reverse(stage["average_ms"].as_u64().unwrap_or(0)));
+    let bottleneck = stages.first().cloned();
+    json!({
+        "retained_limit": ROUTE_SEARCH_TIMING_HISTORY,
+        "sample_count": recent.len(),
+        "average_total_ms": if recent.is_empty() { 0 } else { total_sum / recent.len() as u64 },
+        "max_total_ms": total_max,
+        "bottleneck": bottleneck,
+        "stage_aggregates": stages,
+        "recent": recent.iter().take(10).collect::<Vec<_>>(),
+        "implemented_improvements": [
+            "Resolve origin and destination concurrently",
+            "Reuse one routing-data revision for all service days in a request",
+            "Fetch related data, realtime updates and intermediate stops concurrently"
+        ]
     })
 }
 
@@ -2246,13 +2406,14 @@ async fn routing_snapshot_status(
     routing_snapshot_dir: &FsPath,
     warmup_status: &RoutingWarmupStatus,
 ) -> Value {
-    let (latest_import, latest_import_error) = match pool {
-        Some(pool) => match latest_successful_import_timestamp(pool).await {
-            Ok(value) => (value, None),
+    let (revision, latest_import_error) = match pool {
+        Some(pool) => match routing_data_revision(pool).await {
+            Ok(value) => (Some(value), None),
             Err(error) => (None, Some(error.to_string())),
         },
         None => (None, None),
     };
+    let latest_import = revision.as_ref().and_then(|value| value.latest_import);
     let today = chrono::Local::now().date_naive();
     let dates = [
         today,
@@ -2264,14 +2425,25 @@ async fn routing_snapshot_status(
         let cache = cache.read().await;
         dates
             .iter()
-            .map(|date| (*date, cache.contains_key(&(*date, latest_import))))
+            .map(|date| {
+                (
+                    *date,
+                    revision.as_ref().is_some_and(|revision| {
+                        cache.contains_key(&(*date, revision.token.clone()))
+                    }),
+                )
+            })
             .collect::<HashMap<_, _>>()
     };
     let mut snapshots = Vec::new();
     let mut total_size_bytes: u64 = 0;
     for service_date in dates {
-        let path =
-            raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, latest_import);
+        let path = revision.as_ref().map(|revision| {
+            raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, revision)
+        });
+        let Some(path) = path else {
+            continue;
+        };
         let metadata = tokio::fs::metadata(&path).await.ok();
         let size_bytes = metadata.as_ref().map(|metadata| metadata.len());
         if let Some(size_bytes) = size_bytes {
@@ -2645,14 +2817,70 @@ async fn query_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
     routing_snapshot_dir: &FsPath,
+    diagnostics: &RouteSearchDiagnostics,
     body: &JourneySearchBody,
     departure_time: u32,
     service_date: chrono::NaiveDate,
+) -> Result<(Vec<Value>, Vec<String>, Value, DateTime<Utc>), sqlx::Error> {
+    let mut timing = RouteSearchTimingBuilder::new(service_date);
+    let search_started_at = timing.started_at;
+    let result = query_journeys_profiled_db(
+        pool,
+        raptor_cache,
+        routing_snapshot_dir,
+        body,
+        departure_time,
+        service_date,
+        &mut timing,
+    )
+    .await;
+    let result_count = result
+        .as_ref()
+        .map(|(journeys, _, _)| journeys.len())
+        .unwrap_or(0);
+    let completed = timing.finish(result.is_ok(), result_count);
+    tracing::info!(
+        elapsed_ms = completed.total_ms,
+        success = completed.success,
+        results = completed.result_count,
+        service_date = %completed.service_date,
+        "profiled route search completed"
+    );
+    record_route_search_timing(diagnostics, completed).await;
+    result.map(|(journeys, warnings, related)| (journeys, warnings, related, search_started_at))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_journeys_profiled_db(
+    pool: &PgPool,
+    raptor_cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
+    body: &JourneySearchBody,
+    departure_time: u32,
+    service_date: chrono::NaiveDate,
+    timing: &mut RouteSearchTimingBuilder,
 ) -> Result<(Vec<Value>, Vec<String>, Value), sqlx::Error> {
     let mut warnings = Vec::new();
+    let stage_started = time::Instant::now();
     let (routing_config, _, _) = routing_algorithm_config_db(pool).await?;
-    let (from_stop_ids, from_warning) = resolve_journey_point_db(pool, &body.from).await?;
-    let (to_stop_ids, to_warning) = resolve_journey_point_db(pool, &body.to).await?;
+    timing.push("routing_config", stage_started, None);
+
+    let stage_started = time::Instant::now();
+    let (from_result, to_result) = tokio::join!(
+        resolve_journey_point_db(pool, &body.from),
+        resolve_journey_point_db(pool, &body.to)
+    );
+    let (from_stop_ids, from_warning) = from_result?;
+    let (to_stop_ids, to_warning) = to_result?;
+    timing.push(
+        "resolve_endpoints",
+        stage_started,
+        Some(format!(
+            "{} origin, {} destination stops",
+            from_stop_ids.len(),
+            to_stop_ids.len()
+        )),
+    );
     warnings.extend(from_warning);
     warnings.extend(to_warning);
 
@@ -2665,6 +2893,7 @@ async fn query_journeys_db(
         ));
     }
 
+    let stage_started = time::Instant::now();
     let nearby_transfers = nearby_journey_transfers_db(
         pool,
         &body.from,
@@ -2674,6 +2903,18 @@ async fn query_journeys_db(
         walking_speed_meters_per_second(&body.walking_speed),
     )
     .await?;
+    timing.push(
+        "nearby_transfers",
+        stage_started,
+        Some(format!(
+            "{} walking links",
+            nearby_transfers.transfers.len()
+        )),
+    );
+
+    let stage_started = time::Instant::now();
+    let routing_revision = routing_data_revision(pool).await?;
+    timing.push("routing_revision", stage_started, None);
 
     let mode_filters = body
         .transport_modes
@@ -2684,6 +2925,7 @@ async fn query_journeys_db(
         pool,
         raptor_cache,
         routing_snapshot_dir,
+        &routing_revision,
         &from_stop_ids,
         &to_stop_ids,
         departure_time,
@@ -2702,6 +2944,7 @@ async fn query_journeys_db(
             pool,
             raptor_cache,
             routing_snapshot_dir,
+            &routing_revision,
             &from_stop_ids,
             &to_stop_ids,
             0,
@@ -2717,7 +2960,21 @@ async fn query_journeys_db(
         (current_service_day_search.await, None)
     };
 
-    let (mut journeys, transfer_search_status) = current_service_day_result?;
+    let (mut journeys, transfer_search_status, current_timing) = current_service_day_result?;
+    timing.stages.push(RouteSearchStageTiming {
+        stage: "current_timetable_access".to_string(),
+        elapsed_ms: current_timing.timetable_ms,
+        detail: Some(if current_timing.memory_cache_hit {
+            "memory cache hit".to_string()
+        } else {
+            "cache miss, disk load, build, or concurrent wait".to_string()
+        }),
+    });
+    timing.stages.push(RouteSearchStageTiming {
+        stage: "current_raptor".to_string(),
+        elapsed_ms: current_timing.raptor_ms,
+        detail: Some(format!("{} candidates", journeys.len())),
+    });
     append_transfer_search_warning(
         &mut warnings,
         transfer_search_status,
@@ -2726,7 +2983,22 @@ async fn query_journeys_db(
     );
 
     if let Some(next_service_day_result) = next_service_day_result {
-        let (next_service_day_journeys, next_transfer_search_status) = next_service_day_result?;
+        let (next_service_day_journeys, next_transfer_search_status, next_timing) =
+            next_service_day_result?;
+        timing.stages.push(RouteSearchStageTiming {
+            stage: "next_timetable_access".to_string(),
+            elapsed_ms: next_timing.timetable_ms,
+            detail: Some(if next_timing.memory_cache_hit {
+                "memory cache hit".to_string()
+            } else {
+                "cache miss, disk load, build, or concurrent wait".to_string()
+            }),
+        });
+        timing.stages.push(RouteSearchStageTiming {
+            stage: "next_raptor".to_string(),
+            elapsed_ms: next_timing.raptor_ms,
+            detail: Some(format!("{} candidates", next_service_day_journeys.len())),
+        });
         append_transfer_search_warning(
             &mut warnings,
             next_transfer_search_status,
@@ -2746,20 +3018,36 @@ async fn query_journeys_db(
         }
     }
     if journeys.is_empty() && !include_next_service_day {
-        let (next_service_day_journeys, next_transfer_search_status) = service_day_journeys_db(
-            pool,
-            raptor_cache,
-            routing_snapshot_dir,
-            &from_stop_ids,
-            &to_stop_ids,
-            0,
-            &mode_filters,
-            body.max_transfers,
-            service_date.succ_opt().unwrap_or(service_date),
-            &routing_config,
-            &nearby_transfers.transfers,
-        )
-        .await?;
+        let (next_service_day_journeys, next_transfer_search_status, next_timing) =
+            service_day_journeys_db(
+                pool,
+                raptor_cache,
+                routing_snapshot_dir,
+                &routing_revision,
+                &from_stop_ids,
+                &to_stop_ids,
+                0,
+                &mode_filters,
+                body.max_transfers,
+                service_date.succ_opt().unwrap_or(service_date),
+                &routing_config,
+                &nearby_transfers.transfers,
+            )
+            .await?;
+        timing.stages.push(RouteSearchStageTiming {
+            stage: "next_timetable_access".to_string(),
+            elapsed_ms: next_timing.timetable_ms,
+            detail: Some(if next_timing.memory_cache_hit {
+                "memory cache hit".to_string()
+            } else {
+                "cache miss, disk load, build, or concurrent wait".to_string()
+            }),
+        });
+        timing.stages.push(RouteSearchStageTiming {
+            stage: "next_raptor".to_string(),
+            elapsed_ms: next_timing.raptor_ms,
+            detail: Some(format!("{} candidates", next_service_day_journeys.len())),
+        });
         append_transfer_search_warning(
             &mut warnings,
             next_transfer_search_status,
@@ -2777,34 +3065,68 @@ async fn query_journeys_db(
         }
     }
     let candidate_count = journeys.len();
+    let stage_started = time::Instant::now();
     journeys = dedupe_relevant_journeys_db(pool, journeys, &routing_config).await?;
+    timing.push(
+        "dedupe_candidates",
+        stage_started,
+        Some(format!(
+            "{candidate_count} to {} candidates",
+            journeys.len()
+        )),
+    );
     let removed_candidates = candidate_count.saturating_sub(journeys.len());
     if removed_candidates > 0 {
         warnings.push(format!(
             "removed {removed_candidates} duplicate or invalid journey candidates"
         ));
     }
+    let stage_started = time::Instant::now();
     let carrier_keys = journey_carrier_keys_db(pool, &journeys).await?;
     journeys = ranked_journey_results_with_carriers(journeys, &carrier_keys, &routing_config);
-
-    let unverified_services = unverified_journey_service_count(pool, &journeys).await?;
-    if unverified_services > 0 {
-        warnings.push(format!(
-            "{unverified_services} selected trip services come from a legacy import without calendar data; refresh that source to verify the requested date"
-        ));
-    }
+    timing.push(
+        "carrier_lookup_and_rank",
+        stage_started,
+        Some(format!("{} final journeys", journeys.len())),
+    );
 
     if journeys.is_empty() {
         warnings.push("no database journeys found for the resolved stops".to_string());
     }
 
-    let mut related = journey_related_data_db(pool, &journeys).await?;
-    let realtime_updates = journey_realtime_updates_db(pool, &journeys, service_date).await?;
-    let stop_calls = if body.include_intermediate_stops {
-        Some(journey_stop_calls_db(pool, &journeys).await?)
-    } else {
-        None
+    let related_future = async {
+        let started = time::Instant::now();
+        (journey_related_data_db(pool, &journeys).await, started)
     };
+    let realtime_future = async {
+        let started = time::Instant::now();
+        (
+            journey_realtime_updates_db(pool, &journeys, service_date).await,
+            started,
+        )
+    };
+    let (mut related, realtime_updates, stop_calls) = if body.include_intermediate_stops {
+        let stop_calls_future = async {
+            let started = time::Instant::now();
+            (journey_stop_calls_db(pool, &journeys).await, started)
+        };
+        let (related_result, realtime_result, stop_calls_result) =
+            tokio::join!(related_future, realtime_future, stop_calls_future);
+        timing.push("related_data", related_result.1, None);
+        timing.push("realtime_updates", realtime_result.1, None);
+        timing.push("intermediate_stops", stop_calls_result.1, None);
+        (
+            related_result.0?,
+            realtime_result.0?,
+            Some(stop_calls_result.0?),
+        )
+    } else {
+        let (related_result, realtime_result) = tokio::join!(related_future, realtime_future);
+        timing.push("related_data", related_result.1, None);
+        timing.push("realtime_updates", realtime_result.1, None);
+        (related_result.0?, realtime_result.0?, None)
+    };
+    let stage_started = time::Instant::now();
     let mut journey_values = journeys_with_realtime(&journeys, &realtime_updates);
     if let Some(stop_calls) = &stop_calls {
         attach_stop_calls(
@@ -2824,6 +3146,7 @@ async fn query_journeys_db(
         &to_stop_ids,
         nearby_transfers.transfers.len(),
     );
+    timing.push("response_assembly", stage_started, None);
 
     Ok((journey_values, warnings, related))
 }
@@ -2850,17 +3173,24 @@ async fn nearby_journey_transfers_db(
     to_stop_ids: &[String],
     walking_speed_mps: f64,
 ) -> Result<NearbyJourneyTransfers, sqlx::Error> {
-    let mut transfers = Vec::new();
-    if from_point.point_type == "stop" {
-        transfers.extend(
-            nearby_endpoint_transfers_db(pool, from_stop_ids, true, walking_speed_mps).await?,
-        );
-    }
-    if to_point.point_type == "stop" {
-        transfers.extend(
-            nearby_endpoint_transfers_db(pool, to_stop_ids, false, walking_speed_mps).await?,
-        );
-    }
+    let origin_transfers = async {
+        if from_point.point_type == "stop" {
+            nearby_endpoint_transfers_db(pool, from_stop_ids, true, walking_speed_mps).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let destination_transfers = async {
+        if to_point.point_type == "stop" {
+            nearby_endpoint_transfers_db(pool, to_stop_ids, false, walking_speed_mps).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (origin_transfers, destination_transfers) =
+        tokio::join!(origin_transfers, destination_transfers);
+    let mut transfers = origin_transfers?;
+    transfers.extend(destination_transfers?);
 
     transfers.sort_by(|left, right| {
         left.from_stop_id
@@ -2991,39 +3321,12 @@ fn append_transfer_search_warning(
     }
 }
 
-async fn unverified_journey_service_count(
-    pool: &PgPool,
-    journeys: &[Journey],
-) -> Result<i64, sqlx::Error> {
-    let trip_ids = journeys
-        .iter()
-        .flat_map(|journey| journey.legs.iter())
-        .filter_map(|leg| leg.trip_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if trip_ids.is_empty() {
-        return Ok(0);
-    }
-    sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)
-        FROM trips trip
-        WHERE trip.id = ANY($1)
-          AND NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
-          AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = trip.source_feed_id)
-        "#,
-    )
-    .bind(trip_ids)
-    .fetch_one(pool)
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn service_day_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
     routing_snapshot_dir: &FsPath,
+    revision: &RoutingDataRevision,
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
@@ -3032,14 +3335,22 @@ async fn service_day_journeys_db(
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
-) -> Result<(Vec<Journey>, TransferSearchStatus), sqlx::Error> {
-    let started_at = time::Instant::now();
-    let timetable =
-        raptor_timetable_cached_db(pool, raptor_cache, routing_snapshot_dir, service_date).await?;
+) -> Result<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming), sqlx::Error> {
+    let timetable_started = time::Instant::now();
+    let (timetable, memory_cache_hit) = raptor_timetable_cached_for_revision_db(
+        pool,
+        raptor_cache,
+        routing_snapshot_dir,
+        service_date,
+        revision,
+    )
+    .await?;
+    let timetable_ms = elapsed_millis(timetable_started);
     let modes = mode_filters
         .iter()
         .map(|mode| db_mode_to_model(mode))
         .collect();
+    let raptor_started = time::Instant::now();
     let journeys = raptor(
         timetable.as_ref(),
         RaptorRequest {
@@ -3052,15 +3363,32 @@ async fn service_day_journeys_db(
             modes,
         },
     );
+    let raptor_ms = elapsed_millis(raptor_started);
     tracing::debug!(
-        elapsed_ms = started_at.elapsed().as_millis(),
+        timetable_ms,
+        raptor_ms,
         candidates = journeys.len(),
         trips = timetable.trip_count(),
         service_date = %service_date,
         "RAPTOR journey search completed"
     );
     let _ = routing_config;
-    Ok((journeys, TransferSearchStatus::Complete))
+    Ok((
+        journeys,
+        TransferSearchStatus::Complete,
+        ServiceDaySearchTiming {
+            timetable_ms,
+            raptor_ms,
+            memory_cache_hit,
+        },
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ServiceDaySearchTiming {
+    timetable_ms: u64,
+    raptor_ms: u64,
+    memory_cache_hit: bool,
 }
 
 async fn raptor_timetable_cached_db(
@@ -3069,47 +3397,69 @@ async fn raptor_timetable_cached_db(
     routing_snapshot_dir: &FsPath,
     service_date: chrono::NaiveDate,
 ) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
-    let latest_import = latest_successful_import_timestamp(pool).await?;
-    let key = (service_date, latest_import);
-    let cell = {
+    let revision = routing_data_revision(pool).await?;
+    raptor_timetable_cached_for_revision_db(
+        pool,
+        cache,
+        routing_snapshot_dir,
+        service_date,
+        &revision,
+    )
+    .await
+    .map(|(timetable, _)| timetable)
+}
+
+async fn raptor_timetable_cached_for_revision_db(
+    pool: &PgPool,
+    cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
+    service_date: chrono::NaiveDate,
+    revision: &RoutingDataRevision,
+) -> Result<(Arc<RaptorTimetable>, bool), sqlx::Error> {
+    let key = (service_date, revision.token.clone());
+    let (cell, memory_cache_hit) = {
         let mut cache = cache.write().await;
-        cache.retain(|(date, import), _| *date != service_date || *import == latest_import);
-        cache
+        cache.retain(|(date, token), _| *date != service_date || *token == revision.token);
+        let cell = cache
             .entry(key)
             .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
+            .clone();
+        let hit = cell.get().is_some();
+        (cell, hit)
     };
     let snapshot_path =
-        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, latest_import);
-    cell.get_or_try_init(|| async {
-        let started_at = time::Instant::now();
-        if let Some(timetable) =
-            load_raptor_timetable_snapshot(&snapshot_path, service_date, latest_import).await
-        {
+        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, &revision);
+    let timetable = cell
+        .get_or_try_init(|| async {
+            let started_at = time::Instant::now();
+            if let Some(timetable) =
+                load_raptor_timetable_snapshot(&snapshot_path, service_date, &revision).await
+            {
+                tracing::info!(
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    trips = timetable.trip_count(),
+                    service_date = %service_date,
+                    path = %snapshot_path.display(),
+                    "loaded RAPTOR timetable snapshot"
+                );
+                return Ok::<Arc<RaptorTimetable>, sqlx::Error>(Arc::new(timetable));
+            }
+
+            let db_started_at = time::Instant::now();
+            let timetable = raptor_timetable_db(pool, service_date).await?;
             tracing::info!(
-                elapsed_ms = started_at.elapsed().as_millis(),
+                elapsed_ms = db_started_at.elapsed().as_millis(),
                 trips = timetable.trip_count(),
                 service_date = %service_date,
-                path = %snapshot_path.display(),
-                "loaded RAPTOR timetable snapshot"
+                "built RAPTOR timetable from database"
             );
-            return Ok(Arc::new(timetable));
-        }
-
-        let db_started_at = time::Instant::now();
-        let timetable = raptor_timetable_db(pool, service_date).await?;
-        tracing::info!(
-            elapsed_ms = db_started_at.elapsed().as_millis(),
-            trips = timetable.trip_count(),
-            service_date = %service_date,
-            "built RAPTOR timetable from database"
-        );
-        write_raptor_timetable_snapshot(&snapshot_path, service_date, latest_import, &timetable)
-            .await;
-        Ok(Arc::new(timetable))
-    })
-    .await
-    .cloned()
+            write_raptor_timetable_snapshot(&snapshot_path, service_date, &revision, &timetable)
+                .await;
+            Ok::<Arc<RaptorTimetable>, sqlx::Error>(Arc::new(timetable))
+        })
+        .await
+        .cloned()?;
+    Ok((timetable, memory_cache_hit))
 }
 
 async fn warm_raptor_timetables(
@@ -3171,33 +3521,63 @@ async fn warm_raptor_timetables(
     }
 }
 
-async fn latest_successful_import_timestamp(
-    pool: &PgPool,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-    sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT max(finished_at) FROM import_runs WHERE status = 'success'",
+async fn routing_data_revision(pool: &PgPool) -> Result<RoutingDataRevision, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          (SELECT max(finished_at) FROM import_runs WHERE status = 'success') AS latest_import,
+          COALESCE((
+            SELECT jsonb_agg(
+              jsonb_build_array(feed.id, feed.enabled, latest.import_run_id)
+              ORDER BY feed.id
+            )
+            FROM source_feeds feed
+            LEFT JOIN LATERAL (
+              SELECT run.id AS import_run_id
+              FROM import_runs run
+              WHERE run.status = 'success'
+                AND run.summary->>'feed_id' = feed.id
+              ORDER BY run.finished_at DESC NULLS LAST, run.started_at DESC, run.id DESC
+              LIMIT 1
+            ) latest ON true
+          ), '[]'::jsonb) AS source_state
+        "#,
     )
     .fetch_one(pool)
-    .await
+    .await?;
+    let latest_import = row.get::<Option<DateTime<Utc>>, _>("latest_import");
+    let source_state = row.get::<Value, _>("source_state");
+    let mut digest = Sha256::new();
+    if let Some(latest_import) = latest_import {
+        digest.update(latest_import.timestamp_millis().to_be_bytes());
+    }
+    digest.update(source_state.to_string().as_bytes());
+    let token = hex::encode(digest.finalize())[..16].to_string();
+    Ok(RoutingDataRevision {
+        latest_import,
+        token,
+    })
 }
 
 fn raptor_timetable_snapshot_path(
     routing_snapshot_dir: &FsPath,
     service_date: chrono::NaiveDate,
-    latest_import: Option<DateTime<Utc>>,
+    revision: &RoutingDataRevision,
 ) -> PathBuf {
-    let import_token = latest_import
+    let import_token = revision
+        .latest_import
         .map(|value| value.timestamp_millis().to_string())
         .unwrap_or_else(|| "no-successful-import".to_string());
     routing_snapshot_dir.join(format!(
-        "raptor-v{RAPTOR_TIMETABLE_SNAPSHOT_VERSION}-{service_date}-{import_token}.json"
+        "raptor-v{RAPTOR_TIMETABLE_SNAPSHOT_VERSION}-{service_date}-{import_token}-{}.json",
+        revision.token
     ))
 }
 
 async fn load_raptor_timetable_snapshot(
     path: &FsPath,
     service_date: chrono::NaiveDate,
-    latest_import: Option<DateTime<Utc>>,
+    revision: &RoutingDataRevision,
 ) -> Option<RaptorTimetable> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -3215,7 +3595,8 @@ async fn load_raptor_timetable_snapshot(
     };
     if snapshot.version != RAPTOR_TIMETABLE_SNAPSHOT_VERSION
         || snapshot.service_date != service_date
-        || snapshot.latest_import != latest_import
+        || snapshot.latest_import != revision.latest_import
+        || snapshot.revision_token != revision.token
     {
         tracing::warn!(
             path = %path.display(),
@@ -3229,13 +3610,14 @@ async fn load_raptor_timetable_snapshot(
 async fn write_raptor_timetable_snapshot(
     path: &FsPath,
     service_date: chrono::NaiveDate,
-    latest_import: Option<DateTime<Utc>>,
+    revision: &RoutingDataRevision,
     timetable: &RaptorTimetable,
 ) {
     let snapshot = RaptorTimetableSnapshot {
         version: RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
         service_date,
-        latest_import,
+        latest_import: revision.latest_import,
+        revision_token: revision.token.clone(),
         timetable: timetable.clone(),
     };
     let bytes = match serde_json::to_vec(&snapshot) {
@@ -3317,22 +3699,12 @@ async fn raptor_timetable_db(
                stop_time.pickup_type, stop_time.drop_off_type
         FROM trips trip
         JOIN routes route ON route.id = trip.route_id AND route.is_active = true
+        JOIN source_feeds feed ON feed.id = trip.source_feed_id AND feed.enabled = true
         JOIN stop_times stop_time ON stop_time.trip_id = trip.id
-        LEFT JOIN latest_import_runs latest
+        JOIN latest_import_runs latest
           ON latest.source_feed_id = trip.source_feed_id
          AND latest.import_run_id = trip.import_run_id
-        WHERE (
-          trip.service_id IN (SELECT service_id FROM active_services)
-          OR NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
-             AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = trip.source_feed_id)
-        )
-          AND (
-            latest.import_run_id IS NOT NULL
-            OR NOT EXISTS (
-              SELECT 1 FROM latest_import_runs known
-              WHERE known.source_feed_id = trip.source_feed_id
-            )
-          )
+        WHERE trip.service_id IN (SELECT service_id FROM active_services)
         ORDER BY trip.id, stop_time.stop_sequence
         "#,
     )
@@ -4794,8 +5166,12 @@ async fn journey_related_data_db(
         .collect::<Vec<_>>()
     };
 
-    let agencies = fetch_agencies_json(pool, agency_ids.into_iter().collect()).await?;
-    let source_feeds = fetch_source_feeds_json(pool, source_feed_ids.into_iter().collect()).await?;
+    let (agencies, source_feeds) = tokio::join!(
+        fetch_agencies_json(pool, agency_ids.into_iter().collect()),
+        fetch_source_feeds_json(pool, source_feed_ids.into_iter().collect())
+    );
+    let agencies = agencies?;
+    let source_feeds = source_feeds?;
 
     Ok(json!({
         "stops": stops,
@@ -6459,6 +6835,24 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn raptor_snapshot_path_includes_format_and_data_revision() {
+        let revision = RoutingDataRevision {
+            latest_import: DateTime::from_timestamp_millis(1_783_479_136_328),
+            token: "0123456789abcdef".to_string(),
+        };
+        let path = raptor_timetable_snapshot_path(
+            FsPath::new("routing"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 8).unwrap(),
+            &revision,
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("routing/raptor-v2-2026-07-08-1783479136328-0123456789abcdef.json")
+        );
+    }
+
     #[tokio::test]
     async fn health_endpoint() {
         let app = build_router(app_state().await.unwrap());
@@ -6529,6 +6923,7 @@ mod tests {
         );
         assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
         assert!(payload["paths"]["/admin/routing-algorithm"]["put"].is_object());
+        assert!(payload["components"]["schemas"]["RouteSearchDiagnostics"].is_object());
     }
 
     #[tokio::test]

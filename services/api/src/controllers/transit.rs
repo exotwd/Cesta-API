@@ -476,24 +476,40 @@ pub(crate) async fn journey_search(
     );
 
     if let Some(pool) = &state.db {
-        validate_journey_point_db(pool, &body.from).await?;
-        validate_journey_point_db(pool, &body.to).await?;
+        let (from_validation, to_validation) = tokio::join!(
+            validate_journey_point_db(pool, &body.from),
+            validate_journey_point_db(pool, &body.to)
+        );
+        from_validation?;
+        to_validation?;
         return match query_journeys_db(
             pool,
             &state.raptor_cache,
             &state.config.routing_snapshot_dir,
+            &state.route_search_diagnostics,
             &body,
             departure_time,
             service_date,
         )
         .await
         {
-            Ok((mut journeys, warnings, related)) => {
+            Ok((mut journeys, warnings, related, search_started_at)) => {
                 let realtime_status = related["realtime_status"].as_str().unwrap_or("unavailable");
-                state
+                let ticketing_started = tokio::time::Instant::now();
+                let ticketing_result = state
                     .ticketing
                     .annotate_journeys(&mut journeys, &related, service_date)
-                    .await?;
+                    .await;
+                append_route_search_timing(
+                    &state.route_search_diagnostics,
+                    search_started_at,
+                    "ticketing_annotation",
+                    elapsed_millis(ticketing_started),
+                    Some(format!("{} journeys", journeys.len())),
+                    ticketing_result.is_ok(),
+                )
+                .await;
+                ticketing_result?;
                 Ok(Json(json!({
                     "journeys": journeys,
                     "related": related,
