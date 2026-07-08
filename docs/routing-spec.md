@@ -28,7 +28,8 @@ All three endpoints require an `admin` or `data_admin` access token.
 The API keeps route search fast by serving RAPTOR from memory. On cache miss it first tries a
 serialized timetable snapshot from `ROUTING_SNAPSHOT_DIR` (default
 `storage/processed/routing`) keyed by service date, latest successful imports, and enabled source
-state. Only enabled feeds with calendar-confirmed service on the requested date are included. If the
+state. Enabled feeds use calendar-confirmed service on the requested date. A latest successful
+import that has no calendar data remains searchable as an explicitly unverified legacy fallback. If the
 snapshot is missing or stale, the API rebuilds the timetable from PostgreSQL, writes a replacement
 snapshot, and stores it in the in-memory cache. A background warmer refreshes today and tomorrow
 every minute so new imports are picked up before most user searches; it never runs an import on API

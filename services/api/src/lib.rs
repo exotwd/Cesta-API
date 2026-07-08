@@ -77,7 +77,7 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 2;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 3;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2965,9 +2965,12 @@ async fn query_journeys_profiled_db(
         stage: "current_timetable_access".to_string(),
         elapsed_ms: current_timing.timetable_ms,
         detail: Some(if current_timing.memory_cache_hit {
-            "memory cache hit".to_string()
+            format!("memory cache hit; {} trips", current_timing.trip_count)
         } else {
-            "cache miss, disk load, build, or concurrent wait".to_string()
+            format!(
+                "cache miss, disk load, build, or concurrent wait; {} trips",
+                current_timing.trip_count
+            )
         }),
     });
     timing.stages.push(RouteSearchStageTiming {
@@ -2989,9 +2992,12 @@ async fn query_journeys_profiled_db(
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
             detail: Some(if next_timing.memory_cache_hit {
-                "memory cache hit".to_string()
+                format!("memory cache hit; {} trips", next_timing.trip_count)
             } else {
-                "cache miss, disk load, build, or concurrent wait".to_string()
+                format!(
+                    "cache miss, disk load, build, or concurrent wait; {} trips",
+                    next_timing.trip_count
+                )
             }),
         });
         timing.stages.push(RouteSearchStageTiming {
@@ -3038,9 +3044,12 @@ async fn query_journeys_profiled_db(
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
             detail: Some(if next_timing.memory_cache_hit {
-                "memory cache hit".to_string()
+                format!("memory cache hit; {} trips", next_timing.trip_count)
             } else {
-                "cache miss, disk load, build, or concurrent wait".to_string()
+                format!(
+                    "cache miss, disk load, build, or concurrent wait; {} trips",
+                    next_timing.trip_count
+                )
             }),
         });
         timing.stages.push(RouteSearchStageTiming {
@@ -3089,6 +3098,19 @@ async fn query_journeys_profiled_db(
         stage_started,
         Some(format!("{} final journeys", journeys.len())),
     );
+
+    let stage_started = time::Instant::now();
+    let unverified_services = unverified_journey_service_count(pool, &journeys).await?;
+    timing.push(
+        "legacy_service_validation",
+        stage_started,
+        Some(format!("{unverified_services} unverified services")),
+    );
+    if unverified_services > 0 {
+        warnings.push(format!(
+            "{unverified_services} selected trip services come from the latest import of a feed without calendar data; service dates cannot be verified"
+        ));
+    }
 
     if journeys.is_empty() {
         warnings.push("no database journeys found for the resolved stops".to_string());
@@ -3149,6 +3171,34 @@ async fn query_journeys_profiled_db(
     timing.push("response_assembly", stage_started, None);
 
     Ok((journey_values, warnings, related))
+}
+
+async fn unverified_journey_service_count(
+    pool: &PgPool,
+    journeys: &[Journey],
+) -> Result<i64, sqlx::Error> {
+    let trip_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if trip_ids.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM trips trip
+        WHERE trip.id = ANY($1)
+          AND NOT EXISTS (SELECT 1 FROM calendars WHERE source_feed_id = trip.source_feed_id)
+          AND NOT EXISTS (SELECT 1 FROM calendar_dates WHERE source_feed_id = trip.source_feed_id)
+        "#,
+    )
+    .bind(trip_ids)
+    .fetch_one(pool)
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3380,6 +3430,7 @@ async fn service_day_journeys_db(
             timetable_ms,
             raptor_ms,
             memory_cache_hit,
+            trip_count: timetable.trip_count(),
         },
     ))
 }
@@ -3389,6 +3440,7 @@ struct ServiceDaySearchTiming {
     timetable_ms: u64,
     raptor_ms: u64,
     memory_cache_hit: bool,
+    trip_count: usize,
 }
 
 async fn raptor_timetable_cached_db(
@@ -3704,7 +3756,19 @@ async fn raptor_timetable_db(
         JOIN latest_import_runs latest
           ON latest.source_feed_id = trip.source_feed_id
          AND latest.import_run_id = trip.import_run_id
-        WHERE trip.service_id IN (SELECT service_id FROM active_services)
+        WHERE (
+          trip.service_id IN (SELECT service_id FROM active_services)
+          OR (
+            NOT EXISTS (
+              SELECT 1 FROM calendars
+              WHERE source_feed_id = trip.source_feed_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM calendar_dates
+              WHERE source_feed_id = trip.source_feed_id
+            )
+          )
+        )
         ORDER BY trip.id, stop_time.stop_sequence
         "#,
     )
@@ -6849,7 +6913,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v2-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v3-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
