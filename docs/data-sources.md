@@ -8,6 +8,11 @@ Current schedule sources:
 - raw JDF archive: `JDF_merged.zip`
 - conversion and fixing logs: `jdf-to-gtfs.log.json`, `czptt-to-gtfs.log.json`, `fixing.log.json`, `merging.log.json`, `main.log`
 - PID GTFS: `https://data.pid.cz/PID_GTFS.zip` (checked every 6 hours and imported only when changed)
+
+Schedule downloads use conditional HTTP validators when available and SHA-256 before database
+export. Unchanged GGU files are hard-linked into mixed runs, while obsolete timestamped raw runs are
+deleted according to `RAW_IMPORT_RUNS_TO_KEEP` (default `3`). PostgreSQL import audit and validation
+history are retained.
 - PID current and seven-day route geometry: `https://data.pid.cz/geodata/Linky_7d_WGS84.json`
 
 Current realtime sources:

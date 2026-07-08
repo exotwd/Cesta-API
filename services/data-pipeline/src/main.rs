@@ -9,7 +9,10 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use gtfs_importer::{GtfsDataset, ImportOptions, ValidationSeverity, parse_gtfs_zip, sha256_file};
-use reqwest::header::{CONTENT_LENGTH, ETAG, HeaderMap, LAST_MODIFIED};
+use reqwest::{
+    StatusCode,
+    header::{CONTENT_LENGTH, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
+};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -37,6 +40,7 @@ const DEFAULT_PID_LINES_URL: &str = "https://data.pid.cz/geodata/Linky_7d_WGS84.
 const PID_FEED_ID: &str = "pid_gtfs";
 const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
 const PID_SOURCE_PRIORITY: i32 = 10;
+const DEFAULT_RAW_RUNS_TO_KEEP: usize = 3;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -630,12 +634,16 @@ async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(30))
         .build()?;
-    let remote = fetch_remote_file_metadata(&client, url).await?;
+    let previous = reusable_run
+        .as_ref()
+        .and_then(|run| run.manifest.get(FILE_NAME));
+    let remote = fetch_remote_file_metadata(&client, url, previous).await?;
 
     if let Some(run) = &reusable_run
         && can_reuse_file(run, FILE_NAME, remote.as_ref())
     {
         tracing::info!(path = %run.path.display(), "PID GTFS has not changed");
+        prune_raw_run_directories(storage_dir, "pid", &run.path).await?;
         return Ok(run.path.clone());
     }
 
@@ -645,13 +653,13 @@ async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
         .join("pid")
         .join("latest")
         .join(timestamp);
-    fs::create_dir_all(&run_dir).await?;
     let response = client
         .get(url)
         .send()
         .await
         .with_context(|| format!("download {url}"))?
         .error_for_status()?;
+    fs::create_dir_all(&run_dir).await?;
     let status = response.status().as_u16();
     let etag = header_to_string(response.headers(), ETAG);
     let last_modified = header_to_string(response.headers(), LAST_MODIFIED);
@@ -683,6 +691,7 @@ async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
         serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
+    prune_raw_run_directories(storage_dir, "pid", &run_dir).await?;
     Ok(run_dir)
 }
 
@@ -766,6 +775,7 @@ async fn import_pid_gtfs(
             PID_FEED_ID,
             PID_SOURCE_PRIORITY,
             &dataset,
+            limit_rows.is_none(),
             manifest_entry,
             checksum.as_deref(),
         )
@@ -994,7 +1004,10 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
     let mut all_files_reusable = reusable_run.is_some();
     for (file_name, _, _) in GGU_FILES {
         let url = format!("{}/{}", base_url.trim_end_matches('/'), file_name);
-        let remote = fetch_remote_file_metadata(&client, &url).await?;
+        let previous = reusable_run
+            .as_ref()
+            .and_then(|run| run.manifest.get(*file_name));
+        let remote = fetch_remote_file_metadata(&client, &url, previous).await?;
         if let Some(run) = &reusable_run {
             all_files_reusable =
                 all_files_reusable && can_reuse_file(run, file_name, remote.as_ref());
@@ -1006,6 +1019,7 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
         let run = reusable_run.expect("checked above");
         write_reuse_checked_manifest(&run, base_url, &remote_metadata, &timestamp).await?;
         eprintln!("GGU latest has not changed; reusing {}", run.path.display());
+        prune_raw_run_directories(storage_dir, "ggu", &run.path).await?;
         return Ok(run.path);
     }
 
@@ -1027,7 +1041,7 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
                     .manifest
                     .get(*file_name)
                     .context("missing reusable manifest entry")?;
-                fs::copy(run.path.join(file_name), &output).await?;
+                let reuse_method = reuse_local_file(&run.path.join(file_name), &output).await?;
                 manifest.push(serde_json::json!({
                     "file": file_name,
                     "feed_id": feed_id,
@@ -1036,6 +1050,7 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
                     "http_status": remote.as_ref().map(|metadata| metadata.http_status),
                     "downloaded": false,
                     "reused_from": run.path.display().to_string(),
+                    "reuse_method": reuse_method,
                     "size_bytes": previous.size_bytes,
                     "sha256": previous.sha256,
                     "etag": remote.as_ref().and_then(|metadata| metadata.etag.clone()).or_else(|| previous.etag.clone()),
@@ -1053,6 +1068,29 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
             .with_context(|| format!("download {url}"))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
+            if let Some(run) = &reusable_run
+                && let Some(previous) = run.manifest.get(*file_name)
+                && run.path.join(file_name).exists()
+            {
+                let reuse_method = reuse_local_file(&run.path.join(file_name), &output).await?;
+                manifest.push(serde_json::json!({
+                    "file": file_name,
+                    "feed_id": feed_id,
+                    "priority": priority,
+                    "url": url,
+                    "http_status": status,
+                    "downloaded": false,
+                    "reused_after_http_error": true,
+                    "reused_from": run.path.display().to_string(),
+                    "reuse_method": reuse_method,
+                    "size_bytes": previous.size_bytes,
+                    "sha256": previous.sha256,
+                    "etag": previous.etag,
+                    "last_modified": previous.last_modified,
+                    "content_length": previous.content_length
+                }));
+                continue;
+            }
             manifest.push(serde_json::json!({
                 "file": file_name,
                 "url": url,
@@ -1093,15 +1131,35 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
         serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
+    let missing_files = GGU_FILES
+        .iter()
+        .filter(|(file_name, _, _)| !run_dir.join(file_name).exists())
+        .map(|(file_name, _, _)| *file_name)
+        .collect::<Vec<_>>();
+    if !missing_files.is_empty() {
+        fs::remove_dir_all(&run_dir).await?;
+        anyhow::bail!(
+            "GGU download did not produce required files: {}",
+            missing_files.join(", ")
+        );
+    }
+    prune_raw_run_directories(storage_dir, "ggu", &run_dir).await?;
     Ok(run_dir)
 }
 
 async fn fetch_remote_file_metadata(
     client: &reqwest::Client,
     url: &str,
+    previous: Option<&ManifestEntry>,
 ) -> Result<Option<RemoteFileMetadata>> {
-    let response = client
-        .head(url)
+    let mut request = client.head(url);
+    if let Some(etag) = previous.and_then(|entry| entry.etag.as_deref()) {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    if let Some(last_modified) = previous.and_then(|entry| entry.last_modified.as_deref()) {
+        request = request.header(IF_MODIFIED_SINCE, last_modified);
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("check remote metadata {url}"))?;
@@ -1163,7 +1221,9 @@ fn can_reuse_file(run: &ReusableRun, file_name: &str, remote: Option<&RemoteFile
     let Some(remote) = remote else {
         return false;
     };
-    if !(200..300).contains(&remote.http_status) {
+    if remote.http_status != StatusCode::NOT_MODIFIED.as_u16()
+        && !(200..300).contains(&remote.http_status)
+    {
         return false;
     }
     if !run.path.join(file_name).exists() {
@@ -1175,6 +1235,9 @@ fn can_reuse_file(run: &ReusableRun, file_name: &str, remote: Option<&RemoteFile
     if matches!(previous.downloaded, Some(false)) && previous.sha256.is_none() {
         return false;
     }
+    if remote.http_status == StatusCode::NOT_MODIFIED.as_u16() {
+        return true;
+    }
 
     let previous_size = previous.size_bytes.or(previous.content_length);
     let size_matches = match (previous_size, remote.content_length) {
@@ -1185,17 +1248,92 @@ fn can_reuse_file(run: &ReusableRun, file_name: &str, remote: Option<&RemoteFile
 
     match (&previous.etag, &remote.etag) {
         (Some(previous), Some(remote)) => return previous == remote && size_matches,
-        (Some(_), None) => return size_matches,
+        (Some(_), None) => return false,
         _ => {}
     }
 
     match (&previous.last_modified, &remote.last_modified) {
         (Some(previous), Some(remote)) => return previous == remote && size_matches,
-        (Some(_), None) => return size_matches,
+        (Some(_), None) => return false,
         _ => {}
     }
 
-    size_matches
+    false
+}
+
+async fn reuse_local_file(source: &Path, destination: &Path) -> Result<&'static str> {
+    match fs::hard_link(source, destination).await {
+        Ok(()) => Ok("hard_link"),
+        Err(hard_link_error) => {
+            tracing::debug!(
+                %hard_link_error,
+                source = %source.display(),
+                destination = %destination.display(),
+                "hard-link reuse unavailable; copying unchanged source file"
+            );
+            fs::copy(source, destination).await?;
+            Ok("copy")
+        }
+    }
+}
+
+fn raw_runs_to_keep() -> usize {
+    std::env::var("RAW_IMPORT_RUNS_TO_KEEP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_RAW_RUNS_TO_KEEP)
+        .max(1)
+}
+
+async fn prune_raw_run_directories(
+    storage_dir: &Path,
+    source: &str,
+    protected_run: &Path,
+) -> Result<()> {
+    prune_raw_run_directories_with_limit(storage_dir, source, protected_run, raw_runs_to_keep())
+        .await
+}
+
+async fn prune_raw_run_directories_with_limit(
+    storage_dir: &Path,
+    source: &str,
+    protected_run: &Path,
+    runs_to_keep: usize,
+) -> Result<()> {
+    let root = storage_dir.join("raw").join(source).join("latest");
+    let mut entries = match fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut runs = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if chrono::NaiveDateTime::parse_from_str(&name, "%Y%m%dT%H%M%SZ").is_ok() {
+            runs.push(entry.path());
+        }
+    }
+    runs.sort();
+    let mut remove_count = runs.len().saturating_sub(runs_to_keep.max(1));
+    for run in runs {
+        if remove_count == 0 {
+            break;
+        }
+        if run == protected_run {
+            continue;
+        }
+        fs::remove_dir_all(&run)
+            .await
+            .with_context(|| format!("remove obsolete raw import run {}", run.display()))?;
+        remove_count -= 1;
+        tracing::info!(source, path = %run.display(), "deleted obsolete raw import run");
+    }
+    Ok(())
 }
 
 async fn write_reuse_checked_manifest(
@@ -1217,7 +1355,7 @@ async fn write_reuse_checked_manifest(
             "priority": priority,
             "url": format!("{}/{}", base_url.trim_end_matches('/'), file_name),
             "http_status": remote.as_ref().map(|metadata| metadata.http_status),
-            "downloaded": true,
+            "downloaded": false,
             "reused_existing_run": true,
             "checked_at": checked_at,
             "size_bytes": previous.size_bytes,
@@ -1321,6 +1459,7 @@ async fn import_ggu_latest(
                 feed_id,
                 *priority,
                 &dataset,
+                limit_rows.is_none(),
                 manifest_entry,
                 checksum.as_deref(),
             )
@@ -1446,6 +1585,13 @@ async fn database_import_skip_reason(
     .await?
     {
         let previous_summary = row.get::<Value, _>("summary");
+        if previous_summary
+            .get("complete_dataset")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return Ok(None);
+        }
         let feed_id = source.split(':').next().unwrap_or(source);
         let has_service_calendar: bool = sqlx::query_scalar(
             r#"
@@ -1483,6 +1629,7 @@ async fn export_dataset_to_postgres(
     feed_id: &str,
     priority: i32,
     dataset: &GtfsDataset,
+    complete_dataset: bool,
     manifest_entry: Option<&ManifestEntry>,
     checksum: Option<&str>,
 ) -> Result<serde_json::Value> {
@@ -1497,6 +1644,7 @@ async fn export_dataset_to_postgres(
         "run_dir": run_dir.display().to_string(),
         "file": file_name,
         "feed_id": feed_id,
+        "complete_dataset": complete_dataset,
         "sha256": checksum,
         "size_bytes": manifest_entry.and_then(|entry| entry.size_bytes),
         "etag": manifest_entry.and_then(|entry| entry.etag.clone()),
@@ -1698,11 +1846,13 @@ async fn export_dataset_to_postgres(
               suppressed_as_duplicate = false
             WHERE (
               stop_source_ids.stop_id,
+              stop_source_ids.import_run_id,
               stop_source_ids.priority,
               stop_source_ids.confidence,
               stop_source_ids.suppressed_as_duplicate
             ) IS DISTINCT FROM (
               EXCLUDED.stop_id,
+              EXCLUDED.import_run_id,
               EXCLUDED.priority,
               EXCLUDED.confidence,
               false
@@ -1894,7 +2044,14 @@ async fn export_dataset_to_postgres(
         .await?;
     }
 
-    let stale_cleanup = prune_stale_feed_schedule_rows(pool, feed_id, import_run_id).await?;
+    let stale_cleanup = if complete_dataset {
+        prune_stale_feed_schedule_rows(pool, feed_id, import_run_id).await?
+    } else {
+        serde_json::json!({
+            "skipped": true,
+            "reason": "partial import created with --limit-rows"
+        })
+    };
 
     let summary = serde_json::json!({
         "exported": true,
@@ -2082,12 +2239,59 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    let deleted_stop_source_ids = sqlx::query(
+        r#"
+        DELETE FROM stop_source_ids
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deactivated_stops = sqlx::query(
+        r#"
+        UPDATE stops
+        SET is_active = false
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+          AND is_active = true
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_agencies = sqlx::query(
+        r#"
+        DELETE FROM agencies
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+          AND NOT EXISTS (
+            SELECT 1 FROM routes WHERE routes.agency_id = agencies.id
+          )
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
     Ok(serde_json::json!({
         "deleted_stop_times": deleted_stop_times,
         "deleted_trips": deleted_trips,
         "deleted_routes": deleted_routes,
         "deleted_calendars": deleted_calendars,
-        "deleted_calendar_dates": deleted_calendar_dates
+        "deleted_calendar_dates": deleted_calendar_dates,
+        "deleted_stop_source_ids": deleted_stop_source_ids,
+        "deactivated_stops": deactivated_stops,
+        "deleted_agencies": deleted_agencies
     }))
 }
 
@@ -2326,10 +2530,104 @@ fn summarize(run_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn reusable_run(root: &Path, entry: ManifestEntry) -> ReusableRun {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(&entry.file), b"same-size").unwrap();
+        ReusableRun {
+            path: root.to_path_buf(),
+            manifest: HashMap::from([(entry.file.clone(), entry)]),
+        }
+    }
+
     #[test]
     fn parses_pid_line_validity_dates() {
         let dates = parse_pid_validity("20260704,20260705").unwrap();
         assert_eq!(dates.len(), 2);
         assert_eq!(dates[0].to_string(), "2026-07-04");
+    }
+
+    #[test]
+    fn conditional_not_modified_response_reuses_local_file() {
+        let root = std::env::temp_dir().join(format!("cesta-reuse-{}", Uuid::new_v4()));
+        let run = reusable_run(
+            &root,
+            ManifestEntry {
+                file: "feed.zip".to_string(),
+                downloaded: Some(true),
+                size_bytes: Some(9),
+                sha256: Some("checksum".to_string()),
+                etag: Some("etag".to_string()),
+                last_modified: None,
+                content_length: Some(9),
+            },
+        );
+        let remote = RemoteFileMetadata {
+            http_status: StatusCode::NOT_MODIFIED.as_u16(),
+            etag: None,
+            last_modified: None,
+            content_length: None,
+        };
+
+        assert!(can_reuse_file(&run, "feed.zip", Some(&remote)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn equal_size_without_http_validators_does_not_reuse_file() {
+        let root = std::env::temp_dir().join(format!("cesta-reuse-{}", Uuid::new_v4()));
+        let run = reusable_run(
+            &root,
+            ManifestEntry {
+                file: "feed.zip".to_string(),
+                downloaded: Some(true),
+                size_bytes: Some(9),
+                sha256: Some("checksum".to_string()),
+                etag: None,
+                last_modified: None,
+                content_length: Some(9),
+            },
+        );
+        let remote = RemoteFileMetadata {
+            http_status: StatusCode::OK.as_u16(),
+            etag: None,
+            last_modified: None,
+            content_length: Some(9),
+        };
+
+        assert!(!can_reuse_file(&run, "feed.zip", Some(&remote)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_run_retention_removes_only_old_timestamped_directories() {
+        let storage = std::env::temp_dir().join(format!("cesta-retention-{}", Uuid::new_v4()));
+        let root = storage.join("raw").join("pid").join("latest");
+        fs::create_dir_all(&root).await.unwrap();
+        let names = [
+            "20260701T000000Z",
+            "20260702T000000Z",
+            "20260703T000000Z",
+            "20260704T000000Z",
+            "20260705T000000Z",
+        ];
+        for name in names {
+            fs::create_dir_all(root.join(name)).await.unwrap();
+        }
+        fs::create_dir_all(root.join("manual-backup"))
+            .await
+            .unwrap();
+        let protected = root.join("20260705T000000Z");
+
+        prune_raw_run_directories_with_limit(&storage, "pid", &protected, 3)
+            .await
+            .unwrap();
+
+        assert!(!root.join("20260701T000000Z").exists());
+        assert!(!root.join("20260702T000000Z").exists());
+        assert!(root.join("20260703T000000Z").exists());
+        assert!(root.join("20260704T000000Z").exists());
+        assert!(protected.exists());
+        assert!(root.join("manual-backup").exists());
+        fs::remove_dir_all(storage).await.unwrap();
     }
 }
