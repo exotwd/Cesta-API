@@ -30,7 +30,7 @@ pub struct SearchRequest {
     pub modes: Vec<TransportMode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaptorStopTime {
     pub stop_id: String,
     pub arrival_time: u32,
@@ -39,7 +39,7 @@ pub struct RaptorStopTime {
     pub drop_off_allowed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaptorTrip {
     pub trip_id: String,
     pub route_id: String,
@@ -47,12 +47,12 @@ pub struct RaptorTrip {
     pub stop_times: Vec<RaptorStopTime>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RaptorRoute {
     trips: Vec<RaptorTrip>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaptorTimetable {
     routes: Vec<RaptorRoute>,
     stop_routes: HashMap<String, Vec<(usize, usize)>>,

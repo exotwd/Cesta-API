@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, bail};
 
@@ -12,6 +12,7 @@ pub(crate) struct AppConfig {
     pub(crate) database_pool: DatabasePoolConfig,
     pub(crate) jwt_secret: String,
     pub(crate) request_body_limit_bytes: usize,
+    pub(crate) routing_snapshot_dir: PathBuf,
     pub(crate) use_mock_data: bool,
     pub(crate) production: bool,
 }
@@ -90,6 +91,9 @@ impl AppConfig {
             },
             jwt_secret,
             request_body_limit_bytes: parse_number("REQUEST_BODY_LIMIT_BYTES", 1024_usize * 1024)?,
+            routing_snapshot_dir: env::var("ROUTING_SNAPSHOT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("storage").join("processed").join("routing")),
             use_mock_data,
             production,
         })
@@ -137,6 +141,7 @@ mod tests {
             },
             jwt_secret: DEVELOPMENT_JWT_SECRET.to_string(),
             request_body_limit_bytes: 1024 * 1024,
+            routing_snapshot_dir: PathBuf::from("storage").join("processed").join("routing"),
             use_mock_data: true,
             production: false,
         };

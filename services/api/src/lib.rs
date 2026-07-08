@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
 
@@ -75,6 +76,8 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 1;
+const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
@@ -84,6 +87,14 @@ const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 type RaptorCacheKey = (chrono::NaiveDate, Option<DateTime<Utc>>);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
 type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RaptorTimetableSnapshot {
+    version: u32,
+    service_date: chrono::NaiveDate,
+    latest_import: Option<DateTime<Utc>>,
+    timetable: RaptorTimetable,
+}
 
 struct AdminEntitySpec {
     key: &'static str,
@@ -709,12 +720,8 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
     };
     if let Some(pool) = state.db.clone() {
         let cache = state.raptor_cache.clone();
-        tokio::spawn(async move {
-            let service_date = chrono::Local::now().date_naive();
-            if let Err(error) = raptor_timetable_cached_db(&pool, &cache, service_date).await {
-                tracing::warn!(%error, %service_date, "background RAPTOR timetable warmup failed");
-            }
-        });
+        let snapshot_dir = state.config.routing_snapshot_dir.clone();
+        tokio::spawn(async move { warm_raptor_timetables(pool, cache, snapshot_dir).await });
     }
     state
         .ticketing
@@ -2488,6 +2495,7 @@ async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error>
 async fn query_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
     body: &JourneySearchBody,
     departure_time: u32,
     service_date: chrono::NaiveDate,
@@ -2526,6 +2534,7 @@ async fn query_journeys_db(
     let current_service_day_search = service_day_journeys_db(
         pool,
         raptor_cache,
+        routing_snapshot_dir,
         &from_stop_ids,
         &to_stop_ids,
         departure_time,
@@ -2543,6 +2552,7 @@ async fn query_journeys_db(
         let next_service_day_search = service_day_journeys_db(
             pool,
             raptor_cache,
+            routing_snapshot_dir,
             &from_stop_ids,
             &to_stop_ids,
             0,
@@ -2590,6 +2600,7 @@ async fn query_journeys_db(
         let (next_service_day_journeys, next_transfer_search_status) = service_day_journeys_db(
             pool,
             raptor_cache,
+            routing_snapshot_dir,
             &from_stop_ids,
             &to_stop_ids,
             0,
@@ -2863,6 +2874,7 @@ async fn unverified_journey_service_count(
 async fn service_day_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
     from_stop_ids: &[String],
     to_stop_ids: &[String],
     departure_time: u32,
@@ -2873,7 +2885,8 @@ async fn service_day_journeys_db(
     extra_transfers: &[Transfer],
 ) -> Result<(Vec<Journey>, TransferSearchStatus), sqlx::Error> {
     let started_at = time::Instant::now();
-    let timetable = raptor_timetable_cached_db(pool, raptor_cache, service_date).await?;
+    let timetable =
+        raptor_timetable_cached_db(pool, raptor_cache, routing_snapshot_dir, service_date).await?;
     let modes = mode_filters
         .iter()
         .map(|mode| db_mode_to_model(mode))
@@ -2904,13 +2917,10 @@ async fn service_day_journeys_db(
 async fn raptor_timetable_cached_db(
     pool: &PgPool,
     cache: &RaptorCache,
+    routing_snapshot_dir: &FsPath,
     service_date: chrono::NaiveDate,
 ) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
-    let latest_import = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT max(finished_at) FROM import_runs WHERE status = 'success'",
-    )
-    .fetch_one(pool)
-    .await?;
+    let latest_import = latest_successful_import_timestamp(pool).await?;
     let key = (service_date, latest_import);
     let cell = {
         let mut cache = cache.write().await;
@@ -2920,9 +2930,165 @@ async fn raptor_timetable_cached_db(
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone()
     };
-    cell.get_or_try_init(|| async { raptor_timetable_db(pool, service_date).await.map(Arc::new) })
-        .await
-        .cloned()
+    let snapshot_path =
+        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, latest_import);
+    cell.get_or_try_init(|| async {
+        let started_at = time::Instant::now();
+        if let Some(timetable) =
+            load_raptor_timetable_snapshot(&snapshot_path, service_date, latest_import).await
+        {
+            tracing::info!(
+                elapsed_ms = started_at.elapsed().as_millis(),
+                trips = timetable.trip_count(),
+                service_date = %service_date,
+                path = %snapshot_path.display(),
+                "loaded RAPTOR timetable snapshot"
+            );
+            return Ok(Arc::new(timetable));
+        }
+
+        let db_started_at = time::Instant::now();
+        let timetable = raptor_timetable_db(pool, service_date).await?;
+        tracing::info!(
+            elapsed_ms = db_started_at.elapsed().as_millis(),
+            trips = timetable.trip_count(),
+            service_date = %service_date,
+            "built RAPTOR timetable from database"
+        );
+        write_raptor_timetable_snapshot(&snapshot_path, service_date, latest_import, &timetable)
+            .await;
+        Ok(Arc::new(timetable))
+    })
+    .await
+    .cloned()
+}
+
+async fn warm_raptor_timetables(pool: PgPool, cache: RaptorCache, routing_snapshot_dir: PathBuf) {
+    loop {
+        let service_date = chrono::Local::now().date_naive();
+        for offset_days in 0..=1 {
+            let warmup_date = service_date
+                .checked_add_days(chrono::Days::new(offset_days))
+                .unwrap_or(service_date);
+            if let Err(error) =
+                raptor_timetable_cached_db(&pool, &cache, &routing_snapshot_dir, warmup_date).await
+            {
+                tracing::warn!(%error, service_date = %warmup_date, "background RAPTOR timetable warmup failed");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            RAPTOR_WARMUP_INTERVAL_SECONDS,
+        ))
+        .await;
+    }
+}
+
+async fn latest_successful_import_timestamp(
+    pool: &PgPool,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT max(finished_at) FROM import_runs WHERE status = 'success'",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+fn raptor_timetable_snapshot_path(
+    routing_snapshot_dir: &FsPath,
+    service_date: chrono::NaiveDate,
+    latest_import: Option<DateTime<Utc>>,
+) -> PathBuf {
+    let import_token = latest_import
+        .map(|value| value.timestamp_millis().to_string())
+        .unwrap_or_else(|| "no-successful-import".to_string());
+    routing_snapshot_dir.join(format!(
+        "raptor-v{RAPTOR_TIMETABLE_SNAPSHOT_VERSION}-{service_date}-{import_token}.json"
+    ))
+}
+
+async fn load_raptor_timetable_snapshot(
+    path: &FsPath,
+    service_date: chrono::NaiveDate,
+    latest_import: Option<DateTime<Utc>>,
+) -> Option<RaptorTimetable> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "RAPTOR timetable snapshot not available");
+            return None;
+        }
+    };
+    let snapshot = match serde_json::from_slice::<RaptorTimetableSnapshot>(&bytes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "RAPTOR timetable snapshot is unreadable");
+            return None;
+        }
+    };
+    if snapshot.version != RAPTOR_TIMETABLE_SNAPSHOT_VERSION
+        || snapshot.service_date != service_date
+        || snapshot.latest_import != latest_import
+    {
+        tracing::warn!(
+            path = %path.display(),
+            "RAPTOR timetable snapshot metadata did not match requested cache key"
+        );
+        return None;
+    }
+    Some(snapshot.timetable)
+}
+
+async fn write_raptor_timetable_snapshot(
+    path: &FsPath,
+    service_date: chrono::NaiveDate,
+    latest_import: Option<DateTime<Utc>>,
+    timetable: &RaptorTimetable,
+) {
+    let snapshot = RaptorTimetableSnapshot {
+        version: RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
+        service_date,
+        latest_import,
+        timetable: timetable.clone(),
+    };
+    let bytes = match serde_json::to_vec(&snapshot) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "failed to serialize RAPTOR timetable snapshot");
+            return;
+        }
+    };
+    let Some(parent) = path.parent() else {
+        tracing::warn!(path = %path.display(), "RAPTOR timetable snapshot path has no parent directory");
+        return;
+    };
+    if let Err(error) = tokio::fs::create_dir_all(parent).await {
+        tracing::warn!(%error, path = %parent.display(), "failed to create RAPTOR snapshot directory");
+        return;
+    }
+    let temporary_path = path.with_extension("json.tmp");
+    if let Err(error) = tokio::fs::write(&temporary_path, bytes).await {
+        tracing::warn!(%error, path = %temporary_path.display(), "failed to write RAPTOR timetable snapshot");
+        return;
+    }
+    if let Err(error) = tokio::fs::rename(&temporary_path, path).await {
+        let _ = tokio::fs::remove_file(path).await;
+        if let Err(second_error) = tokio::fs::rename(&temporary_path, path).await {
+            tracing::warn!(
+                error = %error,
+                retry_error = %second_error,
+                path = %path.display(),
+                "failed to publish RAPTOR timetable snapshot"
+            );
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return;
+        }
+    }
+    tracing::info!(
+        path = %path.display(),
+        service_date = %service_date,
+        trips = timetable.trip_count(),
+        "wrote RAPTOR timetable snapshot"
+    );
 }
 
 async fn raptor_timetable_db(
