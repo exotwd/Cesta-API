@@ -61,11 +61,13 @@ pub struct RaptorTimetable {
     stop_routes: HashMap<String, Vec<(usize, usize)>>,
     transfers_by_stop: HashMap<String, Vec<Transfer>>,
     trip_count: usize,
+    has_unverified_services: bool,
 }
 
 impl RaptorTimetable {
     pub fn new(trips: Vec<RaptorTrip>, transfers: Vec<Transfer>) -> Self {
         let trip_count = trips.len();
+        let has_unverified_services = trips.iter().any(|trip| !trip.service_verified);
         let mut grouped = HashMap::<(TransportMode, Vec<String>), Vec<RaptorTrip>>::new();
         for trip in trips {
             let key = (
@@ -123,6 +125,7 @@ impl RaptorTimetable {
             stop_routes,
             transfers_by_stop,
             trip_count,
+            has_unverified_services,
         }
     }
 
@@ -140,6 +143,10 @@ impl RaptorTimetable {
             .map(|route| route.trips.len())
             .max()
             .unwrap_or(0)
+    }
+
+    pub fn has_unverified_services(&self) -> bool {
+        self.has_unverified_services
     }
 }
 

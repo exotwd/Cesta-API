@@ -77,7 +77,7 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 5;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 6;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2954,11 +2954,11 @@ async fn query_journeys_profiled_db(
         departure_time,
         routing_config.next_day_search_from_seconds as u32,
     );
-    let (current_service_day_result, next_service_day_result) = if include_next_service_day {
-        let next_service_day_search = service_day_journeys_db(
-            pool,
+    let current_service_day_result = current_service_day_search.await;
+    let next_service_day_result = if include_next_service_day {
+        let stage_started = time::Instant::now();
+        match cached_service_day_journeys_db(
             raptor_cache,
-            routing_snapshot_dir,
             &routing_revision,
             &from_stop_ids,
             &to_stop_ids,
@@ -2968,11 +2968,28 @@ async fn query_journeys_profiled_db(
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
             &nearby_transfers.transfers,
-        );
-        let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
-        (current, Some(next))
+        )
+        .await?
+        {
+            Some(next) => Some(next),
+            None => {
+                timing.push(
+                    "next_timetable_access",
+                    stage_started,
+                    Some(
+                        "skipped cold next service-day timetable; background warmup will prepare it"
+                            .to_string(),
+                    ),
+                );
+                warnings.push(
+                    "next service-day search was skipped because its routing timetable is still warming"
+                        .to_string(),
+                );
+                None
+            }
+        }
     } else {
-        (current_service_day_search.await, None)
+        None
     };
 
     let (mut journeys, transfer_search_status, current_timing) = current_service_day_result?;
@@ -3017,7 +3034,7 @@ async fn query_journeys_profiled_db(
 
     if let Some(next_service_day_result) = next_service_day_result {
         let (next_service_day_journeys, next_transfer_search_status, next_timing) =
-            next_service_day_result?;
+            next_service_day_result;
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
@@ -3069,66 +3086,80 @@ async fn query_journeys_profiled_db(
         }
     }
     if journeys.is_empty() && !include_next_service_day {
-        let (next_service_day_journeys, next_transfer_search_status, next_timing) =
-            service_day_journeys_db(
-                pool,
-                raptor_cache,
-                routing_snapshot_dir,
-                &routing_revision,
-                &from_stop_ids,
-                &to_stop_ids,
-                0,
-                &mode_filters,
-                body.max_transfers,
-                service_date.succ_opt().unwrap_or(service_date),
-                &routing_config,
-                &nearby_transfers.transfers,
-            )
-            .await?;
-        timing.stages.push(RouteSearchStageTiming {
-            stage: "next_timetable_access".to_string(),
-            elapsed_ms: next_timing.timetable_ms,
-            detail: Some(if next_timing.memory_cache_hit {
-                format!(
-                    "memory cache hit; {} trips across {} route patterns; largest pattern has {} trips",
-                    next_timing.trip_count,
-                    next_timing.route_count,
-                    next_timing.max_route_trip_count
-                )
-            } else {
-                format!(
-                    "cache miss, disk load, build, or concurrent wait; {} trips across {} route patterns; largest pattern has {} trips",
-                    next_timing.trip_count,
-                    next_timing.route_count,
-                    next_timing.max_route_trip_count
-                )
-        }),
-    });
-        timing.stages.push(RouteSearchStageTiming {
-            stage: "next_raptor".to_string(),
-            elapsed_ms: next_timing.raptor_ms,
-            detail: Some(format!(
-                "{} candidates; {}",
-                next_service_day_journeys.len(),
-                if next_timing.legacy_search_attempted {
-                    "legacy fallback attempted"
+        let stage_started = time::Instant::now();
+        let next_service_day_result = cached_service_day_journeys_db(
+            raptor_cache,
+            &routing_revision,
+            &from_stop_ids,
+            &to_stop_ids,
+            0,
+            &mode_filters,
+            body.max_transfers,
+            service_date.succ_opt().unwrap_or(service_date),
+            &routing_config,
+            &nearby_transfers.transfers,
+        )
+        .await?;
+        if let Some((next_service_day_journeys, next_transfer_search_status, next_timing)) =
+            next_service_day_result
+        {
+            timing.stages.push(RouteSearchStageTiming {
+                stage: "next_timetable_access".to_string(),
+                elapsed_ms: next_timing.timetable_ms,
+                detail: Some(if next_timing.memory_cache_hit {
+                    format!(
+                        "memory cache hit; {} trips across {} route patterns; largest pattern has {} trips",
+                        next_timing.trip_count,
+                        next_timing.route_count,
+                        next_timing.max_route_trip_count
+                    )
                 } else {
-                    "verified-only search succeeded"
-                }
-            )),
-        });
-        append_transfer_search_warning(
-            &mut warnings,
-            next_transfer_search_status,
-            true,
-            routing_config.transfer_search_timeout_seconds,
-        );
-        let mut next_service_day_journeys =
-            next_service_day_journey_results(next_service_day_journeys, departure_time);
-        if !next_service_day_journeys.is_empty() {
-            journeys.append(&mut next_service_day_journeys);
+                    format!(
+                        "cache miss, disk load, build, or concurrent wait; {} trips across {} route patterns; largest pattern has {} trips",
+                        next_timing.trip_count,
+                        next_timing.route_count,
+                        next_timing.max_route_trip_count
+                    )
+                }),
+            });
+            timing.stages.push(RouteSearchStageTiming {
+                stage: "next_raptor".to_string(),
+                elapsed_ms: next_timing.raptor_ms,
+                detail: Some(format!(
+                    "{} candidates; {}",
+                    next_service_day_journeys.len(),
+                    if next_timing.legacy_search_attempted {
+                        "legacy fallback attempted"
+                    } else {
+                        "verified-only search succeeded"
+                    }
+                )),
+            });
+            append_transfer_search_warning(
+                &mut warnings,
+                next_transfer_search_status,
+                true,
+                routing_config.transfer_search_timeout_seconds,
+            );
+            let mut next_service_day_journeys =
+                next_service_day_journey_results(next_service_day_journeys, departure_time);
+            if !next_service_day_journeys.is_empty() {
+                journeys.append(&mut next_service_day_journeys);
+                warnings.push(
+                    "included next service-day journeys because no later service was available on the requested day"
+                        .to_string(),
+                );
+            }
+        } else {
+            timing.push(
+                "next_timetable_access",
+                stage_started,
+                Some(
+                    "skipped cold next service-day timetable after same-day no-result".to_string(),
+                ),
+            );
             warnings.push(
-                "included next service-day journeys because no later service was available on the requested day"
+                "no same-day journey was found; next service-day fallback was skipped because its routing timetable is still warming"
                     .to_string(),
             );
         }
@@ -3498,13 +3529,80 @@ async fn service_day_journeys_db(
     )
     .await?;
     let timetable_ms = elapsed_millis(timetable_started);
+    service_day_journeys_for_timetable(
+        timetable,
+        memory_cache_hit,
+        timetable_ms,
+        from_stop_ids,
+        to_stop_ids,
+        departure_time,
+        mode_filters,
+        max_transfers,
+        service_date,
+        routing_config,
+        extra_transfers,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cached_service_day_journeys_db(
+    raptor_cache: &RaptorCache,
+    revision: &RoutingDataRevision,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    departure_time: u32,
+    mode_filters: &[String],
+    max_transfers: u32,
+    service_date: chrono::NaiveDate,
+    routing_config: &RoutingAlgorithmConfig,
+    extra_transfers: &[Transfer],
+) -> Result<Option<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming)>, sqlx::Error> {
+    let timetable_started = time::Instant::now();
+    let Some(timetable) =
+        raptor_timetable_memory_cached_for_revision(raptor_cache, service_date, revision).await
+    else {
+        return Ok(None);
+    };
+    let timetable_ms = elapsed_millis(timetable_started);
+    service_day_journeys_for_timetable(
+        timetable,
+        true,
+        timetable_ms,
+        from_stop_ids,
+        to_stop_ids,
+        departure_time,
+        mode_filters,
+        max_transfers,
+        service_date,
+        routing_config,
+        extra_transfers,
+    )
+    .await
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn service_day_journeys_for_timetable(
+    timetable: Arc<RaptorTimetable>,
+    memory_cache_hit: bool,
+    timetable_ms: u64,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    departure_time: u32,
+    mode_filters: &[String],
+    max_transfers: u32,
+    service_date: chrono::NaiveDate,
+    routing_config: &RoutingAlgorithmConfig,
+    extra_transfers: &[Transfer],
+) -> Result<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming), sqlx::Error> {
     let modes = mode_filters
         .iter()
         .map(|mode| db_mode_to_model(mode))
         .collect::<Vec<_>>();
     let raptor_started = time::Instant::now();
-    let mut journeys = raptor(
-        timetable.as_ref(),
+    let mut journeys = run_raptor_search(
+        timetable.clone(),
         RaptorRequest {
             from_stop_ids: from_stop_ids.to_vec(),
             to_stop_ids: to_stop_ids.to_vec(),
@@ -3515,11 +3613,12 @@ async fn service_day_journeys_db(
             modes: modes.clone(),
             allow_unverified_services: false,
         },
-    );
-    let legacy_search_attempted = journeys.is_empty();
+    )
+    .await?;
+    let legacy_search_attempted = journeys.is_empty() && timetable.has_unverified_services();
     if legacy_search_attempted {
-        journeys = raptor(
-            timetable.as_ref(),
+        journeys = run_raptor_search(
+            timetable.clone(),
             RaptorRequest {
                 from_stop_ids: from_stop_ids.to_vec(),
                 to_stop_ids: to_stop_ids.to_vec(),
@@ -3530,7 +3629,8 @@ async fn service_day_journeys_db(
                 modes,
                 allow_unverified_services: true,
             },
-        );
+        )
+        .await?;
     }
     let raptor_ms = elapsed_millis(raptor_started);
     tracing::debug!(
@@ -3557,6 +3657,15 @@ async fn service_day_journeys_db(
             legacy_search_attempted,
         },
     ))
+}
+
+async fn run_raptor_search(
+    timetable: Arc<RaptorTimetable>,
+    request: RaptorRequest,
+) -> Result<Vec<Journey>, sqlx::Error> {
+    tokio::task::spawn_blocking(move || raptor(timetable.as_ref(), request))
+        .await
+        .map_err(|error| sqlx::Error::Protocol(format!("RAPTOR worker failed: {error}")))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3639,6 +3748,19 @@ async fn raptor_timetable_cached_for_revision_db(
         .await
         .cloned()?;
     Ok((timetable, memory_cache_hit))
+}
+
+async fn raptor_timetable_memory_cached_for_revision(
+    cache: &RaptorCache,
+    service_date: chrono::NaiveDate,
+    revision: &RoutingDataRevision,
+) -> Option<Arc<RaptorTimetable>> {
+    let key = (service_date, revision.token.clone());
+    cache
+        .read()
+        .await
+        .get(&key)
+        .and_then(|cell| cell.get().cloned())
 }
 
 async fn warm_raptor_timetables(
@@ -7087,7 +7209,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v5-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v6-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -7100,8 +7222,9 @@ mod tests {
             "raptor-v2-2026-07-08-old.json.tmp",
             "raptor-v3-2026-07-08-old.json",
             "raptor-v4-2026-07-08-old.json",
-            "raptor-v5-2026-07-08-current.json",
-            "raptor-v6-2026-07-08-newer.json",
+            "raptor-v5-2026-07-08-old.json",
+            "raptor-v6-2026-07-08-current.json",
+            "raptor-v7-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -7111,14 +7234,15 @@ mod tests {
 
         assert_eq!(
             prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            4
+            5
         );
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
         assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v4-2026-07-08-old.json").exists());
-        assert!(directory.join("raptor-v5-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v6-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v5-2026-07-08-old.json").exists());
+        assert!(directory.join("raptor-v6-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v7-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
