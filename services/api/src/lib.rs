@@ -77,7 +77,7 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 4;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 5;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2409,6 +2409,7 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
         "implemented_improvements": [
             "Resolve origin and destination concurrently",
             "Reuse one routing-data revision for all service days in a request",
+            "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
             "Fetch related data, realtime updates and intermediate stops concurrently"
         ]
     })
@@ -2979,11 +2980,18 @@ async fn query_journeys_profiled_db(
         stage: "current_timetable_access".to_string(),
         elapsed_ms: current_timing.timetable_ms,
         detail: Some(if current_timing.memory_cache_hit {
-            format!("memory cache hit; {} trips", current_timing.trip_count)
+            format!(
+                "memory cache hit; {} trips across {} route patterns; largest pattern has {} trips",
+                current_timing.trip_count,
+                current_timing.route_count,
+                current_timing.max_route_trip_count
+            )
         } else {
             format!(
-                "cache miss, disk load, build, or concurrent wait; {} trips",
-                current_timing.trip_count
+                "cache miss, disk load, build, or concurrent wait; {} trips across {} route patterns; largest pattern has {} trips",
+                current_timing.trip_count,
+                current_timing.route_count,
+                current_timing.max_route_trip_count
             )
         }),
     });
@@ -2997,7 +3005,7 @@ async fn query_journeys_profiled_db(
                 "legacy fallback attempted"
             } else {
                 "verified-only search succeeded"
-            }
+            },
         )),
     });
     append_transfer_search_warning(
@@ -3014,14 +3022,21 @@ async fn query_journeys_profiled_db(
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
             detail: Some(if next_timing.memory_cache_hit {
-                format!("memory cache hit; {} trips", next_timing.trip_count)
+                format!(
+                    "memory cache hit; {} trips across {} route patterns; largest pattern has {} trips",
+                    next_timing.trip_count,
+                    next_timing.route_count,
+                    next_timing.max_route_trip_count
+                )
             } else {
                 format!(
-                    "cache miss, disk load, build, or concurrent wait; {} trips",
-                    next_timing.trip_count
+                    "cache miss, disk load, build, or concurrent wait; {} trips across {} route patterns; largest pattern has {} trips",
+                    next_timing.trip_count,
+                    next_timing.route_count,
+                    next_timing.max_route_trip_count
                 )
-            }),
-        });
+        }),
+    });
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
@@ -3074,14 +3089,21 @@ async fn query_journeys_profiled_db(
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
             detail: Some(if next_timing.memory_cache_hit {
-                format!("memory cache hit; {} trips", next_timing.trip_count)
+                format!(
+                    "memory cache hit; {} trips across {} route patterns; largest pattern has {} trips",
+                    next_timing.trip_count,
+                    next_timing.route_count,
+                    next_timing.max_route_trip_count
+                )
             } else {
                 format!(
-                    "cache miss, disk load, build, or concurrent wait; {} trips",
-                    next_timing.trip_count
+                    "cache miss, disk load, build, or concurrent wait; {} trips across {} route patterns; largest pattern has {} trips",
+                    next_timing.trip_count,
+                    next_timing.route_count,
+                    next_timing.max_route_trip_count
                 )
-            }),
-        });
+        }),
+    });
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
@@ -3516,6 +3538,8 @@ async fn service_day_journeys_db(
         raptor_ms,
         candidates = journeys.len(),
         trips = timetable.trip_count(),
+        route_patterns = timetable.route_count(),
+        max_route_trips = timetable.max_route_trip_count(),
         service_date = %service_date,
         "RAPTOR journey search completed"
     );
@@ -3528,6 +3552,8 @@ async fn service_day_journeys_db(
             raptor_ms,
             memory_cache_hit,
             trip_count: timetable.trip_count(),
+            route_count: timetable.route_count(),
+            max_route_trip_count: timetable.max_route_trip_count(),
             legacy_search_attempted,
         },
     ))
@@ -3539,6 +3565,8 @@ struct ServiceDaySearchTiming {
     raptor_ms: u64,
     memory_cache_hit: bool,
     trip_count: usize,
+    route_count: usize,
+    max_route_trip_count: usize,
     legacy_search_attempted: bool,
 }
 
@@ -7059,7 +7087,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v4-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v5-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -7071,8 +7099,9 @@ mod tests {
             "raptor-v1-2026-07-08-old.json",
             "raptor-v2-2026-07-08-old.json.tmp",
             "raptor-v3-2026-07-08-old.json",
-            "raptor-v4-2026-07-08-current.json",
-            "raptor-v5-2026-07-08-newer.json",
+            "raptor-v4-2026-07-08-old.json",
+            "raptor-v5-2026-07-08-current.json",
+            "raptor-v6-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -7082,13 +7111,14 @@ mod tests {
 
         assert_eq!(
             prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            3
+            4
         );
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
         assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
-        assert!(directory.join("raptor-v4-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v5-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v4-2026-07-08-old.json").exists());
+        assert!(directory.join("raptor-v5-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v6-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }

@@ -51,6 +51,8 @@ pub struct RaptorTrip {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RaptorRoute {
     trips: Vec<RaptorTrip>,
+    departures_by_stop_index: Vec<Vec<usize>>,
+    verified_departures_by_stop_index: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,7 +85,14 @@ impl RaptorTimetable {
                         .first()
                         .map_or(u32::MAX, |stop| stop.departure_time)
                 });
-                RaptorRoute { trips }
+                let departures_by_stop_index = route_departure_indices_by_stop_index(&trips, false);
+                let verified_departures_by_stop_index =
+                    route_departure_indices_by_stop_index(&trips, true);
+                RaptorRoute {
+                    trips,
+                    departures_by_stop_index,
+                    verified_departures_by_stop_index,
+                }
             })
             .collect::<Vec<_>>();
         routes.sort_by(|left, right| {
@@ -119,6 +128,18 @@ impl RaptorTimetable {
 
     pub fn trip_count(&self) -> usize {
         self.trip_count
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn max_route_trip_count(&self) -> usize {
+        self.routes
+            .iter()
+            .map(|route| route.trips.len())
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -215,6 +236,11 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
             if !allowed_modes.is_empty() && !allowed_modes.contains(&trips[0].mode) {
                 continue;
             }
+            let departure_indices = if allow_unverified_services {
+                &timetable.routes[route_index].departures_by_stop_index
+            } else {
+                &timetable.routes[route_index].verified_departures_by_stop_index
+            };
             let stops = &trips[0].stop_times;
             let mut current_trip: Option<(&RaptorTrip, usize)> = None;
             for index in start_index..stops.len() {
@@ -257,15 +283,8 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
                     request.min_transfer_seconds
                 };
                 let ready_time = previous_arrival.saturating_add(transfer_slack);
-                let catchable = trips
-                    .iter()
-                    .filter(|trip| {
-                        let stop = &trip.stop_times[index];
-                        (allow_unverified_services || trip.service_verified)
-                            && stop.pickup_allowed
-                            && ready_time <= stop.departure_time
-                    })
-                    .min_by_key(|trip| trip.stop_times[index].departure_time);
+                let catchable =
+                    earliest_catchable_trip(trips, departure_indices, index, ready_time);
                 if let Some(candidate) = catchable
                     && current_trip.is_none_or(|(current, _)| {
                         candidate.stop_times[index].departure_time
@@ -326,6 +345,43 @@ pub fn raptor(timetable: &RaptorTimetable, request: RaptorRequest) -> Vec<Journe
     }
     journeys.sort_by_key(|journey| (journey.arrival_time, journey.transfer_count));
     journeys
+}
+
+fn route_departure_indices_by_stop_index(
+    trips: &[RaptorTrip],
+    verified_only: bool,
+) -> Vec<Vec<usize>> {
+    let stop_count = trips.first().map_or(0, |trip| trip.stop_times.len());
+    (0..stop_count)
+        .map(|stop_index| {
+            let mut indices = trips
+                .iter()
+                .enumerate()
+                .filter_map(|(trip_index, trip)| {
+                    (!verified_only || trip.service_verified).then_some(trip_index)
+                })
+                .collect::<Vec<_>>();
+            indices
+                .sort_by_key(|trip_index| trips[*trip_index].stop_times[stop_index].departure_time);
+            indices
+        })
+        .collect()
+}
+
+fn earliest_catchable_trip<'a>(
+    trips: &'a [RaptorTrip],
+    departure_indices_by_stop_index: &[Vec<usize>],
+    stop_index: usize,
+    ready_time: u32,
+) -> Option<&'a RaptorTrip> {
+    let departure_indices = departure_indices_by_stop_index.get(stop_index)?;
+    let first_candidate = departure_indices.partition_point(|trip_index| {
+        trips[*trip_index].stop_times[stop_index].departure_time < ready_time
+    });
+    departure_indices[first_candidate..]
+        .iter()
+        .map(|trip_index| &trips[*trip_index])
+        .find(|trip| trip.stop_times[stop_index].pickup_allowed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -896,6 +952,74 @@ mod tests {
         assert_eq!(journeys[0].legs[0].from_stop_id, "selected");
         assert_eq!(journeys[0].legs[0].to_stop_id, "nearby");
         assert_eq!(journeys[0].walking_distance_meters, 150);
+    }
+
+    #[test]
+    fn raptor_uses_earliest_catchable_trip_at_boarding_stop() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![
+                RaptorTrip {
+                    trip_id: "first-at-route-origin".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("a", 8 * 3600),
+                        stop_time("b", 9 * 3600),
+                        stop_time("c", 10 * 3600),
+                    ],
+                },
+                RaptorTrip {
+                    trip_id: "first-at-transfer-stop".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("a", 8 * 3600 + 600),
+                        stop_time("b", 8 * 3600 + 1800),
+                        stop_time("c", 9 * 3600),
+                    ],
+                },
+            ],
+            Vec::new(),
+        );
+
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["origin".into()],
+                to_stop_ids: vec!["c".into()],
+                extra_transfers: vec![Transfer {
+                    from_stop_id: "origin".into(),
+                    to_stop_id: "b".into(),
+                    min_transfer_seconds: 8 * 3600 + 20 * 60,
+                    distance_meters: Some(100),
+                    walking_geometry: None,
+                    confidence: CoordinateConfidence::Medium,
+                    accessibility_level: None,
+                    source: "test".into(),
+                }],
+                departure_time: 0,
+                max_transfers: 1,
+                min_transfer_seconds: 0,
+                modes: vec![TransportMode::Train],
+                allow_unverified_services: false,
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(
+            journeys[0].legs[1].trip_id.as_deref(),
+            Some("first-at-transfer-stop")
+        );
+        assert_eq!(journeys[0].arrival_time, 9 * 3600);
     }
 
     #[test]
