@@ -41,6 +41,7 @@ const PID_FEED_ID: &str = "pid_gtfs";
 const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
 const PID_SOURCE_PRIORITY: i32 = 10;
 const DEFAULT_RAW_RUNS_TO_KEEP: usize = 3;
+const DEFAULT_DB_IMPORT_RUNS_TO_KEEP: usize = 3;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -1285,6 +1286,14 @@ fn raw_runs_to_keep() -> usize {
         .max(1)
 }
 
+fn db_import_runs_to_keep() -> usize {
+    std::env::var("DB_IMPORT_RUNS_TO_KEEP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_DB_IMPORT_RUNS_TO_KEEP)
+        .max(1)
+}
+
 async fn prune_raw_run_directories(
     storage_dir: &Path,
     source: &str,
@@ -1674,12 +1683,14 @@ async fn export_dataset_to_postgres(
               url = EXCLUDED.url,
               timezone = EXCLUDED.timezone
             WHERE (
+              agencies.import_run_id,
               agencies.source_feed_id,
               agencies.source_id,
               agencies.name,
               agencies.url,
               agencies.timezone
             ) IS DISTINCT FROM (
+              EXCLUDED.import_run_id,
               EXCLUDED.source_feed_id,
               EXCLUDED.source_id,
               EXCLUDED.name,
@@ -2053,7 +2064,7 @@ async fn export_dataset_to_postgres(
         })
     };
 
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "exported": true,
         "import_run_id": import_run_id,
         "source": source,
@@ -2083,6 +2094,18 @@ async fn export_dataset_to_postgres(
     .bind(&summary)
     .execute(pool)
     .await?;
+
+    if complete_dataset {
+        let retention_cleanup =
+            prune_obsolete_feed_import_data(pool, feed_id, import_run_id, db_import_runs_to_keep())
+                .await?;
+        summary["retention_cleanup"] = retention_cleanup;
+        sqlx::query("UPDATE import_runs SET summary = $2 WHERE id = $1")
+            .bind(import_run_id)
+            .bind(&summary)
+            .execute(pool)
+            .await?;
+    }
 
     let row = sqlx::query("SELECT COUNT(*) AS count FROM stops WHERE source_feed_id = $1")
         .bind(feed_id)
@@ -2239,6 +2262,19 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    let deleted_shapes = sqlx::query(
+        r#"
+        DELETE FROM shapes
+        WHERE source_feed_id = $1
+          AND import_run_id IS DISTINCT FROM $2
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
     let deleted_stop_source_ids = sqlx::query(
         r#"
         DELETE FROM stop_source_ids
@@ -2259,6 +2295,55 @@ async fn prune_stale_feed_schedule_rows(
         WHERE source_feed_id = $1
           AND import_run_id IS DISTINCT FROM $2
           AND is_active = true
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_obsolete_transfers = sqlx::query(
+        r#"
+        DELETE FROM transfers transfer
+        WHERE EXISTS (
+            SELECT 1
+            FROM stops stop
+            WHERE stop.id IN (transfer.from_stop_id, transfer.to_stop_id)
+              AND stop.source_feed_id = $1
+              AND stop.import_run_id IS DISTINCT FROM $2
+              AND stop.is_active = false
+        )
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_stops = sqlx::query(
+        r#"
+        DELETE FROM stops stop
+        WHERE stop.source_feed_id = $1
+          AND stop.import_run_id IS DISTINCT FROM $2
+          AND stop.is_active = false
+          AND NOT EXISTS (
+            SELECT 1 FROM stop_times stop_time WHERE stop_time.stop_id = stop.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM stop_source_ids source_id WHERE source_id.stop_id = stop.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM transfers transfer
+            WHERE transfer.from_stop_id = stop.id OR transfer.to_stop_id = stop.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM manual_stop_matches manual_match
+            WHERE manual_match.stop_id = stop.id OR manual_match.target_stop_id = stop.id
+          )
         "#,
     )
     .bind(feed_id)
@@ -2289,9 +2374,90 @@ async fn prune_stale_feed_schedule_rows(
         "deleted_routes": deleted_routes,
         "deleted_calendars": deleted_calendars,
         "deleted_calendar_dates": deleted_calendar_dates,
+        "deleted_shapes": deleted_shapes,
         "deleted_stop_source_ids": deleted_stop_source_ids,
         "deactivated_stops": deactivated_stops,
+        "deleted_obsolete_transfers": deleted_obsolete_transfers,
+        "deleted_stops": deleted_stops,
         "deleted_agencies": deleted_agencies
+    }))
+}
+
+async fn prune_obsolete_feed_import_data(
+    pool: &PgPool,
+    feed_id: &str,
+    current_import_run_id: Uuid,
+    runs_to_keep: usize,
+) -> Result<serde_json::Value> {
+    let retained_import_run_ids = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM (
+          SELECT id
+          FROM import_runs
+          WHERE (summary->>'feed_id' = $1 OR source LIKE $1 || ':%')
+            AND status = 'success'
+          ORDER BY finished_at DESC NULLS LAST, started_at DESC
+          LIMIT $2
+        ) retained
+        UNION
+        SELECT $3::uuid
+        UNION
+        SELECT id
+        FROM import_runs
+        WHERE (summary->>'feed_id' = $1 OR source LIKE $1 || ':%')
+          AND status = 'running'
+        "#,
+    )
+    .bind(feed_id)
+    .bind(runs_to_keep.max(1) as i64)
+    .bind(current_import_run_id)
+    .fetch_all(pool)
+    .await?;
+
+    let deleted_validation_issues = sqlx::query(
+        r#"
+        DELETE FROM validation_issues
+        WHERE source_feed_id = $1
+          AND import_run_id IS NOT NULL
+          AND NOT (import_run_id = ANY($2::uuid[]))
+        "#,
+    )
+    .bind(feed_id)
+    .bind(&retained_import_run_ids)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    let deleted_import_runs = sqlx::query(
+        r#"
+        DELETE FROM import_runs run
+        WHERE (run.summary->>'feed_id' = $1 OR run.source LIKE $1 || ':%')
+          AND run.status <> 'running'
+          AND NOT (run.id = ANY($2::uuid[]))
+          AND NOT EXISTS (SELECT 1 FROM agencies item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM stops item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM stop_source_ids item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM routes item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM trips item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM stop_times item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM calendars item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM calendar_dates item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM shapes item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM validation_issues item WHERE item.import_run_id = run.id)
+        "#,
+    )
+    .bind(feed_id)
+    .bind(&retained_import_run_ids)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(serde_json::json!({
+        "db_import_runs_to_keep": runs_to_keep.max(1),
+        "retained_import_run_ids": retained_import_run_ids,
+        "deleted_validation_issues": deleted_validation_issues,
+        "deleted_import_runs": deleted_import_runs
     }))
 }
 
