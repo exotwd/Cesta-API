@@ -133,6 +133,14 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0011_transfer_search_indexes",
         include_str!("../../../../infra/postgres/migrations/0011_transfer_search_indexes.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0014_routing_range_and_endpoint_cache",
+        include_str!(
+            "../../../../infra/postgres/migrations/0014_routing_range_and_endpoint_cache.sql"
+        ),
+    )
     .await
 }
 

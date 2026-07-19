@@ -271,7 +271,7 @@ pub(crate) async fn openapi() -> Json<Value> {
                 "RoutingAlgorithmConfig": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["max_results", "max_direct_candidates", "max_transfer_candidates", "min_transfer_seconds", "max_transfer_wait_seconds", "transfer_search_timeout_seconds", "next_day_search_from_seconds", "arrival_time_weight", "duration_weight", "transfer_penalty_seconds", "preserve_simplest", "preserve_each_transfer_count", "preserve_carrier_diversity", "remove_dominated", "dominate_only_same_carrier"],
+                    "required": ["max_results", "max_direct_candidates", "max_transfer_candidates", "min_transfer_seconds", "max_transfer_wait_seconds", "transfer_search_timeout_seconds", "next_day_search_from_seconds", "range_search_window_seconds", "max_range_departures", "endpoint_access_cache_enabled", "arrival_time_weight", "duration_weight", "transfer_penalty_seconds", "preserve_simplest", "preserve_each_transfer_count", "preserve_carrier_diversity", "remove_dominated", "dominate_only_same_carrier"],
                     "properties": {
                         "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
                         "max_direct_candidates": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
@@ -280,6 +280,9 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "max_transfer_wait_seconds": {"type": "integer", "minimum": 300, "maximum": 21600, "default": 7200},
                         "transfer_search_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 6},
                         "next_day_search_from_seconds": {"type": "integer", "minimum": 0, "maximum": 86399, "default": 64800},
+                        "range_search_window_seconds": {"type": "integer", "minimum": 0, "maximum": 21600, "default": 5400},
+                        "max_range_departures": {"type": "integer", "minimum": 1, "maximum": 96, "default": 24},
+                        "endpoint_access_cache_enabled": {"type": "boolean", "default": true},
                         "arrival_time_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
                         "duration_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 0},
                         "transfer_penalty_seconds": {"type": "integer", "minimum": 0, "maximum": 14400, "default": 0},

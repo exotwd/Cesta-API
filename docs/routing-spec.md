@@ -13,7 +13,6 @@ Required routing behavior:
 
 Future work:
 
-- Range RAPTOR
 - arrive-by search
 - multi-criteria ranking
 
@@ -39,6 +38,17 @@ RAPTOR first searches only calendar-verified trips, preventing a faster legacy t
 a real service during round scanning. It reruns with legacy trips enabled only when the verified
 search returns no journey, and any resulting fallback is returned with a response warning.
 
+For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The requested
+departure time is always searched, then the API samples up to `max_range_departures` real
+departures from resolved origin stops within `range_search_window_seconds`. Candidates from those
+probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside the
+RAPTOR round scan.
+
+Nearby origin and destination walking access is cached by routing-data revision, endpoint stop set,
+direction and walking speed when `endpoint_access_cache_enabled` is true. Cache misses use the same
+PostGIS radius query as before, so repeated searches avoid endpoint transfer latency without
+changing option coverage.
+
 On API startup, snapshot files with a lower format version than the running API are deleted before
 warmup. Current-version files, files from a newer version, and unrelated files are preserved.
 
@@ -53,7 +63,7 @@ on the public journey response.
 The admin page separates controls into:
 
 - candidate generation: direct/transfer query limits, valid transfer time window, transfer-query
-  timeout, and the next-service-day threshold;
+  timeout, the next-service-day threshold, bounded range-search controls and endpoint access cache;
 - ranking: `arrival_time × arrival_time_weight + duration × duration_weight + transfers ×
   transfer_penalty_seconds`, with the lowest score first;
 - result selection: response limit, dominance pruning, simplest-journey coverage, transfer-count

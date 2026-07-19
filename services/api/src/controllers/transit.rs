@@ -485,6 +485,7 @@ pub(crate) async fn journey_search(
         return match query_journeys_db(
             pool,
             &state.raptor_cache,
+            &state.endpoint_access_cache,
             &state.config.routing_snapshot_dir,
             &state.route_search_diagnostics,
             &body,

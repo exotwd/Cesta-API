@@ -14,8 +14,8 @@ use axum::{
 };
 use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use routing_core::{
-    RaptorRequest, RaptorStopTime, RaptorTimetable, RaptorTrip,
-    SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot, raptor,
+    RaptorRequest, RaptorSearchStats, RaptorStopTime, RaptorTimetable, RaptorTrip,
+    SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot, raptor_with_stats,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,7 +77,9 @@ const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 6;
+const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
+const MAX_RANGE_DEPARTURES: usize = 24;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 7;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -89,8 +91,17 @@ const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 type RaptorCacheKey = (chrono::NaiveDate, String);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
 type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
+type EndpointAccessCache = Arc<RwLock<HashMap<EndpointAccessCacheKey, Vec<Transfer>>>>;
 type RoutingWarmupStatus = Arc<RwLock<RoutingWarmupState>>;
 type RouteSearchDiagnostics = Arc<RwLock<VecDeque<RouteSearchTiming>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EndpointAccessCacheKey {
+    revision_token: String,
+    selected_stop_ids: Vec<String>,
+    access_to_origin: bool,
+    walking_speed_centimeters_per_second: u32,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct RouteSearchStageTiming {
@@ -282,6 +293,7 @@ struct AppState {
     use_mock_data: bool,
     ticketing: ticketing::TicketingService,
     raptor_cache: RaptorCache,
+    endpoint_access_cache: EndpointAccessCache,
     routing_warmup_status: RoutingWarmupStatus,
     route_search_diagnostics: RouteSearchDiagnostics,
 }
@@ -558,6 +570,9 @@ struct RoutingAlgorithmConfig {
     max_transfer_wait_seconds: i32,
     transfer_search_timeout_seconds: i32,
     next_day_search_from_seconds: i32,
+    range_search_window_seconds: i32,
+    max_range_departures: i32,
+    endpoint_access_cache_enabled: bool,
     arrival_time_weight: f64,
     duration_weight: f64,
     transfer_penalty_seconds: i32,
@@ -578,6 +593,9 @@ impl Default for RoutingAlgorithmConfig {
             max_transfer_wait_seconds: MAX_TRANSFER_WAIT_SECONDS as i32,
             transfer_search_timeout_seconds: TRANSFER_SEARCH_TIMEOUT_SECONDS as i32,
             next_day_search_from_seconds: NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS as i32,
+            range_search_window_seconds: RANGE_SEARCH_WINDOW_SECONDS as i32,
+            max_range_departures: MAX_RANGE_DEPARTURES as i32,
+            endpoint_access_cache_enabled: true,
             arrival_time_weight: 1.0,
             duration_weight: 0.0,
             transfer_penalty_seconds: 0,
@@ -620,6 +638,13 @@ impl RoutingAlgorithmConfig {
                 0,
                 86399,
             ),
+            (
+                "range_search_window_seconds",
+                self.range_search_window_seconds,
+                0,
+                21600,
+            ),
+            ("max_range_departures", self.max_range_departures, 1, 96),
             (
                 "transfer_penalty_seconds",
                 self.transfer_penalty_seconds,
@@ -829,6 +854,7 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         use_mock_data: config.use_mock_data,
         ticketing,
         raptor_cache: Arc::new(RwLock::new(HashMap::new())),
+        endpoint_access_cache: Arc::new(RwLock::new(HashMap::new())),
         routing_warmup_status: Arc::new(RwLock::new(RoutingWarmupState::default())),
         route_search_diagnostics: Arc::new(RwLock::new(VecDeque::new())),
     };
@@ -2220,6 +2246,8 @@ async fn routing_algorithm_config_db(
         SELECT max_results, max_direct_candidates, max_transfer_candidates,
                min_transfer_seconds, max_transfer_wait_seconds,
                transfer_search_timeout_seconds, next_day_search_from_seconds,
+               range_search_window_seconds, max_range_departures,
+               endpoint_access_cache_enabled,
                arrival_time_weight, duration_weight, transfer_penalty_seconds,
                preserve_simplest, preserve_each_transfer_count,
                preserve_carrier_diversity, remove_dominated,
@@ -2242,6 +2270,9 @@ async fn routing_algorithm_config_db(
             max_transfer_wait_seconds: row.get("max_transfer_wait_seconds"),
             transfer_search_timeout_seconds: row.get("transfer_search_timeout_seconds"),
             next_day_search_from_seconds: row.get("next_day_search_from_seconds"),
+            range_search_window_seconds: row.get("range_search_window_seconds"),
+            max_range_departures: row.get("max_range_departures"),
+            endpoint_access_cache_enabled: row.get("endpoint_access_cache_enabled"),
             arrival_time_weight: row.get("arrival_time_weight"),
             duration_weight: row.get("duration_weight"),
             transfer_penalty_seconds: row.get("transfer_penalty_seconds"),
@@ -2267,13 +2298,15 @@ async fn persist_routing_algorithm_config(
           id, max_results, max_direct_candidates, max_transfer_candidates,
           min_transfer_seconds, max_transfer_wait_seconds,
           transfer_search_timeout_seconds, next_day_search_from_seconds,
+          range_search_window_seconds, max_range_departures,
+          endpoint_access_cache_enabled,
           arrival_time_weight, duration_weight, transfer_penalty_seconds,
           preserve_simplest, preserve_each_transfer_count,
           preserve_carrier_diversity, remove_dominated,
           dominate_only_same_carrier, updated_at, updated_by
         ) VALUES (
           1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-          $11, $12, $13, $14, $15, now(), $16
+          $11, $12, $13, $14, $15, $16, $17, $18, now(), $19
         )
         ON CONFLICT (id) DO UPDATE SET
           max_results = EXCLUDED.max_results,
@@ -2283,6 +2316,9 @@ async fn persist_routing_algorithm_config(
           max_transfer_wait_seconds = EXCLUDED.max_transfer_wait_seconds,
           transfer_search_timeout_seconds = EXCLUDED.transfer_search_timeout_seconds,
           next_day_search_from_seconds = EXCLUDED.next_day_search_from_seconds,
+          range_search_window_seconds = EXCLUDED.range_search_window_seconds,
+          max_range_departures = EXCLUDED.max_range_departures,
+          endpoint_access_cache_enabled = EXCLUDED.endpoint_access_cache_enabled,
           arrival_time_weight = EXCLUDED.arrival_time_weight,
           duration_weight = EXCLUDED.duration_weight,
           transfer_penalty_seconds = EXCLUDED.transfer_penalty_seconds,
@@ -2302,6 +2338,9 @@ async fn persist_routing_algorithm_config(
     .bind(configuration.max_transfer_wait_seconds)
     .bind(configuration.transfer_search_timeout_seconds)
     .bind(configuration.next_day_search_from_seconds)
+    .bind(configuration.range_search_window_seconds)
+    .bind(configuration.max_range_departures)
+    .bind(configuration.endpoint_access_cache_enabled)
     .bind(configuration.arrival_time_weight)
     .bind(configuration.duration_weight)
     .bind(configuration.transfer_penalty_seconds)
@@ -2410,6 +2449,10 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Resolve origin and destination concurrently",
             "Reuse one routing-data revision for all service days in a request",
             "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
+            "Use numeric stop indexes and array labels inside RAPTOR scans",
+            "Sample bounded origin departures for rRAPTOR-style alternatives",
+            "Cache endpoint nearby walking access by routing-data revision",
+            "Run cached current-day and next-day RAPTOR searches concurrently",
             "Fetch related data, realtime updates and intermediate stops concurrently"
         ]
     })
@@ -2831,6 +2874,7 @@ async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error>
 async fn query_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
+    endpoint_access_cache: &EndpointAccessCache,
     routing_snapshot_dir: &FsPath,
     diagnostics: &RouteSearchDiagnostics,
     body: &JourneySearchBody,
@@ -2842,6 +2886,7 @@ async fn query_journeys_db(
     let result = query_journeys_profiled_db(
         pool,
         raptor_cache,
+        endpoint_access_cache,
         routing_snapshot_dir,
         body,
         departure_time,
@@ -2869,6 +2914,7 @@ async fn query_journeys_db(
 async fn query_journeys_profiled_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
+    endpoint_access_cache: &EndpointAccessCache,
     routing_snapshot_dir: &FsPath,
     body: &JourneySearchBody,
     departure_time: u32,
@@ -2909,8 +2955,15 @@ async fn query_journeys_profiled_db(
     }
 
     let stage_started = time::Instant::now();
+    let routing_revision = routing_data_revision(pool).await?;
+    timing.push("routing_revision", stage_started, None);
+
+    let stage_started = time::Instant::now();
     let nearby_transfers = nearby_journey_transfers_db(
         pool,
+        endpoint_access_cache,
+        &routing_revision,
+        routing_config.endpoint_access_cache_enabled,
         &body.from,
         &from_stop_ids,
         &body.to,
@@ -2922,14 +2975,12 @@ async fn query_journeys_profiled_db(
         "nearby_transfers",
         stage_started,
         Some(format!(
-            "{} walking links",
-            nearby_transfers.transfers.len()
+            "{} walking links; {} cache hits, {} misses",
+            nearby_transfers.transfers.len(),
+            nearby_transfers.cache_hits,
+            nearby_transfers.cache_misses
         )),
     );
-
-    let stage_started = time::Instant::now();
-    let routing_revision = routing_data_revision(pool).await?;
-    timing.push("routing_revision", stage_started, None);
 
     let mode_filters = body
         .transport_modes
@@ -2954,10 +3005,9 @@ async fn query_journeys_profiled_db(
         departure_time,
         routing_config.next_day_search_from_seconds as u32,
     );
-    let current_service_day_result = current_service_day_search.await;
-    let next_service_day_result = if include_next_service_day {
+    let (current_service_day_result, next_service_day_result) = if include_next_service_day {
         let stage_started = time::Instant::now();
-        match cached_service_day_journeys_db(
+        let next_service_day_search = cached_service_day_journeys_db(
             raptor_cache,
             &routing_revision,
             &from_stop_ids,
@@ -2968,9 +3018,9 @@ async fn query_journeys_profiled_db(
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
             &nearby_transfers.transfers,
-        )
-        .await?
-        {
+        );
+        let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
+        let next = match next? {
             Some(next) => Some(next),
             None => {
                 timing.push(
@@ -2987,9 +3037,10 @@ async fn query_journeys_profiled_db(
                 );
                 None
             }
-        }
+        };
+        (current, next)
     } else {
-        None
+        (current_service_day_search.await, None)
     };
 
     let (mut journeys, transfer_search_status, current_timing) = current_service_day_result?;
@@ -3016,8 +3067,12 @@ async fn query_journeys_profiled_db(
         stage: "current_raptor".to_string(),
         elapsed_ms: current_timing.raptor_ms,
         detail: Some(format!(
-            "{} candidates; {}",
+            "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
             journeys.len(),
+            current_timing.range_departure_count,
+            current_timing.raptor_rounds,
+            current_timing.raptor_routes_scanned,
+            current_timing.raptor_marked_stops,
             if current_timing.legacy_search_attempted {
                 "legacy fallback attempted"
             } else {
@@ -3058,8 +3113,12 @@ async fn query_journeys_profiled_db(
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
             detail: Some(format!(
-                "{} candidates; {}",
+                "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
                 next_service_day_journeys.len(),
+                next_timing.range_departure_count,
+                next_timing.raptor_rounds,
+                next_timing.raptor_routes_scanned,
+                next_timing.raptor_marked_stops,
                 if next_timing.legacy_search_attempted {
                     "legacy fallback attempted"
                 } else {
@@ -3126,8 +3185,12 @@ async fn query_journeys_profiled_db(
                 stage: "next_raptor".to_string(),
                 elapsed_ms: next_timing.raptor_ms,
                 detail: Some(format!(
-                    "{} candidates; {}",
+                    "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
                     next_service_day_journeys.len(),
+                    next_timing.range_departure_count,
+                    next_timing.raptor_rounds,
+                    next_timing.raptor_routes_scanned,
+                    next_timing.raptor_marked_stops,
                     if next_timing.legacy_search_attempted {
                         "legacy fallback attempted"
                     } else {
@@ -3345,11 +3408,16 @@ enum TransferSearchStatus {
 #[derive(Debug, Default)]
 struct NearbyJourneyTransfers {
     transfers: Vec<Transfer>,
+    cache_hits: usize,
+    cache_misses: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn nearby_journey_transfers_db(
     pool: &PgPool,
+    endpoint_access_cache: &EndpointAccessCache,
+    routing_revision: &RoutingDataRevision,
+    cache_enabled: bool,
     from_point: &JourneyPoint,
     from_stop_ids: &[String],
     to_point: &JourneyPoint,
@@ -3358,22 +3426,41 @@ async fn nearby_journey_transfers_db(
 ) -> Result<NearbyJourneyTransfers, sqlx::Error> {
     let origin_transfers = async {
         if from_point.point_type == "stop" {
-            nearby_endpoint_transfers_db(pool, from_stop_ids, true, walking_speed_mps).await
+            nearby_endpoint_transfers_cached_db(
+                pool,
+                endpoint_access_cache,
+                routing_revision,
+                cache_enabled,
+                from_stop_ids,
+                true,
+                walking_speed_mps,
+            )
+            .await
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), false))
         }
     };
     let destination_transfers = async {
         if to_point.point_type == "stop" {
-            nearby_endpoint_transfers_db(pool, to_stop_ids, false, walking_speed_mps).await
+            nearby_endpoint_transfers_cached_db(
+                pool,
+                endpoint_access_cache,
+                routing_revision,
+                cache_enabled,
+                to_stop_ids,
+                false,
+                walking_speed_mps,
+            )
+            .await
         } else {
-            Ok(Vec::new())
+            Ok((Vec::new(), false))
         }
     };
     let (origin_transfers, destination_transfers) =
         tokio::join!(origin_transfers, destination_transfers);
-    let mut transfers = origin_transfers?;
-    transfers.extend(destination_transfers?);
+    let (mut transfers, origin_cache_hit) = origin_transfers?;
+    let (destination_transfers, destination_cache_hit) = destination_transfers?;
+    transfers.extend(destination_transfers);
 
     transfers.sort_by(|left, right| {
         left.from_stop_id
@@ -3385,7 +3472,62 @@ async fn nearby_journey_transfers_db(
         left.from_stop_id == right.from_stop_id && left.to_stop_id == right.to_stop_id
     });
 
-    Ok(NearbyJourneyTransfers { transfers })
+    let cache_hits = usize::from(origin_cache_hit) + usize::from(destination_cache_hit);
+    let cache_misses = usize::from(from_point.point_type == "stop" && !origin_cache_hit)
+        + usize::from(to_point.point_type == "stop" && !destination_cache_hit);
+    Ok(NearbyJourneyTransfers {
+        transfers,
+        cache_hits,
+        cache_misses,
+    })
+}
+
+async fn nearby_endpoint_transfers_cached_db(
+    pool: &PgPool,
+    endpoint_access_cache: &EndpointAccessCache,
+    routing_revision: &RoutingDataRevision,
+    cache_enabled: bool,
+    selected_stop_ids: &[String],
+    access_to_origin: bool,
+    walking_speed_mps: f64,
+) -> Result<(Vec<Transfer>, bool), sqlx::Error> {
+    let key = endpoint_access_cache_key(
+        routing_revision,
+        selected_stop_ids,
+        access_to_origin,
+        walking_speed_mps,
+    );
+    if cache_enabled && let Some(transfers) = endpoint_access_cache.read().await.get(&key).cloned()
+    {
+        return Ok((transfers, true));
+    }
+
+    let transfers =
+        nearby_endpoint_transfers_db(pool, selected_stop_ids, access_to_origin, walking_speed_mps)
+            .await?;
+    if cache_enabled {
+        let mut cache = endpoint_access_cache.write().await;
+        cache.retain(|known, _| known.revision_token == routing_revision.token);
+        cache.insert(key, transfers.clone());
+    }
+    Ok((transfers, false))
+}
+
+fn endpoint_access_cache_key(
+    routing_revision: &RoutingDataRevision,
+    selected_stop_ids: &[String],
+    access_to_origin: bool,
+    walking_speed_mps: f64,
+) -> EndpointAccessCacheKey {
+    let mut selected_stop_ids = selected_stop_ids.to_vec();
+    selected_stop_ids.sort();
+    selected_stop_ids.dedup();
+    EndpointAccessCacheKey {
+        revision_token: routing_revision.token.clone(),
+        selected_stop_ids,
+        access_to_origin,
+        walking_speed_centimeters_per_second: (walking_speed_mps * 100.0).round().max(0.0) as u32,
+    }
 }
 
 async fn nearby_endpoint_transfers_db(
@@ -3601,36 +3743,50 @@ async fn service_day_journeys_for_timetable(
         .map(|mode| db_mode_to_model(mode))
         .collect::<Vec<_>>();
     let raptor_started = time::Instant::now();
-    let mut journeys = run_raptor_search(
+    let mut departure_times = timetable.departure_times_from_stops(
+        from_stop_ids,
+        departure_time,
+        routing_config.range_search_window_seconds.max(0) as u32,
+        routing_config.max_range_departures.max(1) as usize,
+        &modes,
+        false,
+    );
+    let (mut journeys, mut raptor_stats) = run_raptor_searches(
         timetable.clone(),
-        RaptorRequest {
-            from_stop_ids: from_stop_ids.to_vec(),
-            to_stop_ids: to_stop_ids.to_vec(),
-            extra_transfers: extra_transfers.to_vec(),
-            departure_time,
-            max_transfers,
-            min_transfer_seconds: routing_config.min_transfer_seconds as u32,
-            modes: modes.clone(),
-            allow_unverified_services: false,
-        },
+        from_stop_ids,
+        to_stop_ids,
+        extra_transfers,
+        &departure_times,
+        max_transfers,
+        routing_config.min_transfer_seconds as u32,
+        &modes,
+        false,
     )
     .await?;
     let legacy_search_attempted = journeys.is_empty() && timetable.has_unverified_services();
     if legacy_search_attempted {
-        journeys = run_raptor_search(
+        departure_times = timetable.departure_times_from_stops(
+            from_stop_ids,
+            departure_time,
+            routing_config.range_search_window_seconds.max(0) as u32,
+            routing_config.max_range_departures.max(1) as usize,
+            &modes,
+            true,
+        );
+        let legacy_result = run_raptor_searches(
             timetable.clone(),
-            RaptorRequest {
-                from_stop_ids: from_stop_ids.to_vec(),
-                to_stop_ids: to_stop_ids.to_vec(),
-                extra_transfers: extra_transfers.to_vec(),
-                departure_time,
-                max_transfers,
-                min_transfer_seconds: routing_config.min_transfer_seconds as u32,
-                modes,
-                allow_unverified_services: true,
-            },
+            from_stop_ids,
+            to_stop_ids,
+            extra_transfers,
+            &departure_times,
+            max_transfers,
+            routing_config.min_transfer_seconds as u32,
+            &modes,
+            true,
         )
         .await?;
+        journeys = legacy_result.0;
+        raptor_stats = legacy_result.1;
     }
     let raptor_ms = elapsed_millis(raptor_started);
     tracing::debug!(
@@ -3654,16 +3810,57 @@ async fn service_day_journeys_for_timetable(
             trip_count: timetable.trip_count(),
             route_count: timetable.route_count(),
             max_route_trip_count: timetable.max_route_trip_count(),
+            range_departure_count: departure_times.len(),
+            raptor_rounds: raptor_stats.rounds,
+            raptor_routes_scanned: raptor_stats.routes_scanned,
+            raptor_marked_stops: raptor_stats.marked_stops,
             legacy_search_attempted,
         },
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_raptor_searches(
+    timetable: Arc<RaptorTimetable>,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    extra_transfers: &[Transfer],
+    departure_times: &[u32],
+    max_transfers: u32,
+    min_transfer_seconds: u32,
+    modes: &[TransportMode],
+    allow_unverified_services: bool,
+) -> Result<(Vec<Journey>, RaptorSearchStats), sqlx::Error> {
+    let mut journeys = Vec::new();
+    let mut stats = RaptorSearchStats::default();
+    for departure_time in departure_times {
+        let mut found = run_raptor_search(
+            timetable.clone(),
+            RaptorRequest {
+                from_stop_ids: from_stop_ids.to_vec(),
+                to_stop_ids: to_stop_ids.to_vec(),
+                extra_transfers: extra_transfers.to_vec(),
+                departure_time: *departure_time,
+                max_transfers,
+                min_transfer_seconds,
+                modes: modes.to_vec(),
+                allow_unverified_services,
+            },
+        )
+        .await?;
+        stats.rounds += found.stats.rounds;
+        stats.routes_scanned += found.stats.routes_scanned;
+        stats.marked_stops += found.stats.marked_stops;
+        journeys.append(&mut found.journeys);
+    }
+    Ok((journeys, stats))
+}
+
 async fn run_raptor_search(
     timetable: Arc<RaptorTimetable>,
     request: RaptorRequest,
-) -> Result<Vec<Journey>, sqlx::Error> {
-    tokio::task::spawn_blocking(move || raptor(timetable.as_ref(), request))
+) -> Result<routing_core::RaptorSearchOutput, sqlx::Error> {
+    tokio::task::spawn_blocking(move || raptor_with_stats(timetable.as_ref(), request))
         .await
         .map_err(|error| sqlx::Error::Protocol(format!("RAPTOR worker failed: {error}")))
 }
@@ -3676,6 +3873,10 @@ struct ServiceDaySearchTiming {
     trip_count: usize,
     route_count: usize,
     max_route_trip_count: usize,
+    range_departure_count: usize,
+    raptor_rounds: usize,
+    raptor_routes_scanned: usize,
+    raptor_marked_stops: usize,
     legacy_search_attempted: bool,
 }
 
@@ -7209,7 +7410,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v6-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v7-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -7223,8 +7424,9 @@ mod tests {
             "raptor-v3-2026-07-08-old.json",
             "raptor-v4-2026-07-08-old.json",
             "raptor-v5-2026-07-08-old.json",
-            "raptor-v6-2026-07-08-current.json",
-            "raptor-v7-2026-07-08-newer.json",
+            "raptor-v6-2026-07-08-old.json",
+            "raptor-v7-2026-07-08-current.json",
+            "raptor-v8-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -7234,15 +7436,16 @@ mod tests {
 
         assert_eq!(
             prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            5
+            6
         );
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
         assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v4-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v5-2026-07-08-old.json").exists());
-        assert!(directory.join("raptor-v6-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v7-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v6-2026-07-08-old.json").exists());
+        assert!(directory.join("raptor-v7-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v8-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -8372,6 +8575,24 @@ mod tests {
                 "next service-day transfer search failed; direct journeys are still included",
             ]
         );
+    }
+
+    #[test]
+    fn endpoint_access_cache_key_is_stable_for_same_stop_set() {
+        let revision = RoutingDataRevision {
+            latest_import: None,
+            token: "revision".to_string(),
+        };
+        let left = endpoint_access_cache_key(
+            &revision,
+            &["b".to_string(), "a".to_string(), "a".to_string()],
+            true,
+            1.25,
+        );
+        let right =
+            endpoint_access_cache_key(&revision, &["a".to_string(), "b".to_string()], true, 1.25);
+
+        assert_eq!(left, right);
     }
 
     #[test]
