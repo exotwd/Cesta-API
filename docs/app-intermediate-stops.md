@@ -128,3 +128,5 @@ class JourneyStopCall {
 The API removes source-level duplicate connections and invalid transfer candidates before ranking. The app should not independently merge journeys with different times or transfer patterns.
 
 The requested `datetime` date is checked against GTFS `calendar.txt` and `calendar_dates.txt`. A latest successful import with no calendar data remains searchable as an unverified legacy fallback. Always display top-level API `warnings`.
+
+See also [app-foot-crossings.md](app-foot-crossings.md) for rendering walking transfers and station/platform crossings in the mobile timeline.
