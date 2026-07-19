@@ -39,10 +39,16 @@ a real service during round scanning. It reruns with legacy trips enabled only w
 search returns no journey, and any resulting fallback is returned with a response warning.
 
 For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The requested
-departure time is always searched, then the API samples up to `max_range_departures` real
-departures from resolved origin stops within `range_search_window_seconds`. Candidates from those
-probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside the
-RAPTOR round scan.
+departure time is always searched, then the API mixes evenly spaced coverage probes with real
+departures from resolved origin stops within `range_search_window_seconds`, up to
+`max_range_departures`. Probes run with bounded concurrency. Candidates from those probes are
+merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside the RAPTOR round
+scan.
+
+RAPTOR timetables include imported transfers plus implicit same-station/platform interchange
+footpaths derived from stop areas, railway station IDs, and conservative station-like
+name/municipality/coordinate grouping. This lets transfers between platform-level stop records work
+without adding route-specific exceptions.
 
 Nearby origin and destination walking access is cached by routing-data revision, endpoint stop set,
 direction and walking speed when `endpoint_access_cache_enabled` is true. Cache misses use the same

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use transit_model::{Journey, JourneyLeg, RealtimeStatus, Transfer, TransportMode};
@@ -199,13 +199,22 @@ impl RaptorTimetable {
         modes: &[TransportMode],
         allow_unverified_services: bool,
     ) -> Vec<u32> {
-        let mut departures = vec![departure_time];
-        if window_seconds == 0 || max_departures <= 1 {
-            return departures;
+        let max_departures = max_departures.max(1);
+        let mut selected = BTreeSet::from([departure_time]);
+        if window_seconds == 0 || max_departures == 1 {
+            return selected.into_iter().collect();
         }
 
         let allowed_modes = modes.iter().cloned().collect::<HashSet<_>>();
         let latest_departure = departure_time.saturating_add(window_seconds);
+        let coverage_probe_count = max_departures.saturating_sub(1).min(11);
+        for probe_index in 1..=coverage_probe_count {
+            let offset = ((window_seconds as u64 * probe_index as u64)
+                / (coverage_probe_count as u64 + 1)) as u32;
+            selected.insert(departure_time.saturating_add(offset));
+        }
+
+        let mut route_departures = Vec::<Vec<u32>>::new();
         for stop_index in stop_ids
             .iter()
             .filter_map(|stop_id| self.stop_indices.get(stop_id).copied())
@@ -235,15 +244,22 @@ impl RaptorTimetable {
                         break;
                     }
                     if stop_time.pickup_allowed {
-                        departures.push(stop_time.departure_time);
+                        route_departures.push(vec![stop_time.departure_time]);
+                        break;
                     }
                 }
             }
         }
-        departures.sort_unstable();
-        departures.dedup();
-        departures.truncate(max_departures.max(1));
-        departures
+
+        route_departures.sort_by_key(|departures| departures[0]);
+        for departures in route_departures {
+            if selected.len() >= max_departures {
+                break;
+            }
+            selected.extend(departures);
+        }
+
+        selected.into_iter().take(max_departures).collect()
     }
 }
 
@@ -1278,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn timetable_samples_bounded_origin_departures_for_range_search() {
+    fn timetable_samples_coverage_probes_for_range_search() {
         let stop_time = |stop: &str, time| RaptorStopTime {
             stop_id: stop.to_string(),
             arrival_time: time,
@@ -1325,6 +1341,51 @@ mod tests {
             false,
         );
 
-        assert_eq!(departures, vec![8 * 3600, 8 * 3600 + 900]);
+        assert_eq!(departures, vec![8 * 3600, 8 * 3600 + 600, 8 * 3600 + 1200]);
+    }
+
+    #[test]
+    fn timetable_keeps_later_coverage_when_origin_departures_are_crowded() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let mut trips = (1..=20)
+            .map(|minute| RaptorTrip {
+                trip_id: format!("crowding-{minute}"),
+                route_id: format!("local-{minute}"),
+                mode: TransportMode::Train,
+                service_verified: true,
+                stop_times: vec![
+                    stop_time("a", 8 * 3600 + minute * 60),
+                    stop_time("local", 8 * 3600 + (minute + 10) * 60),
+                ],
+            })
+            .collect::<Vec<_>>();
+        trips.push(RaptorTrip {
+            trip_id: "useful-later".into(),
+            route_id: "intercity".into(),
+            mode: TransportMode::Train,
+            service_verified: true,
+            stop_times: vec![
+                stop_time("a", 8 * 3600 + 55 * 60),
+                stop_time("b", 9 * 3600 + 30 * 60),
+            ],
+        });
+        let timetable = RaptorTimetable::new(trips, Vec::new());
+
+        let departures = timetable.departure_times_from_stops(
+            &["a".to_string()],
+            8 * 3600,
+            3600,
+            6,
+            &[TransportMode::Train],
+            false,
+        );
+
+        assert!(departures.contains(&(8 * 3600 + 50 * 60)));
     }
 }

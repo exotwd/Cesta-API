@@ -79,7 +79,8 @@ const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
 const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
 const MAX_RANGE_DEPARTURES: usize = 24;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 7;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 8;
+const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 6;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2450,7 +2451,9 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Reuse one routing-data revision for all service days in a request",
             "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
             "Use numeric stop indexes and array labels inside RAPTOR scans",
-            "Sample bounded origin departures for rRAPTOR-style alternatives",
+            "Sample bounded coverage probes for rRAPTOR-style alternatives",
+            "Run bounded range probes concurrently",
+            "Add implicit same-station/platform interchange footpaths to RAPTOR timetables",
             "Cache endpoint nearby walking access by routing-data revision",
             "Run cached current-day and next-day RAPTOR searches concurrently",
             "Fetch related data, realtime updates and intermediate stops concurrently"
@@ -3833,36 +3836,39 @@ async fn run_raptor_searches(
 ) -> Result<(Vec<Journey>, RaptorSearchStats), sqlx::Error> {
     let mut journeys = Vec::new();
     let mut stats = RaptorSearchStats::default();
-    for departure_time in departure_times {
-        let mut found = run_raptor_search(
-            timetable.clone(),
-            RaptorRequest {
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut departure_times = departure_times.iter().copied();
+
+    loop {
+        while join_set.len() < RAPTOR_RANGE_SEARCH_CONCURRENCY {
+            let Some(departure_time) = departure_times.next() else {
+                break;
+            };
+            let request = RaptorRequest {
                 from_stop_ids: from_stop_ids.to_vec(),
                 to_stop_ids: to_stop_ids.to_vec(),
                 extra_transfers: extra_transfers.to_vec(),
-                departure_time: *departure_time,
+                departure_time,
                 max_transfers,
                 min_transfer_seconds,
                 modes: modes.to_vec(),
                 allow_unverified_services,
-            },
-        )
-        .await?;
+            };
+            let timetable = timetable.clone();
+            join_set.spawn_blocking(move || raptor_with_stats(timetable.as_ref(), request));
+        }
+
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        let mut found = result
+            .map_err(|error| sqlx::Error::Protocol(format!("RAPTOR worker failed: {error}")))?;
         stats.rounds += found.stats.rounds;
         stats.routes_scanned += found.stats.routes_scanned;
         stats.marked_stops += found.stats.marked_stops;
         journeys.append(&mut found.journeys);
     }
     Ok((journeys, stats))
-}
-
-async fn run_raptor_search(
-    timetable: Arc<RaptorTimetable>,
-    request: RaptorRequest,
-) -> Result<routing_core::RaptorSearchOutput, sqlx::Error> {
-    tokio::task::spawn_blocking(move || raptor_with_stats(timetable.as_ref(), request))
-        .await
-        .map_err(|error| sqlx::Error::Protocol(format!("RAPTOR worker failed: {error}")))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4297,7 +4303,7 @@ async fn raptor_timetable_db(
         });
     }
 
-    let transfers = sqlx::query(
+    let mut transfers: Vec<Transfer> = sqlx::query(
         r#"
         SELECT transfer.from_stop_id, transfer.to_stop_id,
                transfer.min_transfer_seconds, transfer.distance_meters,
@@ -4322,7 +4328,129 @@ async fn raptor_timetable_db(
         source: row.get("source"),
     })
     .collect();
+    let timetable_stop_ids = trips
+        .iter()
+        .flat_map(|trip| {
+            trip.stop_times
+                .iter()
+                .map(|stop_time| stop_time.stop_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    transfers.extend(implicit_station_transfers_db(pool, &timetable_stop_ids).await?);
+    transfers.sort_by(|left, right| {
+        left.from_stop_id
+            .cmp(&right.from_stop_id)
+            .then_with(|| left.to_stop_id.cmp(&right.to_stop_id))
+            .then_with(|| left.min_transfer_seconds.cmp(&right.min_transfer_seconds))
+    });
+    transfers.dedup_by(|left, right| {
+        left.from_stop_id == right.from_stop_id && left.to_stop_id == right.to_stop_id
+    });
     Ok(RaptorTimetable::new(trips, transfers))
+}
+
+async fn implicit_station_transfers_db(
+    pool: &PgPool,
+    stop_ids: &HashSet<String>,
+) -> Result<Vec<Transfer>, sqlx::Error> {
+    if stop_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stop_ids = stop_ids.iter().cloned().collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
+        SELECT id, name, municipality, lat, lon, stop_area_id, platform_code, modes
+        FROM stops
+        WHERE is_active = true AND id = ANY($1)
+        "#,
+    )
+    .bind(stop_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut stops_by_signature = HashMap::<String, Vec<String>>::new();
+    for row in rows {
+        let id = row.get::<String, _>("id");
+        let signature = implicit_station_transfer_signature(
+            &id,
+            &row.get::<String, _>("name"),
+            row.get::<Option<String>, _>("municipality").as_deref(),
+            row.get::<Option<f64>, _>("lat"),
+            row.get::<Option<f64>, _>("lon"),
+            row.get::<Option<String>, _>("stop_area_id").as_deref(),
+            row.get::<Option<String>, _>("platform_code").as_deref(),
+            &row.get::<Vec<String>, _>("modes"),
+        );
+        if let Some(signature) = signature {
+            stops_by_signature.entry(signature).or_default().push(id);
+        }
+    }
+
+    let mut transfers = Vec::new();
+    for mut group in stops_by_signature.into_values() {
+        group.sort();
+        group.dedup();
+        if group.len() < 2 || group.len() > 80 {
+            continue;
+        }
+        for from_stop_id in &group {
+            for to_stop_id in &group {
+                if from_stop_id == to_stop_id {
+                    continue;
+                }
+                transfers.push(Transfer {
+                    from_stop_id: from_stop_id.clone(),
+                    to_stop_id: to_stop_id.clone(),
+                    min_transfer_seconds: MIN_TRANSFER_SECONDS,
+                    distance_meters: None,
+                    walking_geometry: None,
+                    confidence: CoordinateConfidence::Medium,
+                    accessibility_level: None,
+                    source: "implicit_station_interchange".to_string(),
+                });
+            }
+        }
+    }
+    Ok(transfers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn implicit_station_transfer_signature(
+    stop_id: &str,
+    name: &str,
+    municipality: Option<&str>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    stop_area_id: Option<&str>,
+    platform_code: Option<&str>,
+    modes: &[String],
+) -> Option<String> {
+    if let Some(stop_area_id) = stop_area_id.filter(|value| !value.trim().is_empty()) {
+        return Some(format!("area:{stop_area_id}"));
+    }
+
+    let station_like = platform_code.is_some()
+        || railway_station_stop_base(stop_id).is_some()
+        || modes.iter().any(|mode| {
+            matches!(
+                mode.as_str(),
+                "train" | "rail" | "metro" | "subway" | "tram"
+            )
+        });
+    if !station_like {
+        return None;
+    }
+
+    let (Some(lat), Some(lon)) = (lat, lon) else {
+        return railway_station_stop_base(stop_id).map(|station| format!("rail:{station}"));
+    };
+    Some(format!(
+        "station:{}:{}:{}:{}",
+        canonical_stop_name_parts(name, municipality),
+        municipality.map(normalize_search_text).unwrap_or_default(),
+        (lat * 100.0).round() as i32,
+        (lon * 100.0).round() as i32
+    ))
 }
 
 fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
@@ -7410,7 +7538,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v7-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v8-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -7425,8 +7553,9 @@ mod tests {
             "raptor-v4-2026-07-08-old.json",
             "raptor-v5-2026-07-08-old.json",
             "raptor-v6-2026-07-08-old.json",
-            "raptor-v7-2026-07-08-current.json",
-            "raptor-v8-2026-07-08-newer.json",
+            "raptor-v7-2026-07-08-old.json",
+            "raptor-v8-2026-07-08-current.json",
+            "raptor-v9-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -7436,7 +7565,7 @@ mod tests {
 
         assert_eq!(
             prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            6
+            7
         );
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
@@ -7444,8 +7573,9 @@ mod tests {
         assert!(!directory.join("raptor-v4-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v5-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v6-2026-07-08-old.json").exists());
-        assert!(directory.join("raptor-v7-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v8-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v7-2026-07-08-old.json").exists());
+        assert!(directory.join("raptor-v8-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v9-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -8208,6 +8338,45 @@ mod tests {
         assert_eq!(
             canonical_journey_stop_id("ggu_czptt_gtfs_latest:-SR70S-CZ-35442-2"),
             station
+        );
+    }
+
+    #[test]
+    fn implicit_station_transfer_signature_groups_platform_like_stops() {
+        assert_eq!(
+            implicit_station_transfer_signature(
+                "feed:-SR70S-CZ-33722-2",
+                "Olomouc hl.n.",
+                Some("Olomouc"),
+                Some(49.592),
+                Some(17.277),
+                None,
+                None,
+                &["train".to_string()],
+            ),
+            implicit_station_transfer_signature(
+                "other-feed-platform",
+                "Olomouc hl.n.",
+                Some("Olomouc"),
+                Some(49.593),
+                Some(17.278),
+                None,
+                Some("5"),
+                &["train".to_string()],
+            )
+        );
+        assert_eq!(
+            implicit_station_transfer_signature(
+                "ordinary-bus-stop",
+                "Olomouc hl.n.",
+                Some("Olomouc"),
+                Some(49.593),
+                Some(17.278),
+                None,
+                None,
+                &["bus".to_string()],
+            ),
+            None
         );
     }
 
