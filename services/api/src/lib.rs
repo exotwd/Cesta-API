@@ -78,9 +78,11 @@ const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
 const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
-const MAX_RANGE_DEPARTURES: usize = 24;
+const MAX_RANGE_DEPARTURES: usize = 10;
 const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 8;
 const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 6;
+const RAPTOR_INITIAL_RANGE_DEPARTURES: usize = 6;
+const RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES: usize = 3;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
@@ -2452,7 +2454,9 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
             "Use numeric stop indexes and array labels inside RAPTOR scans",
             "Sample bounded coverage probes for rRAPTOR-style alternatives",
+            "Expand range probes adaptively only when early probes find too few candidates",
             "Run bounded range probes concurrently",
+            "Skip next-service-day RAPTOR when current service-day candidates are sufficient",
             "Add implicit same-station/platform interchange footpaths to RAPTOR timetables",
             "Cache endpoint nearby walking access by routing-data revision",
             "Run cached current-day and next-day RAPTOR searches concurrently",
@@ -2990,7 +2994,7 @@ async fn query_journeys_profiled_db(
         .iter()
         .filter_map(transport_mode_to_db)
         .collect::<Vec<_>>();
-    let current_service_day_search = service_day_journeys_db(
+    let current_service_day_result = service_day_journeys_db(
         pool,
         raptor_cache,
         routing_snapshot_dir,
@@ -3003,48 +3007,12 @@ async fn query_journeys_profiled_db(
         service_date,
         &routing_config,
         &nearby_transfers.transfers,
-    );
+    )
+    .await;
     let include_next_service_day = should_search_next_service_day(
         departure_time,
         routing_config.next_day_search_from_seconds as u32,
     );
-    let (current_service_day_result, next_service_day_result) = if include_next_service_day {
-        let stage_started = time::Instant::now();
-        let next_service_day_search = cached_service_day_journeys_db(
-            raptor_cache,
-            &routing_revision,
-            &from_stop_ids,
-            &to_stop_ids,
-            0,
-            &mode_filters,
-            body.max_transfers,
-            service_date.succ_opt().unwrap_or(service_date),
-            &routing_config,
-            &nearby_transfers.transfers,
-        );
-        let (current, next) = tokio::join!(current_service_day_search, next_service_day_search);
-        let next = match next? {
-            Some(next) => Some(next),
-            None => {
-                timing.push(
-                    "next_timetable_access",
-                    stage_started,
-                    Some(
-                        "skipped cold next service-day timetable; background warmup will prepare it"
-                            .to_string(),
-                    ),
-                );
-                warnings.push(
-                    "next service-day search was skipped because its routing timetable is still warming"
-                        .to_string(),
-                );
-                None
-            }
-        };
-        (current, next)
-    } else {
-        (current_service_day_search.await, None)
-    };
 
     let (mut journeys, transfer_search_status, current_timing) = current_service_day_result?;
     timing.stages.push(RouteSearchStageTiming {
@@ -3070,9 +3038,14 @@ async fn query_journeys_profiled_db(
         stage: "current_raptor".to_string(),
         elapsed_ms: current_timing.raptor_ms,
         detail: Some(format!(
-            "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
+            "{} candidates from {} departure probes{}; {} rounds, {} route scans, {} marked stops; {}",
             journeys.len(),
             current_timing.range_departure_count,
+            if current_timing.range_expanded {
+                " after adaptive expansion"
+            } else {
+                ""
+            },
             current_timing.raptor_rounds,
             current_timing.raptor_routes_scanned,
             current_timing.raptor_marked_stops,
@@ -3089,6 +3062,53 @@ async fn query_journeys_profiled_db(
         false,
         routing_config.transfer_search_timeout_seconds,
     );
+
+    let mut next_service_day_result = None;
+    if include_next_service_day {
+        if should_search_next_service_day_for_candidates(journeys.len(), &routing_config) {
+            let stage_started = time::Instant::now();
+            next_service_day_result = match cached_service_day_journeys_db(
+                raptor_cache,
+                &routing_revision,
+                &from_stop_ids,
+                &to_stop_ids,
+                0,
+                &mode_filters,
+                body.max_transfers,
+                service_date.succ_opt().unwrap_or(service_date),
+                &routing_config,
+                &nearby_transfers.transfers,
+            )
+            .await?
+            {
+                Some(next) => Some(next),
+                None => {
+                    timing.push(
+                        "next_timetable_access",
+                        stage_started,
+                        Some(
+                            "skipped cold next service-day timetable; background warmup will prepare it"
+                                .to_string(),
+                        ),
+                    );
+                    warnings.push(
+                        "next service-day search was skipped because its routing timetable is still warming"
+                            .to_string(),
+                    );
+                    None
+                }
+            };
+        } else {
+            timing.push(
+                "next_raptor",
+                time::Instant::now(),
+                Some(format!(
+                    "skipped because current service day produced {} candidates",
+                    journeys.len()
+                )),
+            );
+        }
+    }
 
     if let Some(next_service_day_result) = next_service_day_result {
         let (next_service_day_journeys, next_transfer_search_status, next_timing) =
@@ -3116,9 +3136,14 @@ async fn query_journeys_profiled_db(
             stage: "next_raptor".to_string(),
             elapsed_ms: next_timing.raptor_ms,
             detail: Some(format!(
-                "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
+                "{} candidates from {} departure probes{}; {} rounds, {} route scans, {} marked stops; {}",
                 next_service_day_journeys.len(),
                 next_timing.range_departure_count,
+                if next_timing.range_expanded {
+                    " after adaptive expansion"
+                } else {
+                    ""
+                },
                 next_timing.raptor_rounds,
                 next_timing.raptor_routes_scanned,
                 next_timing.raptor_marked_stops,
@@ -3188,9 +3213,14 @@ async fn query_journeys_profiled_db(
                 stage: "next_raptor".to_string(),
                 elapsed_ms: next_timing.raptor_ms,
                 detail: Some(format!(
-                    "{} candidates from {} departure probes; {} rounds, {} route scans, {} marked stops; {}",
+                    "{} candidates from {} departure probes{}; {} rounds, {} route scans, {} marked stops; {}",
                     next_service_day_journeys.len(),
                     next_timing.range_departure_count,
+                    if next_timing.range_expanded {
+                        " after adaptive expansion"
+                    } else {
+                        ""
+                    },
                     next_timing.raptor_rounds,
                     next_timing.raptor_routes_scanned,
                     next_timing.raptor_marked_stops,
@@ -3746,56 +3776,41 @@ async fn service_day_journeys_for_timetable(
         .map(|mode| db_mode_to_model(mode))
         .collect::<Vec<_>>();
     let raptor_started = time::Instant::now();
-    let mut departure_times = timetable.departure_times_from_stops(
-        from_stop_ids,
-        departure_time,
-        routing_config.range_search_window_seconds.max(0) as u32,
-        routing_config.max_range_departures.max(1) as usize,
-        &modes,
-        false,
-    );
-    let (mut journeys, mut raptor_stats) = run_raptor_searches(
+    let mut search_result = run_adaptive_raptor_searches(
         timetable.clone(),
         from_stop_ids,
         to_stop_ids,
         extra_transfers,
-        &departure_times,
+        departure_time,
         max_transfers,
         routing_config.min_transfer_seconds as u32,
         &modes,
         false,
+        routing_config,
     )
     .await?;
-    let legacy_search_attempted = journeys.is_empty() && timetable.has_unverified_services();
+    let legacy_search_attempted =
+        search_result.journeys.is_empty() && timetable.has_unverified_services();
     if legacy_search_attempted {
-        departure_times = timetable.departure_times_from_stops(
-            from_stop_ids,
-            departure_time,
-            routing_config.range_search_window_seconds.max(0) as u32,
-            routing_config.max_range_departures.max(1) as usize,
-            &modes,
-            true,
-        );
-        let legacy_result = run_raptor_searches(
+        search_result = run_adaptive_raptor_searches(
             timetable.clone(),
             from_stop_ids,
             to_stop_ids,
             extra_transfers,
-            &departure_times,
+            departure_time,
             max_transfers,
             routing_config.min_transfer_seconds as u32,
             &modes,
             true,
+            routing_config,
         )
         .await?;
-        journeys = legacy_result.0;
-        raptor_stats = legacy_result.1;
     }
     let raptor_ms = elapsed_millis(raptor_started);
     tracing::debug!(
         timetable_ms,
         raptor_ms,
-        candidates = journeys.len(),
+        candidates = search_result.journeys.len(),
         trips = timetable.trip_count(),
         route_patterns = timetable.route_count(),
         max_route_trips = timetable.max_route_trip_count(),
@@ -3804,7 +3819,7 @@ async fn service_day_journeys_for_timetable(
     );
     let _ = routing_config;
     Ok((
-        journeys,
+        search_result.journeys,
         TransferSearchStatus::Complete,
         ServiceDaySearchTiming {
             timetable_ms,
@@ -3813,13 +3828,125 @@ async fn service_day_journeys_for_timetable(
             trip_count: timetable.trip_count(),
             route_count: timetable.route_count(),
             max_route_trip_count: timetable.max_route_trip_count(),
-            range_departure_count: departure_times.len(),
-            raptor_rounds: raptor_stats.rounds,
-            raptor_routes_scanned: raptor_stats.routes_scanned,
-            raptor_marked_stops: raptor_stats.marked_stops,
+            range_departure_count: search_result.departure_count,
+            range_expanded: search_result.expanded,
+            raptor_rounds: search_result.stats.rounds,
+            raptor_routes_scanned: search_result.stats.routes_scanned,
+            raptor_marked_stops: search_result.stats.marked_stops,
             legacy_search_attempted,
         },
     ))
+}
+
+#[derive(Debug)]
+struct AdaptiveRaptorSearchResult {
+    journeys: Vec<Journey>,
+    stats: RaptorSearchStats,
+    departure_count: usize,
+    expanded: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_adaptive_raptor_searches(
+    timetable: Arc<RaptorTimetable>,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+    extra_transfers: &[Transfer],
+    departure_time: u32,
+    max_transfers: u32,
+    min_transfer_seconds: u32,
+    modes: &[TransportMode],
+    allow_unverified_services: bool,
+    routing_config: &RoutingAlgorithmConfig,
+) -> Result<AdaptiveRaptorSearchResult, sqlx::Error> {
+    let max_departures = routing_config.max_range_departures.max(1) as usize;
+    let initial_departures = timetable.departure_times_from_stops(
+        from_stop_ids,
+        departure_time,
+        routing_config.range_search_window_seconds.max(0) as u32,
+        max_departures.min(RAPTOR_INITIAL_RANGE_DEPARTURES),
+        modes,
+        allow_unverified_services,
+    );
+    let (mut journeys, mut stats) = run_raptor_searches(
+        timetable.clone(),
+        from_stop_ids,
+        to_stop_ids,
+        extra_transfers,
+        &initial_departures,
+        max_transfers,
+        min_transfer_seconds,
+        modes,
+        allow_unverified_services,
+    )
+    .await?;
+    let mut departure_count = initial_departures.len();
+    let mut expanded = false;
+
+    if should_expand_raptor_range(journeys.len(), routing_config)
+        && initial_departures.len() < max_departures
+    {
+        let initial_set = initial_departures.iter().copied().collect::<HashSet<_>>();
+        let remaining_departures = timetable
+            .departure_times_from_stops(
+                from_stop_ids,
+                departure_time,
+                routing_config.range_search_window_seconds.max(0) as u32,
+                max_departures,
+                modes,
+                allow_unverified_services,
+            )
+            .into_iter()
+            .filter(|departure| !initial_set.contains(departure))
+            .collect::<Vec<_>>();
+        if !remaining_departures.is_empty() {
+            let (mut extra_journeys, extra_stats) = run_raptor_searches(
+                timetable,
+                from_stop_ids,
+                to_stop_ids,
+                extra_transfers,
+                &remaining_departures,
+                max_transfers,
+                min_transfer_seconds,
+                modes,
+                allow_unverified_services,
+            )
+            .await?;
+            journeys.append(&mut extra_journeys);
+            stats.rounds += extra_stats.rounds;
+            stats.routes_scanned += extra_stats.routes_scanned;
+            stats.marked_stops += extra_stats.marked_stops;
+            departure_count += remaining_departures.len();
+            expanded = true;
+        }
+    }
+
+    Ok(AdaptiveRaptorSearchResult {
+        journeys,
+        stats,
+        departure_count,
+        expanded,
+    })
+}
+
+fn should_expand_raptor_range(
+    candidate_count: usize,
+    routing_config: &RoutingAlgorithmConfig,
+) -> bool {
+    candidate_count < range_expansion_candidate_floor(routing_config)
+}
+
+fn should_search_next_service_day_for_candidates(
+    candidate_count: usize,
+    routing_config: &RoutingAlgorithmConfig,
+) -> bool {
+    candidate_count < range_expansion_candidate_floor(routing_config)
+}
+
+fn range_expansion_candidate_floor(routing_config: &RoutingAlgorithmConfig) -> usize {
+    (routing_config.max_results as usize)
+        .min(RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES)
+        .max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3880,6 +4007,7 @@ struct ServiceDaySearchTiming {
     route_count: usize,
     max_route_trip_count: usize,
     range_departure_count: usize,
+    range_expanded: bool,
     raptor_rounds: usize,
     raptor_routes_scanned: usize,
     raptor_marked_stops: usize,
@@ -8727,6 +8855,19 @@ mod tests {
         };
         assert!(no_time_objective.validate().is_err());
         assert!(RoutingAlgorithmConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn adaptive_raptor_expands_only_for_thin_candidate_sets() {
+        let configuration = RoutingAlgorithmConfig::default();
+
+        assert!(should_expand_raptor_range(0, &configuration));
+        assert!(should_expand_raptor_range(2, &configuration));
+        assert!(!should_expand_raptor_range(3, &configuration));
+        assert!(!should_search_next_service_day_for_candidates(
+            4,
+            &configuration
+        ));
     }
 
     #[test]

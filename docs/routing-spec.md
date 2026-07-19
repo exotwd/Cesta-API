@@ -41,9 +41,11 @@ search returns no journey, and any resulting fallback is returned with a respons
 For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The requested
 departure time is always searched, then the API mixes evenly spaced coverage probes with real
 departures from resolved origin stops within `range_search_window_seconds`, up to
-`max_range_departures`. Probes run with bounded concurrency. Candidates from those probes are
-merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside the RAPTOR round
-scan.
+`max_range_departures`. The first pass uses a smaller coverage set and expands to the full configured
+limit only when too few candidates are found. Probes run with bounded concurrency. Candidates from
+those probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside
+the RAPTOR round scan. Evening searches also skip next-service-day RAPTOR when the current service
+day already produced enough candidates.
 
 RAPTOR timetables include imported transfers plus implicit same-station/platform interchange
 footpaths derived from stop areas, railway station IDs, and conservative station-like

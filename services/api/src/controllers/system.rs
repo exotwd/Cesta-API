@@ -281,7 +281,7 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "transfer_search_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 6},
                         "next_day_search_from_seconds": {"type": "integer", "minimum": 0, "maximum": 86399, "default": 64800},
                         "range_search_window_seconds": {"type": "integer", "minimum": 0, "maximum": 21600, "default": 5400},
-                        "max_range_departures": {"type": "integer", "minimum": 1, "maximum": 96, "default": 24},
+                        "max_range_departures": {"type": "integer", "minimum": 1, "maximum": 96, "default": 10},
                         "endpoint_access_cache_enabled": {"type": "boolean", "default": true},
                         "arrival_time_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
                         "duration_weight": {"type": "number", "minimum": 0, "maximum": 10, "default": 0},

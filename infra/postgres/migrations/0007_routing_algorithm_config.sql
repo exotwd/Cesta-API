@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS routing_algorithm_config (
   transfer_search_timeout_seconds integer NOT NULL DEFAULT 6 CHECK (transfer_search_timeout_seconds BETWEEN 1 AND 60),
   next_day_search_from_seconds integer NOT NULL DEFAULT 64800 CHECK (next_day_search_from_seconds BETWEEN 0 AND 86399),
   range_search_window_seconds integer NOT NULL DEFAULT 5400 CHECK (range_search_window_seconds BETWEEN 0 AND 21600),
-  max_range_departures integer NOT NULL DEFAULT 24 CHECK (max_range_departures BETWEEN 1 AND 96),
+  max_range_departures integer NOT NULL DEFAULT 10 CHECK (max_range_departures BETWEEN 1 AND 96),
   endpoint_access_cache_enabled boolean NOT NULL DEFAULT true,
   arrival_time_weight double precision NOT NULL DEFAULT 1 CHECK (arrival_time_weight BETWEEN 0 AND 10),
   duration_weight double precision NOT NULL DEFAULT 0 CHECK (duration_weight BETWEEN 0 AND 10),
