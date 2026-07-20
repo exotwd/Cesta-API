@@ -39,13 +39,19 @@ a real service during round scanning. It reruns with legacy trips enabled only w
 search returns no journey, and any resulting fallback is returned with a response warning.
 
 For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The requested
-departure time is always searched, then the API mixes evenly spaced coverage probes with real
-departures from resolved origin stops within `range_search_window_seconds`, up to
-`max_range_departures`. The first pass uses a smaller coverage set and expands to the full configured
-limit only when too few candidates are found. Probes run with bounded concurrency. Candidates from
+departure time is searched first. If it produces too few distinct candidates, evenly spaced
+coverage probes and real departures from resolved origin stops within
+`range_search_window_seconds` are searched two at a time, up to `max_range_departures`, stopping as
+soon as the candidate floor is reached. Each small batch uses bounded concurrency. Candidates from
 those probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside
 the RAPTOR round scan. Evening searches also skip next-service-day RAPTOR when the current service
 day already produced enough candidates.
+
+RFC3339 journey timestamps are converted to `Europe/Prague` before the service date and seconds
+since midnight are derived. Offset-less date-times remain Prague-local wall times for backward
+compatibility. A final API-boundary guard removes any same-day candidate whose first departure is
+earlier than the requested Prague-local time, so stale or malformed timetable data cannot surface
+an already-departed connection.
 
 RAPTOR timetables include imported transfers plus implicit same-station/platform interchange
 footpaths derived from stop areas, railway station IDs, and conservative station-like
@@ -56,6 +62,12 @@ Nearby origin and destination walking access is cached by routing-data revision,
 direction and walking speed when `endpoint_access_cache_enabled` is true. Cache misses use the same
 PostGIS radius query as before, so repeated searches avoid endpoint transfer latency without
 changing option coverage.
+
+Within a RAPTOR probe, route-queue scratch storage is reused between rounds and request-only
+walking links use a sparse index. Static journey metadata queries run concurrently. Ticketing
+references are installed in the process-local store before the response and are persisted to
+PostgreSQL asynchronously, keeping database fsync latency outside the public route-search critical
+path while preserving the existing opaque-reference API.
 
 On API startup, snapshot files with a lower format version than the running API are deleted before
 warmup. Current-version files, files from a newer version, and unrelated files are preserved.

@@ -91,7 +91,10 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "properties": {
                             "from": {"$ref": "#/components/schemas/JourneyPoint"},
                             "to": {"$ref": "#/components/schemas/JourneyPoint"},
-                            "datetime": {"type": "string"},
+                            "datetime": {
+                                "type": "string",
+                                "description": "Departure date and time. RFC3339 offsets and Z timestamps are converted to Europe/Prague before selecting the public-transport service day; offset-less values are interpreted as Prague-local wall time."
+                            },
                             "mode": {"type": "string"},
                             "transport_modes": {"type": "array", "items": {"type": "string"}},
                             "max_transfers": {"type": "integer", "minimum": 0},

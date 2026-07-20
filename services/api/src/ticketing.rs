@@ -620,32 +620,24 @@ impl TicketingService {
         }
         if !records.is_empty() {
             let mut memory = self.memory.write().await;
+            let now = Utc::now();
+            memory
+                .journey_refs
+                .retain(|_, record| record.expires_at > now);
             for record in &records {
                 memory.journey_refs.insert(record.id, record.clone());
             }
             drop(memory);
             if let Some(db) = &self.db {
-                let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
-                let snapshots = records
-                    .iter()
-                    .map(|record| record.snapshot.clone())
-                    .collect::<Vec<_>>();
-                let expirations = records
-                    .iter()
-                    .map(|record| record.expires_at)
-                    .collect::<Vec<_>>();
-                sqlx::query(
-                    r#"
-                    INSERT INTO cd_ticketing_journey_refs (id, journey_snapshot, expires_at)
-                    SELECT * FROM UNNEST($1::uuid[], $2::jsonb[], $3::timestamptz[])
-                    "#,
-                )
-                .bind(ids)
-                .bind(snapshots)
-                .bind(expirations)
-                .execute(db)
-                .await
-                .map_err(db_error)?;
+                // The same-process reference is usable immediately. Persist the opaque
+                // references off the route-search critical path so database fsync or pool
+                // contention cannot add a second to every public journey response.
+                let db = db.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = persist_journey_references(&db, &records).await {
+                        tracing::error!(%error, "failed to persist journey ticketing references");
+                    }
+                });
             }
         }
         Ok(())
@@ -744,6 +736,34 @@ impl TicketingService {
         sqlx::query("UPDATE cd_ticketing_refund_cursor SET last_event_id=$1,last_event_at=$2,updated_at=now() WHERE singleton=true").bind(cursor).bind(cursor_at).execute(db).await.map_err(|_|"cursor_write_failed")?;
         Ok(())
     }
+}
+
+async fn persist_journey_references(
+    db: &PgPool,
+    records: &[JourneyReferenceRecord],
+) -> Result<(), sqlx::Error> {
+    let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+    let snapshots = records
+        .iter()
+        .map(|record| record.snapshot.clone())
+        .collect::<Vec<_>>();
+    let expirations = records
+        .iter()
+        .map(|record| record.expires_at)
+        .collect::<Vec<_>>();
+    sqlx::query(
+        r#"
+        INSERT INTO cd_ticketing_journey_refs (id, journey_snapshot, expires_at)
+        SELECT * FROM UNNEST($1::uuid[], $2::jsonb[], $3::timestamptz[])
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(ids)
+    .bind(snapshots)
+    .bind(expirations)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 pub fn router() -> Router<AppState> {

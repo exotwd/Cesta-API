@@ -80,8 +80,9 @@ const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
 const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
 const MAX_RANGE_DEPARTURES: usize = 10;
 const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 8;
-const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 6;
-const RAPTOR_INITIAL_RANGE_DEPARTURES: usize = 6;
+const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 2;
+const RAPTOR_INITIAL_RANGE_DEPARTURES: usize = 1;
+const RAPTOR_RANGE_EXPANSION_BATCH_DEPARTURES: usize = 2;
 const RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES: usize = 3;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
@@ -2454,13 +2455,16 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
             "Use numeric stop indexes and array labels inside RAPTOR scans",
             "Sample bounded coverage probes for rRAPTOR-style alternatives",
-            "Expand range probes adaptively only when early probes find too few candidates",
-            "Run bounded range probes concurrently",
+            "Search the exact departure first and expand two probes at a time only while distinct candidates are thin",
+            "Reuse route-sized scratch indexes across RAPTOR rounds",
+            "Store sparse request-only walking links without stop-sized allocations",
+            "Run each small range-probe batch with bounded concurrency",
             "Skip next-service-day RAPTOR when current service-day candidates are sufficient",
             "Add implicit same-station/platform interchange footpaths to RAPTOR timetables",
             "Cache endpoint nearby walking access by routing-data revision",
-            "Run cached current-day and next-day RAPTOR searches concurrently",
-            "Fetch related data, realtime updates and intermediate stops concurrently"
+            "Fetch related entities concurrently, then fetch realtime and intermediate stops concurrently",
+            "Persist ticketing references after response annotation instead of blocking route search on database fsync",
+            "Convert offset timestamps to Europe/Prague and reject any already-departed same-day candidate"
         ]
     })
 }
@@ -3056,6 +3060,20 @@ async fn query_journeys_profiled_db(
             },
         )),
     });
+    let stage_started = time::Instant::now();
+    let departed_candidate_count = discard_departed_journeys(&mut journeys, departure_time);
+    timing.push(
+        "past_departure_guard",
+        stage_started,
+        Some(format!(
+            "discarded {departed_candidate_count} candidates before the requested Prague-local time"
+        )),
+    );
+    if departed_candidate_count > 0 {
+        warnings.push(format!(
+            "discarded {departed_candidate_count} already-departed journey candidates"
+        ));
+    }
     append_transfer_search_warning(
         &mut warnings,
         transfer_search_status,
@@ -3880,13 +3898,13 @@ async fn run_adaptive_raptor_searches(
         allow_unverified_services,
     )
     .await?;
+    let mut searched_departures = initial_departures.iter().copied().collect::<HashSet<_>>();
     let mut departure_count = initial_departures.len();
     let mut expanded = false;
 
-    if should_expand_raptor_range(journeys.len(), routing_config)
-        && initial_departures.len() < max_departures
+    if should_expand_raptor_range(distinct_raptor_candidate_count(&journeys), routing_config)
+        && searched_departures.len() < max_departures
     {
-        let initial_set = initial_departures.iter().copied().collect::<HashSet<_>>();
         let remaining_departures = timetable
             .departure_times_from_stops(
                 from_stop_ids,
@@ -3897,15 +3915,16 @@ async fn run_adaptive_raptor_searches(
                 allow_unverified_services,
             )
             .into_iter()
-            .filter(|departure| !initial_set.contains(departure))
+            .filter(|departure| searched_departures.insert(*departure))
             .collect::<Vec<_>>();
-        if !remaining_departures.is_empty() {
+        for departure_batch in remaining_departures.chunks(RAPTOR_RANGE_EXPANSION_BATCH_DEPARTURES)
+        {
             let (mut extra_journeys, extra_stats) = run_raptor_searches(
-                timetable,
+                timetable.clone(),
                 from_stop_ids,
                 to_stop_ids,
                 extra_transfers,
-                &remaining_departures,
+                departure_batch,
                 max_transfers,
                 min_transfer_seconds,
                 modes,
@@ -3916,8 +3935,14 @@ async fn run_adaptive_raptor_searches(
             stats.rounds += extra_stats.rounds;
             stats.routes_scanned += extra_stats.routes_scanned;
             stats.marked_stops += extra_stats.marked_stops;
-            departure_count += remaining_departures.len();
+            departure_count += departure_batch.len();
             expanded = true;
+            if !should_expand_raptor_range(
+                distinct_raptor_candidate_count(&journeys),
+                routing_config,
+            ) {
+                break;
+            }
         }
     }
 
@@ -3927,6 +3952,20 @@ async fn run_adaptive_raptor_searches(
         departure_count,
         expanded,
     })
+}
+
+fn distinct_raptor_candidate_count(journeys: &[Journey]) -> usize {
+    journeys
+        .iter()
+        .map(|journey| {
+            (
+                journey.departure_time,
+                journey.arrival_time,
+                journey.transfer_count,
+            )
+        })
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 fn should_expand_raptor_range(
@@ -4583,6 +4622,12 @@ fn implicit_station_transfer_signature(
 
 fn should_search_next_service_day(departure_time: u32, threshold_seconds: u32) -> bool {
     departure_time >= threshold_seconds
+}
+
+fn discard_departed_journeys(journeys: &mut Vec<Journey>, requested_departure_time: u32) -> usize {
+    let previous_len = journeys.len();
+    journeys.retain(|journey| journey.departure_time >= requested_departure_time);
+    previous_len.saturating_sub(journeys.len())
 }
 
 fn journey_query_context(
@@ -5844,10 +5889,11 @@ async fn journey_related_data_db(
     let mut source_feed_ids = HashSet::new();
     let mut agency_ids = HashSet::new();
 
-    let stops = if stop_ids.is_empty() {
-        Vec::new()
-    } else {
-        let rows = sqlx::query(
+    let stops_future = async {
+        if stop_ids.is_empty() {
+            return Ok::<_, sqlx::Error>(Vec::new());
+        }
+        sqlx::query(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
@@ -5859,21 +5905,13 @@ async fn journey_related_data_db(
         )
         .bind(&stop_ids)
         .fetch_all(pool)
-        .await?;
-        rows.into_iter()
-            .map(stop_from_row)
-            .collect::<Result<Vec<_>, _>>()?
+        .await
     };
-    for stop in &stops {
-        for source_id in &stop.source_ids {
-            source_feed_ids.insert(source_id.feed_id.clone());
+    let routes_future = async {
+        if route_ids.is_empty() {
+            return Ok::<_, sqlx::Error>(Vec::new());
         }
-    }
-
-    let routes = if route_ids.is_empty() {
-        Vec::new()
-    } else {
-        let rows = sqlx::query(
+        sqlx::query(
             r#"
             SELECT id, source_feed_id, source_id, agency_id, operator_id, short_name, long_name,
                    mode, gtfs_route_type, color, text_color, source_priority, is_active
@@ -5884,24 +5922,13 @@ async fn journey_related_data_db(
         )
         .bind(&route_ids)
         .fetch_all(pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
-                    source_feed_ids.insert(feed_id);
-                }
-                if let Some(agency_id) = row.get::<Option<String>, _>("agency_id") {
-                    agency_ids.insert(agency_id);
-                }
-                route_row_json(&row)
-            })
-            .collect::<Vec<_>>()
+        .await
     };
-
-    let trips = if trip_ids.is_empty() {
-        Vec::new()
-    } else {
-        let rows = sqlx::query(
+    let trips_future = async {
+        if trip_ids.is_empty() {
+            return Ok::<_, sqlx::Error>(Vec::new());
+        }
+        sqlx::query(
             r#"
             SELECT id, source_feed_id, source_id, route_id, service_id, headsign,
                    direction_id, shape_id, restrictions, raw_source_metadata, source_priority
@@ -5912,20 +5939,12 @@ async fn journey_related_data_db(
         )
         .bind(&trip_ids)
         .fetch_all(pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
-                    source_feed_ids.insert(feed_id);
-                }
-                trip_row_json(&row)
-            })
-            .collect::<Vec<_>>()
+        .await
     };
-
-    let stop_times = if trip_ids.is_empty() || stop_ids.is_empty() {
-        Vec::new()
-    } else {
+    let stop_times_future = async {
+        if trip_ids.is_empty() || stop_ids.is_empty() {
+            return Ok::<_, sqlx::Error>(Vec::new());
+        }
         sqlx::query(
             r#"
             SELECT trip_id, stop_id, stop_sequence, arrival_time, departure_time,
@@ -5940,20 +5959,12 @@ async fn journey_related_data_db(
         .bind(&trip_ids)
         .bind(&stop_ids)
         .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
-                source_feed_ids.insert(feed_id);
-            }
-            stop_time_row_json(&row)
-        })
-        .collect::<Vec<_>>()
+        .await
     };
-
-    let route_geometries = if route_ids.is_empty() {
-        Vec::new()
-    } else {
+    let route_geometries_future = async {
+        if route_ids.is_empty() {
+            return Ok::<_, sqlx::Error>(Vec::new());
+        }
         sqlx::query(
             r#"
             SELECT source_feed_id, source_feature_id, route_id, source_route_id,
@@ -5966,7 +5977,56 @@ async fn journey_related_data_db(
         )
         .bind(&route_ids)
         .fetch_all(pool)
-        .await?
+        .await
+    };
+    let (stop_rows, route_rows, trip_rows, stop_time_rows, route_geometry_rows) = tokio::try_join!(
+        stops_future,
+        routes_future,
+        trips_future,
+        stop_times_future,
+        route_geometries_future
+    )?;
+
+    let stops = stop_rows
+        .into_iter()
+        .map(stop_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    for stop in &stops {
+        for source_id in &stop.source_ids {
+            source_feed_ids.insert(source_id.feed_id.clone());
+        }
+    }
+    let routes = route_rows
+        .into_iter()
+        .map(|row| {
+            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                source_feed_ids.insert(feed_id);
+            }
+            if let Some(agency_id) = row.get::<Option<String>, _>("agency_id") {
+                agency_ids.insert(agency_id);
+            }
+            route_row_json(&row)
+        })
+        .collect::<Vec<_>>();
+    let trips = trip_rows
+        .into_iter()
+        .map(|row| {
+            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                source_feed_ids.insert(feed_id);
+            }
+            trip_row_json(&row)
+        })
+        .collect::<Vec<_>>();
+    let stop_times = stop_time_rows
+        .into_iter()
+        .map(|row| {
+            if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
+                source_feed_ids.insert(feed_id);
+            }
+            stop_time_row_json(&row)
+        })
+        .collect::<Vec<_>>();
+    let route_geometries = route_geometry_rows
         .into_iter()
         .map(|row| {
             json!({
@@ -5980,8 +6040,7 @@ async fn journey_related_data_db(
                 "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at")
             })
         })
-        .collect::<Vec<_>>()
-    };
+        .collect::<Vec<_>>();
 
     let (agencies, source_feeds) = tokio::join!(
         fetch_agencies_json(pool, agency_ids.into_iter().collect()),
@@ -8945,6 +9004,112 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "2026-07-04"
+        );
+    }
+
+    #[test]
+    fn utc_journey_datetime_is_converted_to_prague_local_service_time() {
+        assert_eq!(
+            parse_journey_departure_seconds("2026-07-19T15:55:23Z").unwrap(),
+            17 * 3600 + 55 * 60 + 23
+        );
+        assert_eq!(
+            parse_journey_departure_seconds("2026-01-19T15:55:23Z").unwrap(),
+            16 * 3600 + 55 * 60 + 23
+        );
+        assert_eq!(
+            parse_journey_service_date("2026-07-18T22:15:00Z").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 19).unwrap()
+        );
+    }
+
+    #[test]
+    fn already_departed_candidates_are_removed_at_the_api_boundary() {
+        let mut journeys = vec![
+            test_journey("departed", 0, 10_000, 11_000),
+            test_journey("current", 0, 12_000, 13_000),
+        ];
+
+        assert_eq!(discard_departed_journeys(&mut journeys, 12_000), 1);
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].id, "current");
+    }
+
+    #[test]
+    fn adaptive_candidate_count_ignores_duplicate_range_results() {
+        let first = test_journey("first", 0, 10_000, 11_000);
+        let mut duplicate = first.clone();
+        duplicate.id = "duplicate-id".to_string();
+        let different = test_journey("different", 0, 12_000, 13_000);
+
+        assert_eq!(
+            distinct_raptor_candidate_count(&[first, duplicate, different]),
+            2
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit large-network performance regression"]
+    async fn adaptive_large_timetable_search_stays_below_latency_budget() {
+        let route_count = 5_000;
+        let trips_per_route = 20;
+        let mut trips = Vec::with_capacity(route_count * trips_per_route);
+        for route in 0..route_count {
+            for trip in 0..trips_per_route {
+                let departure = 6 * 3600 + trip as u32 * 300 + (route % 60) as u32;
+                let stop_time = |stop_id: String, arrival_time, departure_time| RaptorStopTime {
+                    stop_id,
+                    arrival_time,
+                    departure_time,
+                    pickup_allowed: true,
+                    drop_off_allowed: true,
+                };
+                trips.push(RaptorTrip {
+                    trip_id: format!("trip-{route}-{trip}"),
+                    route_id: format!("route-{route}"),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("origin".to_string(), departure, departure),
+                        stop_time(format!("middle-{route}"), departure + 600, departure + 620),
+                        stop_time(
+                            "destination".to_string(),
+                            departure + 1_200,
+                            departure + 1_200,
+                        ),
+                    ],
+                });
+            }
+        }
+        let timetable = Arc::new(RaptorTimetable::new(trips, Vec::new()));
+        let started = std::time::Instant::now();
+        let result = run_adaptive_raptor_searches(
+            timetable,
+            &["origin".to_string()],
+            &["destination".to_string()],
+            &[],
+            7 * 3600,
+            3,
+            300,
+            &[TransportMode::Train],
+            false,
+            &RoutingAlgorithmConfig::default(),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "adaptive large timetable: {} trips, {} route patterns, {} probes, search {:?}",
+            route_count * trips_per_route,
+            route_count,
+            result.departure_count,
+            elapsed
+        );
+
+        assert!(!result.journeys.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "adaptive large timetable search took {elapsed:?}"
         );
     }
 

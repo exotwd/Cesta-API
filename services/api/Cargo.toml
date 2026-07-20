@@ -10,6 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 geo-types.workspace = true
 hex.workspace = true
 jsonwebtoken.workspace = true

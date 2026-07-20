@@ -345,13 +345,15 @@ pub fn raptor_with_stats(
             resolve_stop_index(stop_id, &mut request_stop_ids, &mut request_stop_indices)
         })
         .collect::<Vec<_>>();
-    let target_stops = request
+    let mut target_stops = request
         .to_stop_ids
         .iter()
         .map(|stop_id| {
             resolve_stop_index(stop_id, &mut request_stop_ids, &mut request_stop_indices)
         })
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
+    target_stops.sort_unstable();
+    target_stops.dedup();
     let mut extra_transfer_pairs = Vec::<RaptorTransfer>::new();
     for transfer in request.extra_transfers {
         let from_stop_index = resolve_stop_index(
@@ -372,16 +374,24 @@ pub fn raptor_with_stats(
         });
     }
     let stop_count = timetable.stops.len() + request_stop_ids.len();
-    let mut extra_transfers_by_stop = vec![Vec::<RaptorTransfer>::new(); stop_count];
+    // Endpoint walking links are sparse. Avoid a country-sized allocation for every
+    // range probe by indexing only stops that have request-specific transfers.
+    let mut extra_transfers_by_stop = HashMap::<usize, Vec<RaptorTransfer>>::new();
     for transfer in extra_transfer_pairs {
-        extra_transfers_by_stop[transfer.from_stop_index].push(transfer);
+        extra_transfers_by_stop
+            .entry(transfer.from_stop_index)
+            .or_default()
+            .push(transfer);
     }
     let max_rounds = request.max_transfers as usize + 1;
     let mut best = vec![u32::MAX; stop_count];
     let mut rounds = vec![vec![u32::MAX; stop_count]; max_rounds + 1];
-    let mut parents = HashMap::<(usize, usize), RaptorParent>::new();
+    let mut parents = (0..=max_rounds)
+        .map(|_| HashMap::<usize, RaptorParent>::new())
+        .collect::<Vec<_>>();
     let mut marked = Vec::<usize>::new();
     let mut marked_flags = vec![false; stop_count];
+    let mut queued_route_positions = vec![usize::MAX; timetable.routes.len()];
 
     for stop in from_stop_indices {
         rounds[0][stop] = request.departure_time;
@@ -411,7 +421,6 @@ pub fn raptor_with_stats(
             marked_flags[*stop] = false;
         }
         let mut routes_to_scan = Vec::<(usize, usize)>::new();
-        let mut queued_route_positions = vec![usize::MAX; timetable.routes.len()];
         for stop in previous_marked {
             for &(route_index, stop_index) in timetable.stop_routes.get(stop).into_iter().flatten()
             {
@@ -423,6 +432,9 @@ pub fn raptor_with_stats(
                     routes_to_scan[position].1 = stop_index;
                 }
             }
+        }
+        for &(route_index, _) in &routes_to_scan {
+            queued_route_positions[route_index] = usize::MAX;
         }
         let best_target = target_stops
             .iter()
@@ -456,8 +468,8 @@ pub fn raptor_with_stats(
                     rounds[round][stop_index] = stop_time.arrival_time;
                     best[stop_index] = stop_time.arrival_time;
                     mark_raptor_stop(stop_index, &mut marked, &mut marked_flags);
-                    parents.insert(
-                        (round, stop_index),
+                    parents[round].insert(
+                        stop_index,
                         RaptorParent::Ride {
                             previous_stop: boarded_stop,
                             previous_round: round - 1,
@@ -476,7 +488,7 @@ pub fn raptor_with_stats(
                 }
                 let transfer_slack = if round == 1
                     || matches!(
-                        parents.get(&(round - 1, stop_index)),
+                        parents[round - 1].get(&stop_index),
                         Some(RaptorParent::Walk { .. })
                     ) {
                     0
@@ -604,9 +616,9 @@ fn relax_raptor_transfers(
     best: &mut [u32],
     marked: &mut Vec<usize>,
     marked_flags: &mut [bool],
-    parents: &mut HashMap<(usize, usize), RaptorParent>,
+    parents: &mut [HashMap<usize, RaptorParent>],
     transfers_by_stop: &[Vec<RaptorTransfer>],
-    extra_transfers_by_stop: &[Vec<RaptorTransfer>],
+    extra_transfers_by_stop: &HashMap<usize, Vec<RaptorTransfer>>,
     best_target: u32,
 ) {
     let mut queue = marked.clone();
@@ -619,7 +631,7 @@ fn relax_raptor_transfers(
             .get(from)
             .into_iter()
             .flatten()
-            .chain(extra_transfers_by_stop.get(from).into_iter().flatten())
+            .chain(extra_transfers_by_stop.get(&from).into_iter().flatten())
         {
             let arrival_time = departure_time.saturating_add(transfer.min_transfer_seconds);
             if arrival_time >= best_target || arrival_time >= best[transfer.to_stop_index] {
@@ -629,8 +641,8 @@ fn relax_raptor_transfers(
             best[transfer.to_stop_index] = arrival_time;
             mark_raptor_stop(transfer.to_stop_index, marked, marked_flags);
             queue.push(transfer.to_stop_index);
-            parents.insert(
-                (round, transfer.to_stop_index),
+            parents[round].insert(
+                transfer.to_stop_index,
                 RaptorParent::Walk {
                     previous_stop: from,
                     departure_time,
@@ -647,11 +659,11 @@ fn reconstruct_raptor_journey(
     request_stop_ids: &[String],
     mut round: usize,
     target: usize,
-    parents: &HashMap<(usize, usize), RaptorParent>,
+    parents: &[HashMap<usize, RaptorParent>],
 ) -> Option<Vec<JourneyLeg>> {
     let mut stop = target;
     let mut legs = Vec::new();
-    while let Some(parent) = parents.get(&(round, stop)) {
+    while let Some(parent) = parents.get(round).and_then(|round| round.get(&stop)) {
         match parent {
             RaptorParent::Ride {
                 previous_stop,
@@ -1387,5 +1399,75 @@ mod tests {
         );
 
         assert!(departures.contains(&(8 * 3600 + 50 * 60)));
+    }
+
+    #[test]
+    #[ignore = "explicit large-network performance regression"]
+    fn large_timetable_route_search_stays_below_latency_budget() {
+        let route_count = 5_000;
+        let trips_per_route = 20;
+        let mut trips = Vec::with_capacity(route_count * trips_per_route);
+        for route in 0..route_count {
+            for trip in 0..trips_per_route {
+                let departure = 6 * 3600 + trip as u32 * 300 + (route % 60) as u32;
+                trips.push(RaptorTrip {
+                    trip_id: format!("trip-{route}-{trip}"),
+                    route_id: format!("route-{route}"),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        RaptorStopTime {
+                            stop_id: "origin".to_string(),
+                            arrival_time: departure,
+                            departure_time: departure,
+                            pickup_allowed: true,
+                            drop_off_allowed: true,
+                        },
+                        RaptorStopTime {
+                            stop_id: format!("middle-{route}"),
+                            arrival_time: departure + 600,
+                            departure_time: departure + 620,
+                            pickup_allowed: true,
+                            drop_off_allowed: true,
+                        },
+                        RaptorStopTime {
+                            stop_id: "destination".to_string(),
+                            arrival_time: departure + 1_200,
+                            departure_time: departure + 1_200,
+                            pickup_allowed: true,
+                            drop_off_allowed: true,
+                        },
+                    ],
+                });
+            }
+        }
+        let timetable = RaptorTimetable::new(trips, Vec::new());
+        let started = std::time::Instant::now();
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["origin".to_string()],
+                to_stop_ids: vec!["destination".to_string()],
+                extra_transfers: Vec::new(),
+                departure_time: 7 * 3600,
+                max_transfers: 3,
+                min_transfer_seconds: 300,
+                modes: vec![TransportMode::Train],
+                allow_unverified_services: false,
+            },
+        );
+        let elapsed = started.elapsed();
+        eprintln!(
+            "large timetable: {} trips, {} route patterns, search {:?}",
+            route_count * trips_per_route,
+            route_count,
+            elapsed
+        );
+
+        assert!(!journeys.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "large timetable search took {elapsed:?}"
+        );
     }
 }

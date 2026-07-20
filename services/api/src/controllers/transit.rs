@@ -650,7 +650,9 @@ pub(crate) fn fixture_journeys_with_stop_calls(journeys: &[Journey], stops: &[St
 
 pub(crate) fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, ApiError> {
     if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
-        return Ok(seconds_since_midnight(value.time()));
+        return Ok(seconds_since_midnight(
+            value.with_timezone(&chrono_tz::Europe::Prague).time(),
+        ));
     }
 
     if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
@@ -674,7 +676,7 @@ pub(crate) fn parse_journey_departure_seconds(datetime: &str) -> Result<u32, Api
 
 pub(crate) fn parse_journey_service_date(datetime: &str) -> Result<chrono::NaiveDate, ApiError> {
     if let Ok(value) = chrono::DateTime::parse_from_rfc3339(datetime) {
-        return Ok(value.date_naive());
+        return Ok(value.with_timezone(&chrono_tz::Europe::Prague).date_naive());
     }
     if let Ok(value) = NaiveDateTime::parse_from_str(datetime, "%Y-%m-%dT%H:%M:%S") {
         return Ok(value.date());
