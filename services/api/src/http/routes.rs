@@ -114,6 +114,7 @@ fn transit_routes() -> Router<AppState> {
         .route("/departures/board/{stop_id}", get(board_departures))
         .route("/departures/board/{stop_id}/qr", get(board_qr))
         .route("/journeys/search", post(journey_search))
+        .route("/vehicles", get(realtime_vehicles))
         .route("/realtime/vehicles", get(realtime_vehicles))
         .route("/data-sources/status", get(data_sources_status))
         .route("/realtime/trip/{trip_id}", get(realtime_trip))

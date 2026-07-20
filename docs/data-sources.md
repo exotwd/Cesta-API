@@ -17,11 +17,17 @@ history are retained.
 
 Current realtime sources:
 
-- PID GTFS-Realtime trip updates and vehicle positions from Golemio, polled every 20 seconds. IDs match the PID static GTFS and update concrete trips and stops.
-- IDS JMK ArcGIS vehicle positions, polled every 30 seconds. Delay values are normalized from minutes to seconds.
-- DUK `GetTraffic` vehicle positions, polled every 30 seconds. Delay values are normalized from minutes to seconds.
+- PID Golemio GTFS-Realtime trip updates plus the richer GeoJSON vehicle-position API, polled every 20 seconds. IDs match PID static GTFS. The GeoJSON adapter adds the public line, destination, vehicle type, registration number, wheelchair accessibility, air conditioning, USB chargers, speed, operator and tracking state. If the richer endpoint fails, the worker falls back to GTFS-Realtime positions.
+- Official IDS JMK GTFS-Realtime at `https://kordis-jmk.cz/gtfs/gtfsReal.dat`, polled every 30 seconds. It is published as open data under CC BY 4.0. Standard GTFS-Realtime fields are normalized without inventing unavailable vehicle equipment.
+- The DÚK `GetTraffic` adapter remains implemented but is disabled by default (`DUK_ENABLED=false`) because redistribution terms for a third-party passenger application have not been verified. Do not enable it in production without written confirmation.
 
-`PID_API_TOKEN` is sent as `X-Access-Token` when configured. No credential is committed. Every record retains source identifiers, fetch time and validity. Synchronization health is available from `GET /data-sources/status`.
+`PID_API_TOKEN` is sent as `X-Access-Token` when configured. No credential is committed. Golemio documents a default limit of 20 requests per 8 seconds; the default 20-second poll interval stays comfortably below it. Every record retains source identifiers, attribution, license metadata, fetch time and validity. Synchronization health is available from `GET /data-sources/status`.
+
+Source and terms references:
+
+- PID open data and attribution: `https://pid.cz/o-systemu/opendata/`
+- Golemio public-transport API: `https://api.golemio.cz/pid/docs/openapi/`
+- IDS JMK open data and CC BY 4.0 notice: `https://www.idsjmk.cz/a/kontakty.html`
 
 Planned sources:
 

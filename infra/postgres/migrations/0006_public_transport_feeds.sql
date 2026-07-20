@@ -60,7 +60,7 @@ VALUES
   ('pid_gtfs', 'PID GTFS', 'https://data.pid.cz/PID_GTFS.zip', 'gtfs', 'pid_all_modes', 10),
   ('pid_lines_geodata', 'PID line geometry', 'https://data.pid.cz/geodata/Linky_7d_WGS84.json', 'geojson', 'pid_routes', 10),
   ('pid_realtime', 'PID GTFS Realtime', 'https://api.golemio.cz/v2/vehiclepositions/gtfsrt/trip_updates.pb', 'gtfs_realtime', 'pid_all_modes', 10),
-  ('ids_jmk_realtime', 'IDS JMK vehicle positions', 'https://gis.brno.cz/ags1/rest/services/Hosted/Kordis_26_polohy/FeatureServer/0', 'arcgis_realtime', 'ids_jmk', 30),
+  ('ids_jmk_realtime', 'IDS JMK GTFS Realtime', 'https://kordis-jmk.cz/gtfs/gtfsReal.dat', 'gtfs_realtime', 'ids_jmk', 30),
   ('duk_realtime', 'DUK vehicle positions', 'https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0', 'json_realtime', 'duk', 30),
   ('mock_realtime', 'Development mock realtime', 'mock://realtime-worker', 'mock', 'development_only', 1000)
 ON CONFLICT (id) DO UPDATE SET

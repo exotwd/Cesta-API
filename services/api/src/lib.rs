@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -26,8 +28,8 @@ use tokio::{
     time,
 };
 use transit_model::{
-    CoordinateConfidence, Journey, JourneyLeg, OfflinePackage, RealtimeStatus, Stop, TicketOption,
-    Transfer, TransportMode, normalize_czech_name,
+    AccessibilityStatus, CoordinateConfidence, Journey, JourneyLeg, OfflinePackage, RealtimeStatus,
+    Stop, StopLocationType, TicketOption, Transfer, TransportMode, normalize_czech_name,
 };
 use uuid::Uuid;
 
@@ -422,7 +424,48 @@ struct StopSearchQuery {
 #[derive(Debug, Deserialize)]
 struct RealtimeVehiclesQuery {
     source: Option<String>,
+    provider: Option<String>,
+    bbox: Option<String>,
     limit: Option<usize>,
+}
+
+impl RealtimeVehiclesQuery {
+    fn parsed_bbox(&self) -> Result<Option<[f64; 4]>, ApiError> {
+        let Some(raw) = self.bbox.as_deref() else {
+            return Ok(None);
+        };
+        let values = raw
+            .split(',')
+            .map(|value| value.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ApiError {
+                code: "validation_error".to_string(),
+                message: "bbox must contain west,south,east,north numbers".to_string(),
+            })?;
+        let [west, south, east, north] = values.as_slice() else {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "bbox must contain exactly west,south,east,north".to_string(),
+            });
+        };
+        if !west.is_finite()
+            || !south.is_finite()
+            || !east.is_finite()
+            || !north.is_finite()
+            || !(-180.0..=180.0).contains(west)
+            || !(-180.0..=180.0).contains(east)
+            || !(-90.0..=90.0).contains(south)
+            || !(-90.0..=90.0).contains(north)
+            || west >= east
+            || south >= north
+        {
+            return Err(ApiError {
+                code: "validation_error".to_string(),
+                message: "bbox coordinates are invalid or reversed".to_string(),
+            });
+        }
+        Ok(Some([*west, *south, *east, *north]))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2021,7 +2064,8 @@ async fn admin_unmatched_stops(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, modes, source_priority, is_active
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
           AND (lat IS NULL OR lon IS NULL OR coordinate_confidence = 'unresolved')
@@ -5349,7 +5393,8 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, modes, source_priority, is_active
+                   platform_code, location_type, parent_station_id, wheelchair_boarding,
+                   modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
               AND lat IS NOT NULL
@@ -5897,7 +5942,8 @@ async fn journey_related_data_db(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, modes, source_priority, is_active
+                   platform_code, location_type, parent_station_id, wheelchair_boarding,
+                   modes, source_priority, is_active
             FROM stops
             WHERE id = ANY($1)
             ORDER BY name ASC, platform_code ASC NULLS FIRST
@@ -6576,7 +6622,8 @@ async fn search_stops_db(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, modes, source_priority, is_active
+                   platform_code, location_type, parent_station_id, wheelchair_boarding,
+                   modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
             ORDER BY source_priority ASC, name ASC, platform_code ASC NULLS FIRST, id ASC
@@ -6600,7 +6647,8 @@ async fn search_stops_db(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, modes, source_priority, is_active
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
           AND (
@@ -6713,7 +6761,8 @@ async fn nearby_stops_db(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, modes, source_priority, is_active
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
           AND geom IS NOT NULL
@@ -6740,7 +6789,8 @@ async fn stops_in_bounds_db(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, modes, source_priority, is_active
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
           AND geom IS NOT NULL
@@ -6768,7 +6818,8 @@ async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Erro
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, modes, source_priority, is_active
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
         FROM stops
         WHERE id = $1 AND is_active = true
         "#,
@@ -6902,6 +6953,17 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
         coordinate_source: row.get("coordinate_source"),
         stop_area_id: row.get("stop_area_id"),
         platform_code: row.get("platform_code"),
+        location_type: row
+            .try_get::<String, _>("location_type")
+            .map(|value| db_stop_location_type_to_model(&value))
+            .unwrap_or(StopLocationType::Stop),
+        parent_station_id: row
+            .try_get::<Option<String>, _>("parent_station_id")
+            .unwrap_or(None),
+        wheelchair_boarding: row
+            .try_get::<String, _>("wheelchair_boarding")
+            .map(|value| db_accessibility_to_model(&value))
+            .unwrap_or(AccessibilityStatus::Unknown),
         modes: row
             .get::<Vec<String>, _>("modes")
             .into_iter()
@@ -6909,6 +6971,24 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
             .collect(),
         is_active: row.get("is_active"),
     })
+}
+
+fn db_stop_location_type_to_model(value: &str) -> StopLocationType {
+    match value {
+        "station" => StopLocationType::Station,
+        "entrance_exit" => StopLocationType::EntranceExit,
+        "generic_node" => StopLocationType::GenericNode,
+        "boarding_area" => StopLocationType::BoardingArea,
+        _ => StopLocationType::Stop,
+    }
+}
+
+fn db_accessibility_to_model(value: &str) -> AccessibilityStatus {
+    match value {
+        "accessible" => AccessibilityStatus::Accessible,
+        "inaccessible" => AccessibilityStatus::Inaccessible,
+        _ => AccessibilityStatus::Unknown,
+    }
 }
 
 fn route_row_json(row: &sqlx::postgres::PgRow) -> Value {
@@ -7315,11 +7395,23 @@ fn city_search_json(city: &City) -> Value {
 
 fn stop_search_json(stop: &Stop) -> Value {
     let mut value = serde_json::to_value(stop).unwrap_or_else(|_| json!({}));
-    value["place_type"] = json!(stop_place_type(stop));
+    let place_type = stop_place_type(stop);
+    value["place_type"] = json!(place_type);
+    value["marker_type"] = json!(place_type);
+    value["map_visible"] = json!(!matches!(
+        stop.location_type,
+        StopLocationType::GenericNode | StopLocationType::BoardingArea
+    ));
     value
 }
 
 fn stop_place_type(stop: &Stop) -> &'static str {
+    match stop.location_type {
+        StopLocationType::EntranceExit => return "station_entrance",
+        StopLocationType::GenericNode => return "generic_node",
+        StopLocationType::BoardingArea => return "boarding_area",
+        StopLocationType::Stop | StopLocationType::Station => {}
+    }
     let normalized_name = normalize_search_text(&stop.name);
     if normalized_name.contains("letiste") || normalized_name.contains("airport") {
         return "airport";
@@ -7656,6 +7748,9 @@ fn fixture_stop(id: &str, name: &str, lat: f64, lon: f64, mode: TransportMode) -
         coordinate_source: Some("fixture".to_string()),
         stop_area_id: None,
         platform_code: None,
+        location_type: StopLocationType::Stop,
+        parent_station_id: None,
+        wheelchair_boarding: AccessibilityStatus::Unknown,
         modes: vec![mode],
         is_active: true,
     }
@@ -7826,6 +7921,8 @@ mod tests {
                 .any(|value| value == "city")
         );
         assert!(payload["paths"]["/realtime/vehicles"].is_object());
+        assert!(payload["paths"]["/vehicles"].is_object());
+        assert!(payload["components"]["schemas"]["Vehicle"].is_object());
         assert!(payload["paths"]["/data-sources/status"].is_object());
         assert!(payload["paths"]["/stops/in-bounds"]["get"].is_object());
         assert!(payload["components"]["schemas"]["StopsInBoundsResponse"].is_object());
@@ -7858,6 +7955,10 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["stops"].as_array().unwrap().len(), 2);
         assert_eq!(payload["stops"][0]["id"], "stop-praha");
+        assert_eq!(payload["stops"][0]["marker_type"], "bus_stop");
+        assert_eq!(payload["stops"][0]["location_type"], "stop");
+        assert_eq!(payload["stops"][0]["wheelchair_boarding"], "unknown");
+        assert_eq!(payload["stops"][0]["map_visible"], true);
         assert_eq!(payload["stops"][1]["id"], "stop-praha-hl-n");
         assert!(payload["nextCursor"].is_null());
         assert_eq!(payload["data_status"]["source"], "mock");
@@ -7914,6 +8015,25 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["code"], "validation_error");
         assert_eq!(payload["message"], "south must be less than north");
+    }
+
+    #[tokio::test]
+    async fn vehicles_rejects_reversed_bbox() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/vehicles?bbox=14.7,50.2,14.3,50.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["code"], "validation_error");
     }
 
     #[tokio::test]

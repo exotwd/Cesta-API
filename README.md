@@ -30,7 +30,7 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 
 - The `data-pipeline` service can download GGU latest GTFS and log files, archive them without overwrites, compute SHA-256 checksums, parse GTFS core files and export agencies, stops, routes, trips, stop times and validation issues to PostgreSQL.
 - The `schedule-updater` checks official PID GTFS and seven-day line geometry every six hours and imports only changed schedules.
-- The realtime worker consumes PID GTFS-Realtime every 20 seconds and IDS JMK/DÚK vehicle feeds every 30 seconds. PID delays are joined to concrete trips and stops.
+- The realtime worker consumes PID GTFS-Realtime and rich Golemio vehicle data every 20 seconds plus the official IDS JMK GTFS-Realtime feed every 30 seconds. The DÚK adapter is disabled until redistribution terms are confirmed. PID delays are joined to concrete trips and stops.
 - `/metadata/data-status`, `/stops/search`, `/stops/{id}` and `/departures` read imported database data when `USE_MOCK_DATA=false`.
 - API response shapes include data freshness and warnings so mock or unavailable data is not hidden.
 
@@ -153,7 +153,7 @@ Inspect source freshness and current vehicle data:
 
 ```powershell
 Invoke-RestMethod http://localhost:8070/data-sources/status
-Invoke-RestMethod "http://localhost:8070/realtime/vehicles?source=pid_gtfs_rt&limit=100"
+Invoke-RestMethod "http://localhost:8070/vehicles?bbox=14.30,49.95,14.70,50.20&limit=1000"
 ```
 
 After import, restart the API if it was already running:
@@ -173,6 +173,8 @@ GET /openapi.json
 ČD ticketing configuration and the exact mobile contract are documented in [`docs/cd-ticketing-frontend-handoff.md`](docs/cd-ticketing-frontend-handoff.md). Ticketing remains disabled until partner credentials are supplied; checkout remains disabled independently until the backend payment-provider verifier is configured.
 
 Flutter integration for detailed journey stop calls is documented in [`docs/app-intermediate-stops.md`](docs/app-intermediate-stops.md).
+
+Flutter map integration for normalized live vehicles and typed stop markers is documented in [`docs/app-vehicle-map.md`](docs/app-vehicle-map.md).
 
 After deploying calendar-aware routing, refresh existing schedule feeds once. PID refreshes automatically; refresh a legacy GGU import with `docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest`.
 

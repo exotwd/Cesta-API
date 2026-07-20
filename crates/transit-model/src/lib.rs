@@ -17,6 +17,24 @@ pub enum TransportMode {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StopLocationType {
+    Stop,
+    Station,
+    EntranceExit,
+    GenericNode,
+    BoardingArea,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessibilityStatus {
+    Unknown,
+    Accessible,
+    Inaccessible,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinateConfidence {
@@ -53,6 +71,9 @@ pub struct Stop {
     pub coordinate_source: Option<String>,
     pub stop_area_id: Option<String>,
     pub platform_code: Option<String>,
+    pub location_type: StopLocationType,
+    pub parent_station_id: Option<String>,
+    pub wheelchair_boarding: AccessibilityStatus,
     pub modes: Vec<TransportMode>,
     pub is_active: bool,
 }

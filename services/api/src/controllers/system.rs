@@ -110,14 +110,19 @@ pub(crate) async fn openapi() -> Json<Value> {
                     }}}
                 }
             }},
-            "/realtime/vehicles": {"get": {
-                "summary": "Current public transport vehicle positions",
-                "description": "Returns fresh PID, IDS JMK and DUK vehicle positions with source-specific delay information.",
+            "/vehicles": {"get": {
+                "summary": "Unified current public transport vehicle positions",
+                "description": "Returns normalized fresh vehicle positions from licensed providers. PID includes Golemio vehicle equipment when available; IDS JMK uses the official GTFS-Realtime feed. DÚK is disabled by default until redistribution terms are confirmed.",
                 "parameters": [
                     {"name": "source", "in": "query", "schema": {"type": "string"}},
+                    {"name": "provider", "in": "query", "schema": {"type": "string", "enum": ["pid", "ids_jmk", "duk"]}},
+                    {"name": "bbox", "in": "query", "description": "Visible map bounds as west,south,east,north", "schema": {"type": "string", "example": "14.30,49.95,14.70,50.20"}},
                     {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 2000}}
                 ],
-                "responses": {"200": {"description": "Current vehicle positions"}}
+                "responses": {
+                    "200": {"description": "Current normalized vehicle positions", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VehiclesResponse"}}}},
+                    "400": {"description": "Invalid bbox"}
+                }
             }},
             "/data-sources/status": {"get": {
                 "summary": "Automatic data-source synchronization status",
@@ -183,7 +188,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             "schemas": {
                 "PlaceType": {
                     "type": "string",
-                    "enum": ["city", "railway_station", "railway_stop", "bus_station", "bus_stop", "tram_stop", "metro_station", "ferry_terminal", "airport", "stop"]
+                    "enum": ["city", "railway_station", "railway_stop", "bus_station", "bus_stop", "tram_stop", "metro_station", "ferry_terminal", "airport", "station_entrance", "generic_node", "boarding_area", "stop"]
                 },
                 "CitySearchResult": {
                     "type": "object",
@@ -239,7 +244,7 @@ pub(crate) async fn openapi() -> Json<Value> {
                 },
                 "Stop": {
                     "type": "object",
-                    "required": ["id", "source_ids", "name", "normalized_name", "modes", "coordinate_confidence", "is_active"],
+                    "required": ["id", "source_ids", "name", "normalized_name", "location_type", "wheelchair_boarding", "modes", "coordinate_confidence", "is_active", "place_type", "marker_type", "map_visible"],
                     "properties": {
                         "id": {"type": "string"},
                         "source_ids": {"type": "array", "items": {"$ref": "#/components/schemas/StopSourceRef"}},
@@ -255,8 +260,60 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "coordinate_source": {"type": ["string", "null"]},
                         "stop_area_id": {"type": ["string", "null"]},
                         "platform_code": {"type": ["string", "null"]},
+                        "location_type": {"type": "string", "enum": ["stop", "station", "entrance_exit", "generic_node", "boarding_area"]},
+                        "parent_station_id": {"type": ["string", "null"]},
+                        "wheelchair_boarding": {"type": "string", "enum": ["unknown", "accessible", "inaccessible"]},
                         "modes": {"type": "array", "items": {"type": "string"}},
+                        "place_type": {"$ref": "#/components/schemas/PlaceType"},
+                        "marker_type": {"$ref": "#/components/schemas/PlaceType"},
+                        "map_visible": {"type": "boolean"},
                         "is_active": {"type": "boolean"}
+                    }
+                },
+                "VehiclesResponse": {
+                    "type": "object",
+                    "required": ["vehicles"],
+                    "properties": {
+                        "vehicles": {"type": "array", "items": {"$ref": "#/components/schemas/Vehicle"}},
+                        "warnings": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "Vehicle": {
+                    "type": "object",
+                    "required": ["id", "provider", "source", "vehicleId", "latitude", "longitude", "route", "accessibility", "amenities", "updatedAt", "confidence"],
+                    "properties": {
+                        "id": {"type": "string", "example": "pid:registration:8826"},
+                        "provider": {"type": "string", "enum": ["pid", "ids_jmk", "duk", "unknown"]},
+                        "source": {"$ref": "#/components/schemas/VehicleSource"},
+                        "vehicleId": {"type": "string"},
+                        "registrationNumber": {"type": ["string", "null"]},
+                        "latitude": {"type": "number"},
+                        "longitude": {"type": "number"},
+                        "heading": {"type": ["number", "null"]},
+                        "speedKmh": {"type": ["number", "null"]},
+                        "route": {"type": "object", "additionalProperties": true},
+                        "vehicleType": {"type": ["string", "null"], "enum": ["bus", "tram", "metro", "train", "trolleybus", "ferry", "cable_car", null]},
+                        "accessibility": {"type": "object", "properties": {"wheelchairAccessible": {"type": ["boolean", "null"]}}},
+                        "amenities": {"type": "object", "properties": {"airConditioned": {"type": ["boolean", "null"]}, "usbChargers": {"type": ["boolean", "null"]}}},
+                        "occupancyStatus": {"type": ["string", "null"]},
+                        "operatorName": {"type": ["string", "null"]},
+                        "tracking": {"type": ["boolean", "null"]},
+                        "state": {"type": ["string", "null"]},
+                        "delaySeconds": {"type": ["integer", "null"]},
+                        "updatedAt": {"type": "string", "format": "date-time"},
+                        "validUntil": {"type": ["string", "null"], "format": "date-time"},
+                        "confidence": {"type": "string"}
+                    }
+                },
+                "VehicleSource": {
+                    "type": "object",
+                    "properties": {
+                        "feedId": {"type": ["string", "null"]},
+                        "url": {"type": ["string", "null"], "format": "uri"},
+                        "license": {"type": ["string", "null"]},
+                        "attribution": {"type": ["string", "null"]},
+                        "termsUrl": {"type": ["string", "null"], "format": "uri"},
+                        "redistributionAllowed": {"type": ["boolean", "null"]}
                     }
                 },
                 "StopSourceRef": {
@@ -363,6 +420,8 @@ pub(crate) async fn openapi() -> Json<Value> {
             }
         }
     });
+    let vehicles_path = specification["paths"]["/vehicles"].clone();
+    specification["paths"]["/realtime/vehicles"] = vehicles_path;
     let schemas = specification["components"]["schemas"]
         .as_object_mut()
         .expect("OpenAPI schemas object");

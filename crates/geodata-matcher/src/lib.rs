@@ -45,7 +45,7 @@ fn confidence_rank(confidence: &CoordinateConfidence) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use transit_model::{SourceRef, TransportMode};
+    use transit_model::{AccessibilityStatus, SourceRef, StopLocationType, TransportMode};
 
     use super::*;
 
@@ -73,6 +73,9 @@ mod tests {
             coordinate_source: None,
             stop_area_id: None,
             platform_code: None,
+            location_type: StopLocationType::Stop,
+            parent_station_id: None,
+            wheelchair_boarding: AccessibilityStatus::Unknown,
             modes: vec![TransportMode::Train],
             is_active: true,
         };

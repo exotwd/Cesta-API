@@ -281,6 +281,7 @@ fn stops_in_bounds_response(stops: &mut Vec<Stop>, limit: usize, data_status: Va
     let next_cursor = has_more
         .then(|| stops.last().map(|stop| stop.id.clone()))
         .flatten();
+    let stops = stops.iter().map(stop_search_json).collect::<Vec<_>>();
     json!({
         "stops": stops,
         "nextCursor": next_cursor,
@@ -370,55 +371,127 @@ pub(crate) async fn board_qr(Path(stop_id): Path<String>) -> Json<Value> {
 pub(crate) async fn realtime_vehicles(
     State(state): State<AppState>,
     Query(query): Query<RealtimeVehiclesQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
+    let bbox = query.parsed_bbox()?;
     let Some(pool) = &state.db else {
-        return Json(json!({"vehicles": [], "data_status": mock_status(state.use_mock_data)}));
+        return Ok(Json(
+            json!({"vehicles": [], "dataStatus": mock_status(state.use_mock_data)}),
+        ));
     };
     let limit = query.limit.unwrap_or(2_000).clamp(1, 10_000) as i64;
+    let source_filter = query.source.or_else(|| {
+        query.provider.as_deref().map(|provider| match provider {
+            "pid" => "pid_realtime".to_string(),
+            "ids_jmk" => "ids_jmk_realtime".to_string(),
+            "duk" => "duk_realtime".to_string(),
+            value => value.to_string(),
+        })
+    });
+    let (west, south, east, north) = bbox.map_or((None, None, None, None), |values| {
+        (
+            Some(values[0]),
+            Some(values[1]),
+            Some(values[2]),
+            Some(values[3]),
+        )
+    });
     match sqlx::query(
         r#"
-        SELECT DISTINCT ON (source, vehicle_id)
-          source, source_feed_id, vehicle_id, trip_id, route_id, stop_id,
+        SELECT DISTINCT ON (realtime.source_feed_id, realtime.vehicle_id)
+          realtime.source, realtime.source_feed_id, realtime.vehicle_id,
+          realtime.trip_id, realtime.route_id, realtime.stop_id,
           delay_seconds, estimated_arrival, estimated_departure,
           ST_Y(vehicle_position::geometry) AS lat,
           ST_X(vehicle_position::geometry) AS lon,
-          bearing, fetched_at, valid_until, confidence
-        FROM realtime_updates
-        WHERE vehicle_id IS NOT NULL
+          bearing, speed_kmh, route_short_name, destination, vehicle_type,
+          wheelchair_accessible, air_conditioned, usb_chargers, occupancy_status,
+          vehicle_registration_number, operator_name, tracking, realtime.state,
+          fetched_at, valid_until, confidence,
+          feed.url AS source_url, feed.license_id, feed.attribution,
+          feed.terms_url, feed.redistribution_allowed
+        FROM realtime_updates realtime
+        LEFT JOIN source_feeds feed ON feed.id = realtime.source_feed_id
+        WHERE realtime.vehicle_id IS NOT NULL
           AND vehicle_position IS NOT NULL
           AND (valid_until IS NULL OR valid_until >= now())
-          AND ($1::text IS NULL OR source = $1)
-        ORDER BY source, vehicle_id, fetched_at DESC
-        LIMIT $2
+          AND ($1::text IS NULL OR realtime.source = $1 OR realtime.source_feed_id = $1)
+          AND (
+            $2::double precision IS NULL
+            OR ST_Covers(
+              ST_MakeEnvelope($2, $3, $4, $5, 4326),
+              vehicle_position::geometry
+            )
+          )
+        ORDER BY realtime.source_feed_id, realtime.vehicle_id, fetched_at DESC
+        LIMIT $6
         "#,
     )
-    .bind(query.source)
+    .bind(source_filter)
+    .bind(west)
+    .bind(south)
+    .bind(east)
+    .bind(north)
     .bind(limit)
     .fetch_all(pool)
     .await
     {
-        Ok(rows) => Json(json!({
+        Ok(rows) => Ok(Json(json!({
             "vehicles": rows.into_iter().map(|row| json!({
-                "source": row.get::<String, _>("source"),
-                "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
-                "vehicle_id": row.get::<String, _>("vehicle_id"),
-                "trip_id": row.get::<Option<String>, _>("trip_id"),
-                "route_id": row.get::<Option<String>, _>("route_id"),
-                "stop_id": row.get::<Option<String>, _>("stop_id"),
-                "delay_seconds": row.get::<Option<i32>, _>("delay_seconds"),
-                "estimated_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
-                "estimated_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
-                "position": {
-                    "lat": row.get::<f64, _>("lat"),
-                    "lon": row.get::<f64, _>("lon")
+                "id": format!("{}:{}", vehicle_provider(&row.get::<String, _>("source")), row.get::<String, _>("vehicle_id")),
+                "provider": vehicle_provider(&row.get::<String, _>("source")),
+                "source": {
+                    "feedId": row.get::<Option<String>, _>("source_feed_id"),
+                    "url": row.get::<Option<String>, _>("source_url"),
+                    "license": row.get::<Option<String>, _>("license_id"),
+                    "attribution": row.get::<Option<String>, _>("attribution"),
+                    "termsUrl": row.get::<Option<String>, _>("terms_url"),
+                    "redistributionAllowed": row.get::<Option<bool>, _>("redistribution_allowed")
                 },
-                "bearing": row.get::<Option<f64>, _>("bearing"),
-                "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at"),
-                "valid_until": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
+                "vehicleId": row.get::<String, _>("vehicle_id"),
+                "registrationNumber": row.get::<Option<String>, _>("vehicle_registration_number"),
+                "latitude": row.get::<f64, _>("lat"),
+                "longitude": row.get::<f64, _>("lon"),
+                "heading": row.get::<Option<f64>, _>("bearing"),
+                "speedKmh": row.get::<Option<f64>, _>("speed_kmh"),
+                "route": {
+                    "id": row.get::<Option<String>, _>("route_id"),
+                    "shortName": row.get::<Option<String>, _>("route_short_name"),
+                    "tripId": row.get::<Option<String>, _>("trip_id"),
+                    "destination": row.get::<Option<String>, _>("destination"),
+                    "nextStopId": row.get::<Option<String>, _>("stop_id")
+                },
+                "vehicleType": row.get::<Option<String>, _>("vehicle_type"),
+                "accessibility": {
+                    "wheelchairAccessible": row.get::<Option<bool>, _>("wheelchair_accessible")
+                },
+                "amenities": {
+                    "airConditioned": row.get::<Option<bool>, _>("air_conditioned"),
+                    "usbChargers": row.get::<Option<bool>, _>("usb_chargers")
+                },
+                "occupancyStatus": row.get::<Option<String>, _>("occupancy_status"),
+                "operatorName": row.get::<Option<String>, _>("operator_name"),
+                "tracking": row.get::<Option<bool>, _>("tracking"),
+                "state": row.get::<Option<String>, _>("state"),
+                "delaySeconds": row.get::<Option<i32>, _>("delay_seconds"),
+                "estimatedArrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
+                "estimatedDeparture": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
+                "updatedAt": row.get::<DateTime<Utc>, _>("fetched_at"),
+                "validUntil": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
                 "confidence": row.get::<String, _>("confidence")
             })).collect::<Vec<_>>()
-        })),
-        Err(error) => Json(json!({"vehicles": [], "warnings": [error.to_string()]})),
+        }))),
+        Err(error) => Ok(Json(
+            json!({"vehicles": [], "warnings": [error.to_string()]}),
+        )),
+    }
+}
+
+fn vehicle_provider(source: &str) -> &'static str {
+    match source {
+        "pid_gtfs_rt" => "pid",
+        "ids_jmk_positions" => "ids_jmk",
+        "duk_positions" => "duk",
+        _ => "unknown",
     }
 }
 

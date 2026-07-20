@@ -141,6 +141,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "../../../../infra/postgres/migrations/0014_routing_range_and_endpoint_cache.sql"
         ),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0015_vehicle_map_contract",
+        include_str!("../../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"),
+    )
     .await
 }
 

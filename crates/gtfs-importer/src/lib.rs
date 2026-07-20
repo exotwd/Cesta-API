@@ -9,8 +9,8 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use transit_model::{
-    Agency, Calendar, CalendarDate, Route, Stop, StopTime, TransportMode, normalize_czech_name,
-    parse_gtfs_time,
+    AccessibilityStatus, Agency, Calendar, CalendarDate, Route, Stop, StopLocationType, StopTime,
+    TransportMode, normalize_czech_name, parse_gtfs_time,
 };
 use zip::ZipArchive;
 
@@ -144,6 +144,7 @@ fn parse_archive<R: Read + Seek>(
             raw_payload: None,
         });
     }
+    populate_stop_modes(&mut dataset);
 
     Ok(dataset)
 }
@@ -191,6 +192,9 @@ struct StopRow {
     stop_lat: Option<f64>,
     stop_lon: Option<f64>,
     platform_code: Option<String>,
+    location_type: Option<i16>,
+    parent_station: Option<String>,
+    wheelchair_boarding: Option<i16>,
 }
 
 fn parse_stops<R: Read + Seek>(
@@ -215,6 +219,42 @@ fn parse_stops<R: Read + Seek>(
                     raw_payload: None,
                 });
             }
+            let location_type = match row.location_type.unwrap_or(0) {
+                0 => StopLocationType::Stop,
+                1 => StopLocationType::Station,
+                2 => StopLocationType::EntranceExit,
+                3 => StopLocationType::GenericNode,
+                4 => StopLocationType::BoardingArea,
+                value => {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        code: "invalid_stop_location_type".to_string(),
+                        message: format!("Unsupported GTFS location_type {value}; using stop"),
+                        source_file: Some("stops.txt".to_string()),
+                        affected_entity: Some(row.stop_id.clone()),
+                        raw_payload: Some(serde_json::json!({"location_type": value})),
+                    });
+                    StopLocationType::Stop
+                }
+            };
+            let wheelchair_boarding = match row.wheelchair_boarding.unwrap_or(0) {
+                0 => AccessibilityStatus::Unknown,
+                1 => AccessibilityStatus::Accessible,
+                2 => AccessibilityStatus::Inaccessible,
+                value => {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        code: "invalid_wheelchair_boarding".to_string(),
+                        message: format!(
+                            "Unsupported GTFS wheelchair_boarding {value}; using unknown"
+                        ),
+                        source_file: Some("stops.txt".to_string()),
+                        affected_entity: Some(row.stop_id.clone()),
+                        raw_payload: Some(serde_json::json!({"wheelchair_boarding": value})),
+                    });
+                    AccessibilityStatus::Unknown
+                }
+            };
             Ok(Stop {
                 id: row.stop_id.clone(),
                 source_ids: vec![transit_model::SourceRef {
@@ -244,6 +284,9 @@ fn parse_stops<R: Read + Seek>(
                 coordinate_source: Some(options.source_feed_id.clone()),
                 stop_area_id: None,
                 platform_code: row.platform_code,
+                location_type,
+                parent_station_id: row.parent_station.filter(|value| !value.trim().is_empty()),
+                wheelchair_boarding,
                 modes: Vec::new(),
                 is_active: true,
             })
@@ -395,6 +438,56 @@ pub fn map_gtfs_route_type(route_type: Option<i32>) -> TransportMode {
     }
 }
 
+fn populate_stop_modes(dataset: &mut GtfsDataset) {
+    use std::collections::{HashMap, HashSet};
+
+    let route_modes = dataset
+        .routes
+        .iter()
+        .map(|route| (route.id.as_str(), route.mode.clone()))
+        .collect::<HashMap<_, _>>();
+    let trip_modes = dataset
+        .trips
+        .iter()
+        .filter_map(|trip| {
+            route_modes
+                .get(trip.route_id.as_str())
+                .cloned()
+                .map(|mode| (trip.trip_id.as_str(), mode))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut stop_modes: HashMap<&str, HashSet<TransportMode>> = HashMap::new();
+    for stop_time in &dataset.stop_times {
+        if let Some(mode) = trip_modes.get(stop_time.trip_id.as_str()) {
+            stop_modes
+                .entry(stop_time.stop_id.as_str())
+                .or_default()
+                .insert(mode.clone());
+        }
+    }
+    for stop in &mut dataset.stops {
+        stop.modes = stop_modes
+            .remove(stop.id.as_str())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        stop.modes.sort_by_key(transport_mode_rank);
+    }
+}
+
+fn transport_mode_rank(mode: &TransportMode) -> u8 {
+    match mode {
+        TransportMode::Train => 0,
+        TransportMode::Metro => 1,
+        TransportMode::Tram => 2,
+        TransportMode::Trolleybus => 3,
+        TransportMode::Bus => 4,
+        TransportMode::Ferry => 5,
+        TransportMode::CableCar => 6,
+        TransportMode::Unknown => 7,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CalendarRow {
     service_id: String,
@@ -484,7 +577,7 @@ mod tests {
             zip.start_file("agency.txt", options).unwrap();
             zip.write_all(b"agency_id,agency_name,agency_url,agency_timezone\npid,PID,https://pid.cz,Europe/Prague\n").unwrap();
             zip.start_file("stops.txt", options).unwrap();
-            zip.write_all(b"stop_id,stop_name,stop_lat,stop_lon\ns1,Praha hl.n.,50.083,14.435\ns2,Brno hl.n.,49.191,16.612\n").unwrap();
+            zip.write_all(b"stop_id,stop_name,stop_lat,stop_lon,location_type,parent_station,wheelchair_boarding\ns1,Praha hl.n.,50.083,14.435,1,,1\ns2,Brno hl.n.,49.191,16.612,0,s1,2\n").unwrap();
             zip.start_file("routes.txt", options).unwrap();
             zip.write_all(b"route_id,agency_id,route_short_name,route_long_name,route_type\nr1,pid,R9,Praha - Brno,2\n").unwrap();
             zip.start_file("trips.txt", options).unwrap();
@@ -513,6 +606,13 @@ mod tests {
         assert_eq!(dataset.agencies.len(), 1);
         assert_eq!(dataset.stops.len(), 2);
         assert_eq!(dataset.routes[0].mode, TransportMode::Train);
+        assert_eq!(dataset.stops[0].modes, vec![TransportMode::Train]);
+        assert_eq!(dataset.stops[0].location_type, StopLocationType::Station);
+        assert_eq!(
+            dataset.stops[0].wheelchair_boarding,
+            AccessibilityStatus::Accessible
+        );
+        assert_eq!(dataset.stops[1].parent_station_id.as_deref(), Some("s1"));
         assert_eq!(dataset.stop_times.len(), 2);
         assert_eq!(dataset.calendars.len(), 1);
         assert!(dataset.calendars[0].monday);

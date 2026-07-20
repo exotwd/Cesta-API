@@ -17,7 +17,7 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use tokio::{fs, io::AsyncWriteExt};
-use transit_model::{TransportMode, normalize_czech_name};
+use transit_model::{AccessibilityStatus, StopLocationType, TransportMode, normalize_czech_name};
 use uuid::Uuid;
 
 const GGU_FILES: &[(&str, &str, i32)] = &[
@@ -1519,6 +1519,11 @@ async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1714,6 +1719,10 @@ async fn export_dataset_to_postgres(
     for stop in &dataset.stops {
         let id = scoped_id(feed_id, &stop.id);
         let modes = stop.modes.iter().map(mode_to_db).collect::<Vec<_>>();
+        let parent_station_id = stop
+            .parent_station_id
+            .as_deref()
+            .map(|source_id| scoped_id(feed_id, source_id));
         sqlx::query(
             r#"
             WITH resolved_city AS (
@@ -1722,7 +1731,7 @@ async fn export_dataset_to_postgres(
                   SELECT city.id
                   FROM cities AS city
                   WHERE city.country_code = 'CZ'
-                    AND city.normalized_name = $18
+                    AND city.normalized_name = $21
                   ORDER BY
                     CASE
                       WHEN $9::double precision IS NOT NULL AND $10::double precision IS NOT NULL
@@ -1755,7 +1764,8 @@ async fn export_dataset_to_postgres(
             INSERT INTO stops (
               id, import_run_id, source_feed_id, name, normalized_name, municipality, district, region,
               lat, lon, geom, coordinate_confidence, coordinate_source, stop_area_id, platform_code,
-              modes, source_priority, is_active, city_id, city_assignment_source
+              location_type, parent_station_id, wheelchair_boarding, modes,
+              source_priority, is_active, city_id, city_assignment_source
             )
             SELECT
               $1, $2, $3, $4, $5, $6, $7, $8,
@@ -1764,7 +1774,7 @@ async fn export_dataset_to_postgres(
                 THEN NULL
                 ELSE ST_SetSRID(ST_MakePoint($10, $9), 4326)::geography
               END,
-              $11, $12, $13, $14, $15, $16, $17,
+              $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
               resolved_city.id,
               CASE WHEN resolved_city.id IS NULL THEN NULL ELSE 'name_fallback' END
             FROM resolved_city
@@ -1779,6 +1789,9 @@ async fn export_dataset_to_postgres(
               coordinate_confidence = EXCLUDED.coordinate_confidence,
               coordinate_source = EXCLUDED.coordinate_source,
               platform_code = EXCLUDED.platform_code,
+              location_type = EXCLUDED.location_type,
+              parent_station_id = EXCLUDED.parent_station_id,
+              wheelchair_boarding = EXCLUDED.wheelchair_boarding,
               modes = EXCLUDED.modes,
               source_priority = EXCLUDED.source_priority,
               is_active = EXCLUDED.is_active,
@@ -1794,6 +1807,9 @@ async fn export_dataset_to_postgres(
               stops.coordinate_confidence,
               stops.coordinate_source,
               stops.platform_code,
+              stops.location_type,
+              stops.parent_station_id,
+              stops.wheelchair_boarding,
               stops.modes,
               stops.source_priority,
               stops.is_active,
@@ -1809,6 +1825,9 @@ async fn export_dataset_to_postgres(
               EXCLUDED.coordinate_confidence,
               EXCLUDED.coordinate_source,
               EXCLUDED.platform_code,
+              EXCLUDED.location_type,
+              EXCLUDED.parent_station_id,
+              EXCLUDED.wheelchair_boarding,
               EXCLUDED.modes,
               EXCLUDED.source_priority,
               EXCLUDED.is_active,
@@ -1831,6 +1850,9 @@ async fn export_dataset_to_postgres(
         .bind(&stop.coordinate_source)
         .bind(&stop.stop_area_id)
         .bind(&stop.platform_code)
+        .bind(stop_location_type_to_db(stop.location_type))
+        .bind(parent_station_id)
+        .bind(accessibility_to_db(stop.wheelchair_boarding))
         .bind(&modes)
         .bind(priority)
         .bind(stop.is_active)
@@ -2633,6 +2655,24 @@ fn mode_to_db(mode: &TransportMode) -> &'static str {
         TransportMode::Ferry => "ferry",
         TransportMode::CableCar => "cable_car",
         TransportMode::Unknown => "unknown",
+    }
+}
+
+fn stop_location_type_to_db(location_type: StopLocationType) -> &'static str {
+    match location_type {
+        StopLocationType::Stop => "stop",
+        StopLocationType::Station => "station",
+        StopLocationType::EntranceExit => "entrance_exit",
+        StopLocationType::GenericNode => "generic_node",
+        StopLocationType::BoardingArea => "boarding_area",
+    }
+}
+
+fn accessibility_to_db(status: AccessibilityStatus) -> &'static str {
+    match status {
+        AccessibilityStatus::Unknown => "unknown",
+        AccessibilityStatus::Accessible => "accessible",
+        AccessibilityStatus::Inaccessible => "inaccessible",
     }
 }
 

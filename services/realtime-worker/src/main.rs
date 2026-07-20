@@ -89,12 +89,18 @@ struct VehiclePosition {
     trip: Option<TripDescriptor>,
     #[prost(message, optional, tag = "2")]
     position: Option<Position>,
+    #[prost(uint32, optional, tag = "3")]
+    current_stop_sequence: Option<u32>,
+    #[prost(int32, optional, tag = "4")]
+    current_status: Option<i32>,
     #[prost(uint64, optional, tag = "5")]
     timestamp: Option<u64>,
     #[prost(string, optional, tag = "7")]
     stop_id: Option<String>,
     #[prost(message, optional, tag = "8")]
     vehicle: Option<VehicleDescriptor>,
+    #[prost(int32, optional, tag = "9")]
+    occupancy_status: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -105,6 +111,8 @@ struct Position {
     longitude: f32,
     #[prost(float, optional, tag = "3")]
     bearing: Option<f32>,
+    #[prost(float, optional, tag = "5")]
+    speed: Option<f32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -131,10 +139,27 @@ struct RealtimeRecord {
     lat: Option<f64>,
     lon: Option<f64>,
     bearing: Option<f64>,
+    details: VehicleDetails,
     fetched_at: DateTime<Utc>,
     valid_until: DateTime<Utc>,
     service_date: Option<NaiveDate>,
     raw_payload: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VehicleDetails {
+    route_short_name: Option<String>,
+    destination: Option<String>,
+    vehicle_type: Option<String>,
+    speed_kmh: Option<f64>,
+    wheelchair_accessible: Option<bool>,
+    air_conditioned: Option<bool>,
+    usb_chargers: Option<bool>,
+    occupancy_status: Option<String>,
+    registration_number: Option<String>,
+    operator_name: Option<String>,
+    tracking: Option<bool>,
+    state: Option<String>,
 }
 
 #[tokio::main]
@@ -164,10 +189,19 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("starting public transport realtime worker");
+    let duk_enabled = env_bool("DUK_ENABLED", false);
     tokio::join!(
         run_pid_loop(pool.clone(), client.clone()),
         run_ids_jmk_loop(pool.clone(), client.clone()),
-        run_duk_loop(pool.clone(), client.clone())
+        async move {
+            if duk_enabled {
+                run_duk_loop(pool, client).await;
+            } else {
+                tracing::info!(
+                    "DÚK realtime connector is disabled until redistribution terms are confirmed"
+                );
+            }
+        }
     );
     Ok(())
 }
@@ -178,17 +212,15 @@ async fn check_external_feeds() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .user_agent("Cesta-API realtime-worker feed check")
         .build()?;
-    let token = env::var("PID_API_TOKEN").ok();
+    let token = non_empty_env("PID_API_TOKEN");
     let trip_updates_url = env::var("PID_TRIP_UPDATES_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/trip_updates.pb".to_string()
     });
     let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
     });
-    let jmk_url = env::var("IDS_JMK_VEHICLES_URL").unwrap_or_else(|_| {
-        "https://gis.brno.cz/ags1/rest/services/Hosted/Kordis_26_polohy/FeatureServer/0/query"
-            .to_string()
-    });
+    let jmk_url = env::var("IDS_JMK_VEHICLES_URL")
+        .unwrap_or_else(|_| "https://kordis-jmk.cz/gtfs/gtfsReal.dat".to_string());
     let duk_url = env::var("DUK_VEHICLES_URL")
         .unwrap_or_else(|_| "https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0".to_string());
     let (trip_bytes, vehicle_bytes) = tokio::try_join!(
@@ -199,26 +231,25 @@ async fn check_external_feeds() -> Result<()> {
     let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_slice())?;
     let trip_records = pid_trip_records(&trip_feed)?;
     let vehicle_records = pid_vehicle_records(&vehicle_feed)?;
-    let jmk: Value = client
-        .get(&jmk_url)
-        .query(&[
-            ("where", "1=1"),
-            ("outFields", "*"),
-            ("resultRecordCount", "1"),
-            ("f", "json"),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let duk: Value = client
-        .get(&duk_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let jmk_bytes = fetch_bytes(&client, &jmk_url, None).await?;
+    let jmk_feed = FeedMessage::decode(jmk_bytes.as_slice())?;
+    let jmk_records = ids_jmk_vehicle_records(&jmk_feed);
+    let duk_vehicles = if env_bool("DUK_ENABLED", false) {
+        let duk: Value = client
+            .get(&duk_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Some(
+            duk.get("VehicleList")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        )
+    } else {
+        None
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -230,10 +261,13 @@ async fn check_external_feeds() -> Result<()> {
                 "source_timestamp": feed_timestamp(&trip_feed)
             },
             "ids_jmk": {
-                "sample_features": jmk.get("features").and_then(Value::as_array).map_or(0, Vec::len)
+                "entities": jmk_feed.entity.len(),
+                "vehicle_records": jmk_records.len(),
+                "source_timestamp": feed_timestamp(&jmk_feed)
             },
             "duk": {
-                "vehicles": duk.get("VehicleList").and_then(Value::as_array).map_or(0, Vec::len)
+                "enabled": env_bool("DUK_ENABLED", false),
+                "vehicles": duk_vehicles
             }
         }))?
     );
@@ -262,6 +296,11 @@ async fn apply_migrations(pool: &PgPool) -> Result<()> {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -284,7 +323,9 @@ async fn run_pid_loop(pool: PgPool, client: Client) {
     let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
     });
-    let token = env::var("PID_API_TOKEN").ok();
+    let vehicle_positions_json_url = env::var("PID_VEHICLE_POSITIONS_JSON_URL")
+        .unwrap_or_else(|_| "https://api.golemio.cz/v2/vehiclepositions".to_string());
+    let token = non_empty_env("PID_API_TOKEN");
     let interval = env_u64("PID_POLL_INTERVAL_SECONDS", 20).max(10);
     loop {
         let attempted_at = Utc::now();
@@ -293,6 +334,7 @@ async fn run_pid_loop(pool: PgPool, client: Client) {
             &client,
             &trip_updates_url,
             &vehicle_positions_url,
+            &vehicle_positions_json_url,
             token.as_deref(),
         )
         .await;
@@ -314,17 +356,46 @@ async fn sync_pid_realtime(
     client: &Client,
     trip_updates_url: &str,
     vehicle_positions_url: &str,
+    vehicle_positions_json_url: &str,
     token: Option<&str>,
 ) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
-    let (trip_bytes, vehicle_bytes) = tokio::try_join!(
-        fetch_bytes(client, trip_updates_url, token),
-        fetch_bytes(client, vehicle_positions_url, token)
-    )?;
+    let trip_bytes = fetch_bytes(client, trip_updates_url, token).await?;
     let trip_feed = FeedMessage::decode(trip_bytes.as_ref())?;
-    let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_ref())?;
-    let source_timestamp = feed_timestamp(&trip_feed).or_else(|| feed_timestamp(&vehicle_feed));
     let mut records = pid_trip_records(&trip_feed)?;
-    records.extend(pid_vehicle_records(&vehicle_feed)?);
+    let (vehicle_records, vehicle_entities, position_format) = if let Some(token) = token {
+        match fetch_pid_vehicle_json(client, vehicle_positions_json_url, token).await {
+            Ok(payload) => {
+                let records = pid_json_vehicle_records(&payload)?;
+                let count = payload
+                    .get("features")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                (records, count, "golemio_geojson")
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Golemio GeoJSON positions failed; using GTFS-RT fallback");
+                let vehicle_bytes = fetch_bytes(client, vehicle_positions_url, Some(token)).await?;
+                let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_ref())?;
+                let count = vehicle_feed.entity.len();
+                (
+                    pid_vehicle_records(&vehicle_feed)?,
+                    count,
+                    "gtfs_realtime_fallback",
+                )
+            }
+        }
+    } else {
+        let vehicle_bytes = fetch_bytes(client, vehicle_positions_url, None).await?;
+        let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_ref())?;
+        let count = vehicle_feed.entity.len();
+        (pid_vehicle_records(&vehicle_feed)?, count, "gtfs_realtime")
+    };
+    records.extend(vehicle_records);
+    let source_timestamp = records
+        .iter()
+        .map(|record| record.fetched_at)
+        .max()
+        .or_else(|| feed_timestamp(&trip_feed));
     let received = records.len();
     let written = persist_records(pool, &records).await?;
     cleanup_expired(pool).await?;
@@ -334,9 +405,30 @@ async fn sync_pid_realtime(
         source_timestamp,
         json!({
             "trip_update_entities": trip_feed.entity.len(),
-            "vehicle_position_entities": vehicle_feed.entity.len()
+            "vehicle_position_entities": vehicle_entities,
+            "position_format": position_format
         }),
     ))
+}
+
+async fn fetch_pid_vehicle_json(client: &Client, url: &str, token: &str) -> Result<Value> {
+    Ok(client
+        .get(url)
+        .header(
+            "X-Access-Token",
+            HeaderValue::from_str(token).context("invalid PID_API_TOKEN")?,
+        )
+        .query(&[
+            ("limit", "10000"),
+            ("includeNotTracking", "false"),
+            ("includeNotPublic", "false"),
+            ("preferredTimezone", "Europe_Prague"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 async fn fetch_bytes(client: &Client, url: &str, token: Option<&str>) -> Result<Vec<u8>> {
@@ -404,6 +496,7 @@ fn pid_trip_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
                 lat: None,
                 lon: None,
                 bearing: None,
+                details: VehicleDetails::default(),
                 fetched_at,
                 valid_until,
                 service_date,
@@ -447,6 +540,7 @@ fn pid_trip_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
                 lat: None,
                 lon: None,
                 bearing: None,
+                details: VehicleDetails::default(),
                 fetched_at,
                 valid_until,
                 service_date,
@@ -500,6 +594,14 @@ fn pid_vehicle_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
             lat: position.map(|position| position.latitude as f64),
             lon: position.map(|position| position.longitude as f64),
             bearing: position.and_then(|position| position.bearing.map(f64::from)),
+            details: VehicleDetails {
+                speed_kmh: position
+                    .and_then(|position| position.speed.map(|speed| f64::from(speed) * 3.6)),
+                occupancy_status: occupancy_status_name(vehicle.occupancy_status)
+                    .map(str::to_string),
+                state: vehicle_status_name(vehicle.current_status).map(str::to_string),
+                ..VehicleDetails::default()
+            },
             fetched_at,
             valid_until: fetched_at + chrono::Duration::seconds(90),
             service_date: trip
@@ -518,11 +620,98 @@ fn pid_vehicle_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
     Ok(records)
 }
 
+fn pid_json_vehicle_records(payload: &Value) -> Result<Vec<RealtimeRecord>> {
+    let features = payload
+        .get("features")
+        .and_then(Value::as_array)
+        .context("Golemio vehicle response is missing features")?;
+    let mut records = Vec::with_capacity(features.len());
+    for feature in features {
+        let coordinates = feature
+            .pointer("/geometry/coordinates")
+            .and_then(Value::as_array);
+        let (Some(lon), Some(lat)) = (
+            coordinates
+                .and_then(|values| values.first())
+                .and_then(Value::as_f64),
+            coordinates
+                .and_then(|values| values.get(1))
+                .and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let properties = feature.get("properties").unwrap_or(feature);
+        let trip = properties.get("trip").unwrap_or(&Value::Null);
+        let position = properties.get("last_position").unwrap_or(&Value::Null);
+        let gtfs = trip.get("gtfs").unwrap_or(&Value::Null);
+        let registration_number = value_string(trip.get("vehicle_registration_number"));
+        let source_trip_id = value_string(gtfs.get("trip_id"));
+        let vehicle_id = registration_number
+            .clone()
+            .map(|value| format!("registration:{value}"))
+            .or_else(|| source_trip_id.clone().map(|value| format!("trip:{value}")));
+        let Some(vehicle_id) = vehicle_id else {
+            continue;
+        };
+        let fetched_at = position
+            .get("origin_timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp)
+            .unwrap_or_else(Utc::now);
+        let vehicle_type_description = trip
+            .pointer("/vehicle_type/description_en")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                trip.pointer("/vehicle_type/description_cs")
+                    .and_then(Value::as_str)
+            });
+        let route_type = gtfs.get("route_type").and_then(Value::as_i64);
+        records.push(RealtimeRecord {
+            source: PID_SOURCE,
+            source_feed_id: PID_FEED_ID,
+            source_entity_id: format!("vehicle:{vehicle_id}"),
+            trip_id: source_trip_id.map(|id| scoped_pid_id(PID_STATIC_FEED_ID, &id)),
+            route_id: value_string(gtfs.get("route_id"))
+                .map(|id| scoped_pid_id(PID_STATIC_FEED_ID, &id)),
+            stop_id: value_string(position.pointer("/next_stop/id"))
+                .map(|id| scoped_pid_id(PID_STATIC_FEED_ID, &id)),
+            delay_seconds: value_i32(position.pointer("/delay/actual")),
+            estimated_arrival: None,
+            estimated_departure: None,
+            cancellation_status: value_bool(position.get("is_canceled"))
+                .filter(|value| *value)
+                .map(|_| "cancelled".to_string()),
+            vehicle_id: Some(vehicle_id),
+            lat: Some(lat),
+            lon: Some(lon),
+            bearing: value_f64(position.get("bearing")),
+            details: VehicleDetails {
+                route_short_name: value_string(gtfs.get("route_short_name"))
+                    .or_else(|| value_string(trip.get("origin_route_name"))),
+                destination: value_string(gtfs.get("trip_headsign")),
+                vehicle_type: canonical_vehicle_type(vehicle_type_description, route_type),
+                speed_kmh: value_f64(position.get("speed")),
+                wheelchair_accessible: value_bool(trip.get("wheelchair_accessible")),
+                air_conditioned: value_bool(trip.get("air_conditioned")),
+                usb_chargers: value_bool(trip.get("usb_chargers")),
+                occupancy_status: None,
+                registration_number,
+                operator_name: value_string(trip.pointer("/agency_name/real")),
+                tracking: value_bool(position.get("tracking")),
+                state: value_string(position.get("state_position")),
+            },
+            fetched_at,
+            valid_until: fetched_at + chrono::Duration::seconds(90),
+            service_date: None,
+            raw_payload: feature.clone(),
+        });
+    }
+    Ok(records)
+}
+
 async fn run_ids_jmk_loop(pool: PgPool, client: Client) {
-    let url = env::var("IDS_JMK_VEHICLES_URL").unwrap_or_else(|_| {
-        "https://gis.brno.cz/ags1/rest/services/Hosted/Kordis_26_polohy/FeatureServer/0/query"
-            .to_string()
-    });
+    let url = env::var("IDS_JMK_VEHICLES_URL")
+        .unwrap_or_else(|_| "https://kordis-jmk.cz/gtfs/gtfsReal.dat".to_string());
     let interval = env_u64("IDS_JMK_POLL_INTERVAL_SECONDS", 30).max(15);
     loop {
         let attempted_at = Utc::now();
@@ -531,7 +720,7 @@ async fn run_ids_jmk_loop(pool: PgPool, client: Client) {
             &pool,
             IDS_JMK_SOURCE,
             &url,
-            "vehicle_positions",
+            "gtfs_realtime",
             attempted_at,
             result,
         )
@@ -545,86 +734,86 @@ async fn sync_ids_jmk(
     client: &Client,
     url: &str,
 ) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
-    let mut offset = 0usize;
-    let mut records = Vec::new();
-    let mut latest_source_time: Option<DateTime<Utc>> = None;
-    loop {
-        let payload: Value = client
-            .get(url)
-            .query(&[
-                ("where", "1=1"),
-                ("outFields", "*"),
-                ("f", "json"),
-                ("resultOffset", &offset.to_string()),
-                ("resultRecordCount", "2000"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let features = payload
-            .get("features")
-            .and_then(Value::as_array)
-            .context("IDS JMK response is missing features")?;
-        if features.is_empty() {
-            break;
-        }
-        for feature in features {
-            let attributes = feature.get("attributes").unwrap_or(feature);
-            if value_bool(attributes.get("IsInactive")).unwrap_or(false) {
-                continue;
-            }
-            let Some(vehicle_id) = value_string(attributes.get("ID")) else {
-                continue;
-            };
-            let fetched_at = attributes
-                .get("TimeUpdated")
-                .and_then(Value::as_i64)
-                .and_then(|millis| Utc.timestamp_millis_opt(millis).single())
-                .unwrap_or_else(Utc::now);
-            latest_source_time =
-                Some(latest_source_time.map_or(fetched_at, |time| time.max(fetched_at)));
-            records.push(RealtimeRecord {
-                source: IDS_JMK_SOURCE,
-                source_feed_id: IDS_JMK_FEED_ID,
-                source_entity_id: format!("vehicle:{vehicle_id}"),
-                trip_id: None,
-                route_id: value_string(attributes.get("LineID"))
-                    .map(|id| format!("ids_jmk:route:{id}")),
-                stop_id: value_string(attributes.get("LastStopID"))
-                    .map(|id| format!("ids_jmk:stop:{id}")),
-                delay_seconds: value_i32(attributes.get("Delay")).map(|minutes| minutes * 60),
-                estimated_arrival: None,
-                estimated_departure: None,
-                cancellation_status: None,
-                vehicle_id: Some(vehicle_id),
-                lat: value_f64(attributes.get("Lat")),
-                lon: value_f64(attributes.get("Lng")),
-                bearing: value_f64(attributes.get("Bearing")),
-                fetched_at,
-                valid_until: fetched_at + chrono::Duration::seconds(60),
-                service_date: None,
-                raw_payload: attributes.clone(),
-            });
-        }
-        let exceeded = payload
-            .get("exceededTransferLimit")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        offset += features.len();
-        if !exceeded {
-            break;
-        }
-    }
+    let bytes = fetch_bytes(client, url, None).await?;
+    let feed = FeedMessage::decode(bytes.as_slice())?;
+    let records = ids_jmk_vehicle_records(&feed);
     let received = records.len();
     let written = persist_records(pool, &records).await?;
     Ok((
         received,
         written,
-        latest_source_time,
-        json!({"pages": (offset / 2000) + 1}),
+        feed_timestamp(&feed),
+        json!({"entities": feed.entity.len(), "format": "gtfs_realtime"}),
     ))
+}
+
+fn ids_jmk_vehicle_records(feed: &FeedMessage) -> Vec<RealtimeRecord> {
+    let feed_fetched_at = feed_timestamp(feed).unwrap_or_else(Utc::now);
+    feed.entity
+        .iter()
+        .filter_map(|entity| {
+            let vehicle = entity.vehicle.as_ref()?;
+            let position = vehicle.position.as_ref()?;
+            let trip = vehicle.trip.as_ref();
+            let descriptor = vehicle.vehicle.as_ref();
+            let vehicle_id = descriptor
+                .and_then(|value| value.id.clone().or_else(|| value.label.clone()))
+                .unwrap_or_else(|| entity.id.clone());
+            let fetched_at = vehicle
+                .timestamp
+                .and_then(|timestamp| unix_time(Some(timestamp as i64)))
+                .unwrap_or(feed_fetched_at);
+            let route_short_name = trip.and_then(|trip| trip.route_id.clone());
+            Some(RealtimeRecord {
+                source: IDS_JMK_SOURCE,
+                source_feed_id: IDS_JMK_FEED_ID,
+                source_entity_id: format!("vehicle:{}", entity.id),
+                trip_id: trip
+                    .and_then(|trip| trip.trip_id.as_deref())
+                    .map(|id| format!("ids_jmk:trip:{id}")),
+                route_id: trip
+                    .and_then(|trip| trip.route_id.as_deref())
+                    .map(|id| format!("ids_jmk:route:{id}")),
+                stop_id: vehicle
+                    .stop_id
+                    .as_deref()
+                    .map(|id| format!("ids_jmk:stop:{id}")),
+                delay_seconds: None,
+                estimated_arrival: None,
+                estimated_departure: None,
+                cancellation_status: None,
+                vehicle_id: Some(vehicle_id),
+                lat: Some(position.latitude as f64),
+                lon: Some(position.longitude as f64),
+                bearing: position.bearing.map(f64::from),
+                details: VehicleDetails {
+                    route_short_name,
+                    speed_kmh: position.speed.map(|speed| f64::from(speed) * 3.6),
+                    occupancy_status: occupancy_status_name(vehicle.occupancy_status)
+                        .map(str::to_string),
+                    state: vehicle_status_name(vehicle.current_status).map(str::to_string),
+                    ..VehicleDetails::default()
+                },
+                fetched_at,
+                valid_until: fetched_at + chrono::Duration::seconds(60),
+                service_date: trip
+                    .and_then(|trip| trip.start_date.as_deref())
+                    .and_then(|date| NaiveDate::parse_from_str(date, "%Y%m%d").ok()),
+                raw_payload: json!({
+                    "entity_id": entity.id,
+                    "trip_id": trip.and_then(|trip| trip.trip_id.as_deref()),
+                    "route_id": trip.and_then(|trip| trip.route_id.as_deref()),
+                    "stop_id": vehicle.stop_id,
+                    "vehicle_id": descriptor.and_then(|value| value.id.as_deref()),
+                    "vehicle_label": descriptor.and_then(|value| value.label.as_deref()),
+                    "current_stop_sequence": vehicle.current_stop_sequence,
+                    "current_status": vehicle.current_status,
+                    "occupancy_status": vehicle.occupancy_status,
+                    "timestamp": vehicle.timestamp
+                }),
+            })
+        })
+        .collect()
 }
 
 async fn run_duk_loop(pool: PgPool, client: Client) {
@@ -708,6 +897,7 @@ async fn sync_duk(
             lat: value_f64(vehicle.get("Latitude")),
             lon: value_f64(vehicle.get("Longitude")),
             bearing: value_f64(vehicle.get("Azimut")),
+            details: VehicleDetails::default(),
             fetched_at,
             valid_until: fetched_at + chrono::Duration::seconds(90),
             service_date: None,
@@ -786,13 +976,64 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
             .iter()
             .map(|record| record.raw_payload.clone())
             .collect::<Vec<_>>();
+        let route_short_names = chunk
+            .iter()
+            .map(|record| record.details.route_short_name.clone())
+            .collect::<Vec<_>>();
+        let destinations = chunk
+            .iter()
+            .map(|record| record.details.destination.clone())
+            .collect::<Vec<_>>();
+        let vehicle_types = chunk
+            .iter()
+            .map(|record| record.details.vehicle_type.clone())
+            .collect::<Vec<_>>();
+        let speeds = chunk
+            .iter()
+            .map(|record| record.details.speed_kmh)
+            .collect::<Vec<_>>();
+        let wheelchair_accessible = chunk
+            .iter()
+            .map(|record| record.details.wheelchair_accessible)
+            .collect::<Vec<_>>();
+        let air_conditioned = chunk
+            .iter()
+            .map(|record| record.details.air_conditioned)
+            .collect::<Vec<_>>();
+        let usb_chargers = chunk
+            .iter()
+            .map(|record| record.details.usb_chargers)
+            .collect::<Vec<_>>();
+        let occupancy_statuses = chunk
+            .iter()
+            .map(|record| record.details.occupancy_status.clone())
+            .collect::<Vec<_>>();
+        let registration_numbers = chunk
+            .iter()
+            .map(|record| record.details.registration_number.clone())
+            .collect::<Vec<_>>();
+        let operator_names = chunk
+            .iter()
+            .map(|record| record.details.operator_name.clone())
+            .collect::<Vec<_>>();
+        let tracking = chunk
+            .iter()
+            .map(|record| record.details.tracking)
+            .collect::<Vec<_>>();
+        let states = chunk
+            .iter()
+            .map(|record| record.details.state.clone())
+            .collect::<Vec<_>>();
         written += sqlx::query(
             r#"
             INSERT INTO realtime_updates (
               source, source_feed_id, source_entity_id, trip_id, route_id, stop_id,
               delay_seconds, estimated_arrival, estimated_departure, cancellation_status,
               vehicle_id, vehicle_position, bearing, fetched_at, valid_until,
-              service_date, confidence, raw_payload
+              service_date, confidence, raw_payload, route_short_name, destination,
+              vehicle_type, speed_kmh, wheelchair_accessible, air_conditioned,
+              usb_chargers, occupancy_status, vehicle_registration_number,
+              operator_name, tracking, state
             )
             SELECT
               item.source, item.source_feed_id, item.source_entity_id, item.trip_id,
@@ -801,17 +1042,25 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
               CASE WHEN item.lat IS NULL OR item.lon IS NULL THEN NULL
                 ELSE ST_SetSRID(ST_MakePoint(item.lon, item.lat), 4326)::geography END,
               item.bearing, item.fetched_at, item.valid_until, item.service_date,
-              'estimated', item.raw_payload
+              'estimated', item.raw_payload, item.route_short_name, item.destination,
+              item.vehicle_type, item.speed_kmh, item.wheelchair_accessible,
+              item.air_conditioned, item.usb_chargers, item.occupancy_status,
+              item.registration_number, item.operator_name, item.tracking, item.state
             FROM UNNEST(
               $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
               $7::integer[], $8::timestamptz[], $9::timestamptz[], $10::text[],
               $11::text[], $12::double precision[], $13::double precision[],
               $14::double precision[], $15::timestamptz[], $16::timestamptz[],
-              $17::date[], $18::jsonb[]
+              $17::date[], $18::jsonb[], $19::text[], $20::text[], $21::text[],
+              $22::double precision[], $23::boolean[], $24::boolean[], $25::boolean[],
+              $26::text[], $27::text[], $28::text[], $29::boolean[], $30::text[]
             ) AS item(
               source, source_feed_id, source_entity_id, trip_id, route_id, stop_id,
               delay_seconds, estimated_arrival, estimated_departure, cancellation_status,
-              vehicle_id, lat, lon, bearing, fetched_at, valid_until, service_date, raw_payload
+              vehicle_id, lat, lon, bearing, fetched_at, valid_until, service_date, raw_payload,
+              route_short_name, destination, vehicle_type, speed_kmh, wheelchair_accessible,
+              air_conditioned, usb_chargers, occupancy_status, registration_number,
+              operator_name, tracking, state
             )
             ON CONFLICT (source, source_entity_id) WHERE source_entity_id IS NOT NULL
             DO UPDATE SET
@@ -829,6 +1078,18 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
               fetched_at = EXCLUDED.fetched_at,
               valid_until = EXCLUDED.valid_until,
               service_date = EXCLUDED.service_date,
+              route_short_name = EXCLUDED.route_short_name,
+              destination = EXCLUDED.destination,
+              vehicle_type = EXCLUDED.vehicle_type,
+              speed_kmh = EXCLUDED.speed_kmh,
+              wheelchair_accessible = EXCLUDED.wheelchair_accessible,
+              air_conditioned = EXCLUDED.air_conditioned,
+              usb_chargers = EXCLUDED.usb_chargers,
+              occupancy_status = EXCLUDED.occupancy_status,
+              vehicle_registration_number = EXCLUDED.vehicle_registration_number,
+              operator_name = EXCLUDED.operator_name,
+              tracking = EXCLUDED.tracking,
+              state = EXCLUDED.state,
               confidence = EXCLUDED.confidence,
               raw_payload = EXCLUDED.raw_payload
             "#,
@@ -851,6 +1112,18 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
         .bind(valid)
         .bind(service_dates)
         .bind(payloads)
+        .bind(route_short_names)
+        .bind(destinations)
+        .bind(vehicle_types)
+        .bind(speeds)
+        .bind(wheelchair_accessible)
+        .bind(air_conditioned)
+        .bind(usb_chargers)
+        .bind(occupancy_statuses)
+        .bind(registration_numbers)
+        .bind(operator_names)
+        .bind(tracking)
+        .bind(states)
         .execute(pool)
         .await?
         .rows_affected() as usize;
@@ -968,6 +1241,7 @@ async fn run_mock_loop(pool: &PgPool) {
             lat: None,
             lon: None,
             bearing: None,
+            details: VehicleDetails::default(),
             fetched_at: now,
             valid_until: now + chrono::Duration::minutes(5),
             service_date: None,
@@ -1026,6 +1300,74 @@ fn value_bool(value: Option<&Value>) -> Option<bool> {
     }
 }
 
+fn canonical_vehicle_type(description: Option<&str>, route_type: Option<i64>) -> Option<String> {
+    let description = description.unwrap_or_default().to_lowercase();
+    let mapped = if description.contains("trolley") || description.contains("trolej") {
+        Some("trolleybus")
+    } else if description.contains("tram") {
+        Some("tram")
+    } else if description.contains("metro") || description.contains("subway") {
+        Some("metro")
+    } else if description.contains("train")
+        || description.contains("rail")
+        || description.contains("vlak")
+    {
+        Some("train")
+    } else if description.contains("ferry") || description.contains("boat") {
+        Some("ferry")
+    } else if description.contains("cable")
+        || description.contains("funicular")
+        || description.contains("lanov")
+    {
+        Some("cable_car")
+    } else if description.contains("bus") || description.contains("autobus") {
+        Some("bus")
+    } else {
+        match route_type {
+            Some(0 | 900..=999) => Some("tram"),
+            Some(1) => Some("metro"),
+            Some(2 | 100..=199 | 400..=499) => Some("train"),
+            Some(3 | 200..=299 | 700..=799) => Some("bus"),
+            Some(4 | 1000..=1099) => Some("ferry"),
+            Some(5 | 1300..=1399) => Some("cable_car"),
+            Some(11 | 800..=899) => Some("trolleybus"),
+            _ => None,
+        }
+    };
+    mapped.map(str::to_string)
+}
+
+fn occupancy_status_name(status: Option<i32>) -> Option<&'static str> {
+    match status? {
+        0 => Some("empty"),
+        1 => Some("many_seats_available"),
+        2 => Some("few_seats_available"),
+        3 => Some("standing_room_only"),
+        4 => Some("crushed_standing_room_only"),
+        5 => Some("full"),
+        6 => Some("not_accepting_passengers"),
+        7 => Some("no_data_available"),
+        8 => Some("not_boardable"),
+        _ => None,
+    }
+}
+
+fn vehicle_status_name(status: Option<i32>) -> Option<&'static str> {
+    match status? {
+        0 => Some("incoming_at"),
+        1 => Some("stopped_at"),
+        2 => Some("in_transit_to"),
+        _ => None,
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
@@ -1074,6 +1416,7 @@ mod tests {
             lat: None,
             lon: None,
             bearing: None,
+            details: VehicleDetails::default(),
             fetched_at,
             valid_until: fetched_at + chrono::Duration::seconds(90),
             service_date: None,
@@ -1128,5 +1471,53 @@ mod tests {
         assert_eq!(records[0].route_id.as_deref(), Some("pid_gtfs:L991"));
         assert_eq!(records[0].stop_id.as_deref(), Some("pid_gtfs:U1Z1P"));
         assert_eq!(records[0].delay_seconds, Some(120));
+    }
+
+    #[test]
+    fn normalizes_golemio_vehicle_equipment() {
+        let payload = json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [14.4378, 50.0755]},
+                "properties": {
+                    "trip": {
+                        "agency_name": {"real": "DPP"},
+                        "gtfs": {
+                            "route_id": "L119",
+                            "route_short_name": "119",
+                            "route_type": 3,
+                            "trip_id": "119_1_260720",
+                            "trip_headsign": "Letiště"
+                        },
+                        "vehicle_registration_number": 8826,
+                        "vehicle_type": {"description_en": "regional bus"},
+                        "wheelchair_accessible": true,
+                        "air_conditioned": true,
+                        "usb_chargers": false
+                    },
+                    "last_position": {
+                        "bearing": 125,
+                        "speed": 42,
+                        "delay": {"actual": 30},
+                        "next_stop": {"id": "U1Z1P"},
+                        "origin_timestamp": "2026-07-20T12:34:56Z",
+                        "tracking": true,
+                        "state_position": "on_track",
+                        "is_canceled": false
+                    }
+                }
+            }]
+        });
+
+        let records = pid_json_vehicle_records(&payload).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].vehicle_id.as_deref(), Some("registration:8826"));
+        assert_eq!(records[0].details.vehicle_type.as_deref(), Some("bus"));
+        assert_eq!(records[0].details.speed_kmh, Some(42.0));
+        assert_eq!(records[0].details.wheelchair_accessible, Some(true));
+        assert_eq!(records[0].details.air_conditioned, Some(true));
+        assert_eq!(records[0].details.usb_chargers, Some(false));
+        assert_eq!(records[0].details.destination.as_deref(), Some("Letiště"));
     }
 }

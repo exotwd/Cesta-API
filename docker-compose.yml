@@ -69,8 +69,11 @@ services:
       DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
       REDIS_URL: redis://redis:6379
       PID_API_TOKEN: ${PID_API_TOKEN:-}
+      PID_VEHICLE_POSITIONS_JSON_URL: ${PID_VEHICLE_POSITIONS_JSON_URL:-https://api.golemio.cz/v2/vehiclepositions}
       PID_POLL_INTERVAL_SECONDS: ${PID_POLL_INTERVAL_SECONDS:-20}
+      IDS_JMK_VEHICLES_URL: ${IDS_JMK_VEHICLES_URL:-https://kordis-jmk.cz/gtfs/gtfsReal.dat}
       IDS_JMK_POLL_INTERVAL_SECONDS: ${IDS_JMK_POLL_INTERVAL_SECONDS:-30}
+      DUK_ENABLED: ${DUK_ENABLED:-false}
       DUK_POLL_INTERVAL_SECONDS: ${DUK_POLL_INTERVAL_SECONDS:-30}
       USE_MOCK_REALTIME: "false"
       RUST_LOG: info
