@@ -69,8 +69,12 @@ references are installed in the process-local store before the response and are 
 PostgreSQL asynchronously, keeping database fsync latency outside the public route-search critical
 path while preserving the existing opaque-reference API.
 
-On API startup, snapshot files with a lower format version than the running API are deleted before
-warmup. Current-version files, files from a newer version, and unrelated files are preserved.
+On API startup and after every background warmup pass, processed snapshot retention removes lower
+format versions, stale temporary files, duplicate data revisions for the same service date, and the
+least recently written surplus snapshots. `ROUTING_SNAPSHOT_FILES_TO_KEEP` defaults to `8` and is
+clamped to at least `2`; the newest snapshots for today and tomorrow are always protected. Files
+from a newer API version and unrelated/manual files are never removed. Every deleted file is a
+derived cache artifact and is rebuilt from PostgreSQL on demand.
 
 `GET /admin/routing-algorithm` also reports `snapshot_status`: configured snapshot directory,
 latest-import key, file sizes, per-date in-memory status, and the current background warmup stage.

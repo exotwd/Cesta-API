@@ -812,18 +812,24 @@ async fn shutdown_signal() {
 pub async fn run() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     init_tracing(config.production)?;
-    match prune_obsolete_raptor_snapshots(&config.routing_snapshot_dir).await {
+    match prune_raptor_snapshots(
+        &config.routing_snapshot_dir,
+        config.routing_snapshot_files_to_keep,
+    )
+    .await
+    {
         Ok(removed) if removed > 0 => tracing::info!(
             removed,
             current_version = RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
+            files_to_keep = config.routing_snapshot_files_to_keep,
             directory = %config.routing_snapshot_dir.display(),
-            "deleted obsolete RAPTOR snapshots"
+            "deleted unused RAPTOR snapshots"
         ),
         Ok(_) => {}
         Err(error) => tracing::warn!(
             %error,
             directory = %config.routing_snapshot_dir.display(),
-            "failed to inspect RAPTOR snapshots for version cleanup"
+            "failed to clean RAPTOR snapshots"
         ),
     }
     let app = app_state_with_config(config.clone()).await?;
@@ -932,9 +938,17 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
     if let Some(pool) = state.db.clone() {
         let cache = state.raptor_cache.clone();
         let snapshot_dir = state.config.routing_snapshot_dir.clone();
+        let snapshot_files_to_keep = state.config.routing_snapshot_files_to_keep;
         let warmup_status = state.routing_warmup_status.clone();
         tokio::spawn(async move {
-            warm_raptor_timetables(pool, cache, snapshot_dir, warmup_status).await
+            warm_raptor_timetables(
+                pool,
+                cache,
+                snapshot_dir,
+                snapshot_files_to_keep,
+                warmup_status,
+            )
+            .await
         });
     }
     state
@@ -5034,6 +5048,7 @@ async fn warm_raptor_timetables(
     pool: PgPool,
     cache: RaptorCache,
     routing_snapshot_dir: PathBuf,
+    routing_snapshot_files_to_keep: usize,
     warmup_status: RoutingWarmupStatus,
 ) {
     loop {
@@ -5081,6 +5096,20 @@ async fn warm_raptor_timetables(
                 finished_at: Some(Utc::now()),
                 error: last_error,
             };
+        }
+        match prune_raptor_snapshots(&routing_snapshot_dir, routing_snapshot_files_to_keep).await {
+            Ok(removed) if removed > 0 => tracing::info!(
+                removed,
+                files_to_keep = routing_snapshot_files_to_keep,
+                directory = %routing_snapshot_dir.display(),
+                "deleted unused RAPTOR snapshots"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                directory = %routing_snapshot_dir.display(),
+                "failed to clean RAPTOR snapshots"
+            ),
         }
         tokio::time::sleep(std::time::Duration::from_secs(
             RAPTOR_WARMUP_INTERVAL_SECONDS,
@@ -5147,24 +5176,36 @@ fn raptor_timetable_snapshot_path(
     ))
 }
 
-fn raptor_snapshot_file_version(file_name: &str) -> Option<u32> {
+fn raptor_snapshot_file_metadata(file_name: &str) -> Option<(u32, chrono::NaiveDate, bool)> {
     let remainder = file_name.strip_prefix("raptor-v")?;
     let (version, suffix) = remainder.split_once('-')?;
-    if !suffix.ends_with(".json") && !suffix.ends_with(".json.tmp") {
+    let temporary = suffix.ends_with(".json.tmp");
+    if !suffix.ends_with(".json") && !temporary {
         return None;
     }
-    version.parse().ok()
+    let service_date = chrono::NaiveDate::parse_from_str(suffix.get(..10)?, "%Y-%m-%d").ok()?;
+    Some((version.parse().ok()?, service_date, temporary))
 }
 
-async fn prune_obsolete_raptor_snapshots(
+#[derive(Debug)]
+struct RaptorSnapshotCandidate {
+    path: PathBuf,
+    service_date: chrono::NaiveDate,
+    modified: std::time::SystemTime,
+}
+
+async fn prune_raptor_snapshots(
     routing_snapshot_dir: &FsPath,
+    files_to_keep: usize,
 ) -> Result<usize, std::io::Error> {
     let mut entries = match tokio::fs::read_dir(routing_snapshot_dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
     };
-    let mut removed = 0;
+    let mut obsolete_paths = HashSet::new();
+    let mut candidates = Vec::new();
+    let now = std::time::SystemTime::now();
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_file() {
             continue;
@@ -5173,18 +5214,80 @@ async fn prune_obsolete_raptor_snapshots(
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        let Some(version) = raptor_snapshot_file_version(file_name) else {
+        let Some((version, service_date, temporary)) = raptor_snapshot_file_metadata(file_name)
+        else {
             continue;
         };
-        if version >= RAPTOR_TIMETABLE_SNAPSHOT_VERSION {
+        if version > RAPTOR_TIMETABLE_SNAPSHOT_VERSION {
             continue;
         }
-        match tokio::fs::remove_file(entry.path()).await {
+        if version < RAPTOR_TIMETABLE_SNAPSHOT_VERSION {
+            obsolete_paths.insert(entry.path());
+            continue;
+        }
+        let metadata = entry.metadata().await?;
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if temporary {
+            let stale = now.duration_since(modified).unwrap_or_default()
+                >= std::time::Duration::from_secs(60 * 60);
+            if stale {
+                obsolete_paths.insert(entry.path());
+            }
+            continue;
+        }
+        candidates.push(RaptorSnapshotCandidate {
+            path: entry.path(),
+            service_date,
+            modified,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        left.service_date
+            .cmp(&right.service_date)
+            .then_with(|| right.modified.cmp(&left.modified))
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    let mut dates = HashSet::new();
+    let mut newest_by_date = Vec::new();
+    for candidate in candidates {
+        if dates.insert(candidate.service_date) {
+            newest_by_date.push(candidate);
+        } else {
+            obsolete_paths.insert(candidate.path);
+        }
+    }
+
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Prague)
+        .date_naive();
+    let tomorrow = today.succ_opt().unwrap_or(today);
+    let protected_count = newest_by_date
+        .iter()
+        .filter(|candidate| candidate.service_date == today || candidate.service_date == tomorrow)
+        .count();
+    let ordinary_to_keep = files_to_keep.max(2).saturating_sub(protected_count);
+    let mut ordinary = newest_by_date
+        .into_iter()
+        .filter(|candidate| candidate.service_date != today && candidate.service_date != tomorrow)
+        .collect::<Vec<_>>();
+    ordinary.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    for candidate in ordinary.into_iter().skip(ordinary_to_keep) {
+        obsolete_paths.insert(candidate.path);
+    }
+
+    let mut removed = 0;
+    for path in obsolete_paths {
+        match tokio::fs::remove_file(&path).await {
             Ok(()) => removed += 1,
             Err(error) => tracing::warn!(
                 %error,
-                path = %entry.path().display(),
-                version,
+                path = %path.display(),
                 "failed to delete obsolete RAPTOR snapshot"
             ),
         }
@@ -8809,10 +8912,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(
-            prune_obsolete_raptor_snapshots(&directory).await.unwrap(),
-            7
-        );
+        assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 7);
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
         assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
@@ -8823,6 +8923,52 @@ mod tests {
         assert!(directory.join("raptor-v8-2026-07-08-current.json").exists());
         assert!(directory.join("raptor-v9-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raptor_snapshot_retention_keeps_one_revision_per_date_and_bounds_cache() {
+        let directory =
+            std::env::temp_dir().join(format!("cesta-raptor-retention-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        for file_name in [
+            "raptor-v8-2026-06-01-import-old.json",
+            "raptor-v8-2026-06-01-import-new.json",
+            "raptor-v8-2026-06-02-import.json",
+            "raptor-v8-2026-06-03-import.json",
+            "raptor-v8-2026-06-04-import.json",
+            "raptor-v8-2026-06-05-import.json",
+        ] {
+            tokio::fs::write(directory.join(file_name), b"test")
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(directory.join("manual-export.json"), b"keep")
+            .await
+            .unwrap();
+
+        assert_eq!(prune_raptor_snapshots(&directory, 2).await.unwrap(), 4);
+        let mut retained_snapshots = tokio::fs::read_dir(&directory).await.unwrap();
+        let mut retained_count = 0;
+        while let Some(entry) = retained_snapshots.next_entry().await.unwrap() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("raptor-v8-"))
+            {
+                retained_count += 1;
+            }
+        }
+        assert_eq!(retained_count, 2);
+        assert!(directory.join("manual-export.json").exists());
+        assert_ne!(
+            directory
+                .join("raptor-v8-2026-06-01-import-old.json")
+                .exists(),
+            directory
+                .join("raptor-v8-2026-06-01-import-new.json")
+                .exists()
+        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

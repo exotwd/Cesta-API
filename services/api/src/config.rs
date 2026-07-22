@@ -13,6 +13,7 @@ pub(crate) struct AppConfig {
     pub(crate) jwt_secret: String,
     pub(crate) request_body_limit_bytes: usize,
     pub(crate) routing_snapshot_dir: PathBuf,
+    pub(crate) routing_snapshot_files_to_keep: usize,
     pub(crate) use_mock_data: bool,
     pub(crate) production: bool,
 }
@@ -94,6 +95,11 @@ impl AppConfig {
             routing_snapshot_dir: env::var("ROUTING_SNAPSHOT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("storage").join("processed").join("routing")),
+            routing_snapshot_files_to_keep: parse_number(
+                "ROUTING_SNAPSHOT_FILES_TO_KEEP",
+                8_usize,
+            )?
+            .max(2),
             use_mock_data,
             production,
         })
@@ -142,11 +148,13 @@ mod tests {
             jwt_secret: DEVELOPMENT_JWT_SECRET.to_string(),
             request_body_limit_bytes: 1024 * 1024,
             routing_snapshot_dir: PathBuf::from("storage").join("processed").join("routing"),
+            routing_snapshot_files_to_keep: 8,
             use_mock_data: true,
             production: false,
         };
 
         assert!(config.use_mock_data);
         assert!(config.database_url.is_none());
+        assert_eq!(config.routing_snapshot_files_to_keep, 8);
     }
 }

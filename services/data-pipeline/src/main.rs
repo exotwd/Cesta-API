@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -42,6 +42,7 @@ const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
 const PID_SOURCE_PRIORITY: i32 = 10;
 const DEFAULT_RAW_RUNS_TO_KEEP: usize = 3;
 const DEFAULT_DB_IMPORT_RUNS_TO_KEEP: usize = 3;
+const DEFAULT_INCOMPLETE_RAW_RUN_MAX_AGE_HOURS: u64 = 24;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -1294,6 +1295,14 @@ fn db_import_runs_to_keep() -> usize {
         .max(1)
 }
 
+fn incomplete_raw_run_max_age() -> Duration {
+    let hours = std::env::var("RAW_INCOMPLETE_RUN_MAX_AGE_HOURS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_INCOMPLETE_RAW_RUN_MAX_AGE_HOURS);
+    Duration::from_secs(hours.saturating_mul(60 * 60))
+}
+
 async fn prune_raw_run_directories(
     storage_dir: &Path,
     source: &str,
@@ -1309,13 +1318,33 @@ async fn prune_raw_run_directories_with_limit(
     protected_run: &Path,
     runs_to_keep: usize,
 ) -> Result<()> {
+    prune_raw_run_directories_with_policy(
+        storage_dir,
+        source,
+        protected_run,
+        runs_to_keep,
+        incomplete_raw_run_max_age(),
+        SystemTime::now(),
+    )
+    .await
+}
+
+async fn prune_raw_run_directories_with_policy(
+    storage_dir: &Path,
+    source: &str,
+    protected_run: &Path,
+    runs_to_keep: usize,
+    incomplete_max_age: Duration,
+    now: SystemTime,
+) -> Result<()> {
     let root = storage_dir.join("raw").join(source).join("latest");
     let mut entries = match fs::read_dir(&root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let mut runs = Vec::new();
+    let mut complete_runs = Vec::new();
+    let mut stale_incomplete_runs = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await?.is_dir() {
             continue;
@@ -1324,25 +1353,54 @@ async fn prune_raw_run_directories_with_limit(
             continue;
         };
         if chrono::NaiveDateTime::parse_from_str(&name, "%Y%m%dT%H%M%SZ").is_ok() {
-            runs.push(entry.path());
+            let path = entry.path();
+            if raw_run_is_complete(source, &path) {
+                complete_runs.push(path);
+            } else if path != protected_run {
+                let modified = entry
+                    .metadata()
+                    .await?
+                    .modified()
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if now.duration_since(modified).unwrap_or_default() >= incomplete_max_age {
+                    stale_incomplete_runs.push(path);
+                }
+            }
         }
     }
-    runs.sort();
-    let mut remove_count = runs.len().saturating_sub(runs_to_keep.max(1));
-    for run in runs {
-        if remove_count == 0 {
-            break;
-        }
-        if run == protected_run {
-            continue;
-        }
+    complete_runs.sort();
+    let mut retained = complete_runs
+        .iter()
+        .rev()
+        .take(runs_to_keep.max(1))
+        .cloned()
+        .collect::<HashSet<_>>();
+    retained.insert(protected_run.to_path_buf());
+    let mut obsolete_runs = complete_runs
+        .into_iter()
+        .filter(|run| !retained.contains(run))
+        .collect::<Vec<_>>();
+    obsolete_runs.extend(stale_incomplete_runs);
+    for run in obsolete_runs {
         fs::remove_dir_all(&run)
             .await
             .with_context(|| format!("remove obsolete raw import run {}", run.display()))?;
-        remove_count -= 1;
         tracing::info!(source, path = %run.display(), "deleted obsolete raw import run");
     }
     Ok(())
+}
+
+fn raw_run_is_complete(source: &str, run: &Path) -> bool {
+    if !run.join("download-manifest.json").is_file() {
+        return false;
+    }
+    match source {
+        "pid" => run.join("PID_GTFS.zip").is_file(),
+        "ggu" => GGU_FILES
+            .iter()
+            .all(|(file_name, _, _)| run.join(file_name).is_file()),
+        _ => false,
+    }
 }
 
 async fn write_reuse_checked_manifest(
@@ -2859,7 +2917,12 @@ mod tests {
             "20260705T000000Z",
         ];
         for name in names {
-            fs::create_dir_all(root.join(name)).await.unwrap();
+            let run = root.join(name);
+            fs::create_dir_all(&run).await.unwrap();
+            fs::write(run.join("download-manifest.json"), b"[]")
+                .await
+                .unwrap();
+            fs::write(run.join("PID_GTFS.zip"), b"zip").await.unwrap();
         }
         fs::create_dir_all(root.join("manual-backup"))
             .await
@@ -2876,6 +2939,35 @@ mod tests {
         assert!(root.join("20260704T000000Z").exists());
         assert!(protected.exists());
         assert!(root.join("manual-backup").exists());
+        fs::remove_dir_all(storage).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_run_retention_removes_stale_incomplete_runs_but_not_active_or_manual_data() {
+        let storage =
+            std::env::temp_dir().join(format!("cesta-incomplete-retention-{}", Uuid::new_v4()));
+        let root = storage.join("raw").join("pid").join("latest");
+        let stale = root.join("20260701T000000Z");
+        let protected = root.join("20260702T000000Z");
+        let manual = root.join("manual-backup");
+        fs::create_dir_all(&stale).await.unwrap();
+        fs::create_dir_all(&protected).await.unwrap();
+        fs::create_dir_all(&manual).await.unwrap();
+
+        prune_raw_run_directories_with_policy(
+            &storage,
+            "pid",
+            &protected,
+            3,
+            Duration::ZERO,
+            SystemTime::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!stale.exists());
+        assert!(protected.exists());
+        assert!(manual.exists());
         fs::remove_dir_all(storage).await.unwrap();
     }
 }
