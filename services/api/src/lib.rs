@@ -8947,7 +8947,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(prune_raptor_snapshots(&directory, 2).await.unwrap(), 4);
+        assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 1);
+        assert_ne!(
+            directory
+                .join("raptor-v8-2026-06-01-import-old.json")
+                .exists(),
+            directory
+                .join("raptor-v8-2026-06-01-import-new.json")
+                .exists()
+        );
+        assert_eq!(prune_raptor_snapshots(&directory, 2).await.unwrap(), 3);
         let mut retained_snapshots = tokio::fs::read_dir(&directory).await.unwrap();
         let mut retained_count = 0;
         while let Some(entry) = retained_snapshots.next_entry().await.unwrap() {
@@ -8961,14 +8970,6 @@ mod tests {
         }
         assert_eq!(retained_count, 2);
         assert!(directory.join("manual-export.json").exists());
-        assert_ne!(
-            directory
-                .join("raptor-v8-2026-06-01-import-old.json")
-                .exists(),
-            directory
-                .join("raptor-v8-2026-06-01-import-new.json")
-                .exists()
-        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
