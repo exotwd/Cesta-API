@@ -1529,6 +1529,11 @@ async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0017_stop_deduplication.sql"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2091,8 +2096,8 @@ async fn export_dataset_to_postgres(
         })
     };
 
-    // These database-side repairs are deliberately conservative. Confirmed duplicate mappings
-    // are administrator decisions retained in manual_stop_matches and re-applied after imports.
+    // These database-side repairs are deliberately conservative. Exact cross-feed aliases may be
+    // confirmed automatically; reviewed nearby mappings are retained and re-applied after imports.
     let safe_repairs =
         sqlx::query_scalar::<_, serde_json::Value>("SELECT cesta_apply_safe_data_repairs()")
             .fetch_one(pool)

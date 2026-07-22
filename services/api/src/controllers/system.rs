@@ -79,7 +79,15 @@ pub(crate) async fn openapi() -> Json<Value> {
                     "400": {"description": "Invalid or reversed bounds"}
                 }
             }},
-            "/departures": {"get": {"summary": "Stop departures"}},
+            "/departures": {"get": {
+                "summary": "Stop departures",
+                "description": "Returns the nearest scheduled departures at or after the requested time. When time is omitted or invalid, the current Europe/Prague local time is used, including the applicable CET or CEST offset.",
+                "parameters": [
+                    {"name": "stopId", "in": "query", "required": true, "schema": {"type": "string"}},
+                    {"name": "time", "in": "query", "required": false, "description": "Optional departure time (HH:MM:SS or a date-time containing HH:MM:SS). Defaults to the current Europe/Prague local time.", "schema": {"type": "string"}},
+                    {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "default": 10}}
+                ]
+            }},
             "/journeys/search": {"post": {
                 "summary": "Search journeys",
                 "description": "Returns ranked journey candidates. City points expand to active physical stops. Each leg may include PID realtime delay, estimates, cancellation, vehicle position, source and freshness metadata.",
@@ -165,7 +173,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/admin/data-quality/repairs": {"get": {
                 "summary": "Preview safe repairs and review duplicate-stop candidates",
-                "description": "Returns counts for conservative automatic repairs, detailed same-name/same-coordinate stop groups and recent audited repair runs.",
+                "description": "Returns counts for conservative automatic repairs, exact-coordinate groups, nearby same-direction candidates derived from scheduled stop sequences, and recent audited repair runs.",
                 "parameters": [
                     {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25}},
                     {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "default": 0}}
@@ -173,7 +181,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/admin/data-quality/repairs/automatic": {"post": {
                 "summary": "Apply conservative automatic data repairs",
-                "description": "Rebuilds missing normalized stop names, assigns unique exact municipality matches and safely expires realtime rows whose validity ends before fetch time. Records an audit run.",
+                "description": "Rebuilds missing normalized stop names, assigns unique exact municipality matches, expires inconsistent realtime rows, and merges only exact cross-feed aliases with matching operational metadata and no same-trip conflict. Records an audit run.",
                 "requestBody": {"required": true, "content": {"application/json": {"schema": {
                     "type": "object", "required": ["confirmation"],
                     "properties": {"confirmation": {"const": "apply_safe_repairs"}},
@@ -182,7 +190,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/admin/data-quality/duplicates/merge": {"post": {
                 "summary": "Confirm and merge duplicate stop records",
-                "description": "Requires matching normalized names and coordinates rounded to five decimal places. Repoints dependent records, preserves original source IDs, deactivates duplicate aliases and stores mappings that are re-applied after imports.",
+                "description": "Exact-coordinate mode requires identical normalized names and coordinates. Nearby-same-direction mode accepts reviewed physical stops up to 120 metres apart only when public name, locality, type and measured travel direction agree. Both modes reject stops called by the same trip, preserve source IDs and persist mappings across imports.",
                 "requestBody": {"required": true, "content": {"application/json": {"schema": {
                     "type": "object",
                     "required": ["canonical_stop_id", "duplicate_stop_ids", "confirmation"],
@@ -190,7 +198,8 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "canonical_stop_id": {"type": "string", "minLength": 1},
                         "duplicate_stop_ids": {"type": "array", "minItems": 1, "maxItems": 25, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
                         "confirmation": {"const": "merge_duplicate_stops"},
-                        "note": {"type": ["string", "null"]}
+                        "note": {"type": ["string", "null"]},
+                        "strategy": {"type": "string", "enum": ["exact_coordinates", "nearby_same_direction"], "default": "exact_coordinates"}
                     },
                     "additionalProperties": false
                 }}}}

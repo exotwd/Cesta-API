@@ -936,6 +936,7 @@
 
   function renderDuplicateRepairs(repairs) {
     const groups = repairs.duplicate_groups || [];
+    const nearbyGroups = repairs.nearby_direction_groups || [];
     state.repairGroups = groups;
     state.repairOffset = Number(repairs.duplicate_offset ?? state.repairOffset);
     state.repairLimit = Number(repairs.duplicate_limit ?? state.repairLimit);
@@ -947,7 +948,7 @@
     $("#duplicate-repair-list").innerHTML = groups.map((group, groupIndex) => {
       const stops = Array.isArray(group.stops) ? group.stops : [];
       return `
-        <article class="duplicate-repair-group" data-group-index="${groupIndex}">
+        <article class="duplicate-repair-group" data-group-index="${groupIndex}" data-merge-strategy="exact_coordinates">
           <div class="duplicate-group-heading">
             <div>
               <strong>${escapeHtml(stops[0]?.name || group.normalized_name)}</strong>
@@ -985,7 +986,49 @@
         </article>`;
     }).join("") || '<div class="empty-state compact-empty">No duplicate groups need review.</div>';
 
-    $$("#duplicate-repair-list .duplicate-repair-group").forEach((card) => {
+    $("#nearby-direction-repair-list").innerHTML = nearbyGroups.map((group, groupIndex) => {
+      const stops = Array.isArray(group.stops) ? group.stops : [];
+      return `
+        <article class="duplicate-repair-group" data-group-index="nearby-${groupIndex}" data-merge-strategy="nearby_same_direction">
+          <div class="duplicate-group-heading">
+            <div>
+              <strong>${escapeHtml(stops[0]?.name || group.normalized_name)}</strong>
+              <small>${formatNumber(Math.round(Number(group.distance_m || 0)))} m apart &middot; ${formatNumber(group.stop_count)} records</small>
+            </div>
+            <span class="badge ${group.high_confidence_candidate ? "success" : "warning"}">${group.high_confidence_candidate ? "Same direction, very close" : "Direction-compatible"}</span>
+          </div>
+          <div class="duplicate-stop-options">
+            ${stops.map((stop) => {
+              const canonical = stop.id === group.suggested_canonical_stop_id;
+              const sourceIds = (stop.source_ids || []).map((source) => `${source.source_feed_id}:${source.original_source_id}`).join(", ");
+              return `
+                <div class="duplicate-stop-option">
+                  <label class="canonical-choice" title="Keep this stop as canonical">
+                    <input type="radio" name="nearby-canonical-${groupIndex}" value="${escapeHtml(stop.id)}" ${canonical ? "checked" : ""}>
+                    <span>Keep</span>
+                  </label>
+                  <label class="merge-choice" title="Merge this record into the canonical stop">
+                    <input type="checkbox" data-duplicate-id="${escapeHtml(stop.id)}" ${canonical ? "disabled" : "checked"}>
+                    <span>Merge</span>
+                  </label>
+                  <div class="duplicate-stop-copy">
+                    <strong>${escapeHtml(stop.name)}${stop.platform_code ? ` &middot; platform ${escapeHtml(stop.platform_code)}` : ""}</strong>
+                    <small>${escapeHtml(stop.id)}</small>
+                    <small>${escapeHtml(stop.location_type)} &middot; ${escapeHtml((stop.modes || []).join(", ") || "no mode")} &middot; ${formatNumber(stop.stop_times)} stop times</small>
+                    <small>Direction ${escapeHtml(stop.direction || "unknown")} from ${formatNumber(stop.direction_samples || 0)} schedule samples</small>
+                    <small>${escapeHtml(sourceIds || stop.source_feed_id || "No retained source ID")}</small>
+                  </div>
+                </div>`;
+            }).join("")}
+          </div>
+          <div class="duplicate-group-actions">
+            <span>The API rechecks name, locality, distance, direction and same-trip conflicts before merging.</span>
+            <button class="button merge-duplicate-group" type="button"><i data-lucide="git-merge"></i>Merge selected</button>
+          </div>
+        </article>`;
+    }).join("") || '<div class="empty-state compact-empty">No nearby same-direction candidates need review.</div>';
+
+    $$("#duplicate-repair-list .duplicate-repair-group, #nearby-direction-repair-list .duplicate-repair-group").forEach((card) => {
       const syncCanonical = () => {
         const canonical = card.querySelector('input[type="radio"]:checked')?.value;
         card.querySelectorAll("[data-duplicate-id]").forEach((checkbox) => {
@@ -1012,7 +1055,8 @@
               canonical_stop_id: canonical,
               duplicate_stop_ids: duplicateIds,
               confirmation: "merge_duplicate_stops",
-              note: "Confirmed in the administrator duplicate-stop review"
+              note: "Confirmed in the administrator duplicate-stop review",
+              strategy: card.dataset.mergeStrategy || "exact_coordinates"
             })
           });
           toast(`${duplicateIds.length} duplicate stop record(s) merged`);

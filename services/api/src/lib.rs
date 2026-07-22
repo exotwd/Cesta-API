@@ -628,6 +628,7 @@ struct AdminDuplicateStopMergeRequest {
     duplicate_stop_ids: Vec<String>,
     confirmation: String,
     note: Option<String>,
+    strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2086,6 +2087,7 @@ async fn admin_data_repairs(
             "database_available": false,
             "safe_repairs": [],
             "duplicate_groups": [],
+            "nearby_direction_groups": [],
             "recent_runs": []
         })));
     };
@@ -2106,13 +2108,44 @@ async fn admin_data_repairs(
             AND COALESCE(btrim(stop.municipality), '') <> ''
           GROUP BY stop.id
           HAVING count(*) = 1
+        ), exact_duplicate_groups AS (
+          SELECT array_agg(stop.id) AS stop_ids
+          FROM stops AS stop
+          WHERE stop.is_active = true
+            AND stop.source_feed_id IS NOT NULL
+            AND stop.lat IS NOT NULL
+            AND stop.lon IS NOT NULL
+            AND btrim(stop.name) <> ''
+            AND btrim(stop.normalized_name) <> ''
+            AND stop.location_type IN ('stop', 'station')
+          GROUP BY stop.normalized_name,
+                   round(stop.lat::numeric, 5), round(stop.lon::numeric, 5)
+          HAVING count(*) > 1
+             AND count(DISTINCT stop.source_feed_id) = count(*)
+             AND count(DISTINCT COALESCE(stop.platform_code, '')) = 1
+             AND count(DISTINCT stop.location_type) = 1
+             AND count(DISTINCT COALESCE(stop.parent_station_id, '')) = 1
+             AND count(DISTINCT array_to_string(stop.modes, ',')) = 1
+             AND count(DISTINCT COALESCE(stop.city_id, '')) = 1
+        ), safe_duplicate_groups AS (
+          SELECT duplicate_group.stop_ids
+          FROM exact_duplicate_groups AS duplicate_group
+          WHERE NOT EXISTS (
+            SELECT 1
+            FROM stop_times AS call
+            WHERE call.stop_id = ANY(duplicate_group.stop_ids)
+            GROUP BY call.trip_id
+            HAVING count(DISTINCT call.stop_id) > 1
+          )
         )
         SELECT
           (SELECT count(*) FROM stops
            WHERE btrim(name) <> '' AND btrim(normalized_name) = '') AS normalized_stop_names,
           (SELECT count(*) FROM exact_city_matches) AS exact_city_assignments,
           (SELECT count(*) FROM realtime_updates
-           WHERE valid_until IS NOT NULL AND valid_until < fetched_at) AS realtime_validity
+           WHERE valid_until IS NOT NULL AND valid_until < fetched_at) AS realtime_validity,
+          COALESCE((SELECT sum(cardinality(stop_ids) - 1)
+                    FROM safe_duplicate_groups), 0)::bigint AS automatic_stop_merges
         "#,
     )
     .fetch_one(pool)
@@ -2202,6 +2235,224 @@ async fn admin_data_repairs(
     .fetch_all(pool)
     .await
     .map_err(internal_error)?;
+    let nearby_direction_rows = sqlx::query(
+        r#"
+        WITH normalized_stops AS (
+          SELECT
+            stop.*,
+            trim(regexp_replace(
+              lower(unaccent(COALESCE(stop.municipality, ''))),
+              '[^a-z0-9]+', ' ', 'g'
+            )) AS municipality_key
+          FROM stops AS stop
+          WHERE stop.is_active = true
+            AND stop.geom IS NOT NULL
+            AND stop.lat IS NOT NULL
+            AND stop.lon IS NOT NULL
+            AND btrim(stop.name) <> ''
+            AND btrim(stop.normalized_name) <> ''
+            AND stop.location_type IN ('stop', 'station')
+        ), physical_stops AS (
+          SELECT
+            normalized_stop.*,
+            CASE
+              WHEN municipality_key <> ''
+               AND normalized_name LIKE municipality_key || ' %'
+                THEN substr(normalized_name, char_length(municipality_key) + 2)
+              ELSE normalized_name
+            END AS public_name,
+            COALESCE(city_id, NULLIF(municipality_key, ''), '') AS locality_key
+          FROM normalized_stops AS normalized_stop
+        ), base_pairs AS (
+          SELECT
+            left_stop.id AS left_stop_id,
+            right_stop.id AS right_stop_id,
+            left_stop.public_name,
+            ST_Distance(left_stop.geom, right_stop.geom) AS distance_m
+          FROM physical_stops AS left_stop
+          JOIN physical_stops AS right_stop
+            ON right_stop.id > left_stop.id
+           AND right_stop.public_name = left_stop.public_name
+           AND right_stop.locality_key = left_stop.locality_key
+           AND ST_DWithin(left_stop.geom, right_stop.geom, 120)
+          WHERE left_stop.public_name <> ''
+            AND NOT (
+              round(left_stop.lat::numeric, 5) = round(right_stop.lat::numeric, 5)
+              AND round(left_stop.lon::numeric, 5) = round(right_stop.lon::numeric, 5)
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM stop_times AS left_call
+              JOIN stop_times AS right_call
+                ON right_call.trip_id = left_call.trip_id
+              WHERE left_call.stop_id = left_stop.id
+                AND right_call.stop_id = right_stop.id
+            )
+          ORDER BY distance_m ASC, left_stop.id ASC, right_stop.id ASC
+          LIMIT 500
+        ), candidate_stop_ids AS (
+          SELECT left_stop_id AS stop_id FROM base_pairs
+          UNION
+          SELECT right_stop_id FROM base_pairs
+        ), direction_counts AS (
+          SELECT
+            call.stop_id,
+            mod(floor((degrees(ST_Azimuth(
+              origin.geom::geometry,
+              next_stop.geom::geometry
+            )) + 22.5) / 45.0)::integer, 8) AS direction_bucket,
+            count(*) AS sample_count
+          FROM stop_times AS call
+          JOIN candidate_stop_ids AS candidate ON candidate.stop_id = call.stop_id
+          JOIN stops AS origin ON origin.id = call.stop_id
+          JOIN LATERAL (
+            SELECT destination.geom
+            FROM stop_times AS next_call
+            JOIN stops AS destination ON destination.id = next_call.stop_id
+            WHERE next_call.trip_id = call.trip_id
+              AND next_call.stop_sequence > call.stop_sequence
+              AND destination.geom IS NOT NULL
+            ORDER BY next_call.stop_sequence ASC
+            LIMIT 1
+          ) AS next_stop ON true
+          WHERE origin.geom IS NOT NULL
+            AND ST_Distance(origin.geom, next_stop.geom) > 5
+          GROUP BY call.stop_id, direction_bucket
+        ), ranked_directions AS (
+          SELECT *, row_number() OVER (
+            PARTITION BY stop_id
+            ORDER BY sample_count DESC, direction_bucket ASC
+          ) AS rank
+          FROM direction_counts
+        ), dominant_directions AS (
+          SELECT stop_id, direction_bucket, sample_count
+          FROM ranked_directions
+          WHERE rank = 1
+        ), compatible_pairs AS (
+          SELECT
+            pair.*,
+            left_direction.direction_bucket AS left_direction_bucket,
+            left_direction.sample_count AS left_direction_samples,
+            right_direction.direction_bucket AS right_direction_bucket,
+            right_direction.sample_count AS right_direction_samples
+          FROM base_pairs AS pair
+          JOIN dominant_directions AS left_direction
+            ON left_direction.stop_id = pair.left_stop_id
+          JOIN dominant_directions AS right_direction
+            ON right_direction.stop_id = pair.right_stop_id
+          WHERE least(
+            abs(left_direction.direction_bucket - right_direction.direction_bucket),
+            8 - abs(left_direction.direction_bucket - right_direction.direction_bucket)
+          ) <= 1
+          ORDER BY pair.distance_m ASC, pair.public_name ASC,
+                   pair.left_stop_id ASC, pair.right_stop_id ASC
+          LIMIT 50
+        ), stop_usage AS (
+          SELECT call.stop_id, count(*) AS stop_time_count
+          FROM stop_times AS call
+          WHERE call.stop_id IN (
+            SELECT left_stop_id FROM compatible_pairs
+            UNION
+            SELECT right_stop_id FROM compatible_pairs
+          )
+          GROUP BY call.stop_id
+        )
+        SELECT
+          pair.public_name AS normalized_name,
+          (left_stop.lat + right_stop.lat) / 2.0 AS latitude,
+          (left_stop.lon + right_stop.lon) / 2.0 AS longitude,
+          pair.distance_m,
+          CASE
+            WHEN left_stop.source_priority < right_stop.source_priority THEN left_stop.id
+            WHEN right_stop.source_priority < left_stop.source_priority THEN right_stop.id
+            WHEN COALESCE(left_usage.stop_time_count, 0) >= COALESCE(right_usage.stop_time_count, 0)
+              THEN left_stop.id
+            ELSE right_stop.id
+          END AS suggested_canonical_stop_id,
+          pair.distance_m <= 30
+            AND pair.left_direction_bucket = pair.right_direction_bucket
+            AND left_stop.location_type = right_stop.location_type
+            AS high_confidence_candidate,
+          jsonb_build_array(
+            jsonb_build_object(
+              'id', left_stop.id,
+              'name', left_stop.name,
+              'municipality', left_stop.municipality,
+              'platform_code', left_stop.platform_code,
+              'location_type', left_stop.location_type,
+              'parent_station_id', left_stop.parent_station_id,
+              'modes', left_stop.modes,
+              'source_feed_id', left_stop.source_feed_id,
+              'source_priority', left_stop.source_priority,
+              'stop_times', COALESCE(left_usage.stop_time_count, 0),
+              'direction_bucket', pair.left_direction_bucket,
+              'direction', (ARRAY['N','NE','E','SE','S','SW','W','NW'])[pair.left_direction_bucket + 1],
+              'direction_samples', pair.left_direction_samples,
+              'source_ids', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'source_feed_id', source_id.source_feed_id,
+                  'original_source_id', source_id.original_source_id,
+                  'priority', source_id.priority
+                ) ORDER BY source_id.priority, source_id.source_feed_id)
+                FROM stop_source_ids AS source_id
+                WHERE source_id.stop_id = left_stop.id
+              ), '[]'::jsonb)
+            ),
+            jsonb_build_object(
+              'id', right_stop.id,
+              'name', right_stop.name,
+              'municipality', right_stop.municipality,
+              'platform_code', right_stop.platform_code,
+              'location_type', right_stop.location_type,
+              'parent_station_id', right_stop.parent_station_id,
+              'modes', right_stop.modes,
+              'source_feed_id', right_stop.source_feed_id,
+              'source_priority', right_stop.source_priority,
+              'stop_times', COALESCE(right_usage.stop_time_count, 0),
+              'direction_bucket', pair.right_direction_bucket,
+              'direction', (ARRAY['N','NE','E','SE','S','SW','W','NW'])[pair.right_direction_bucket + 1],
+              'direction_samples', pair.right_direction_samples,
+              'source_ids', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'source_feed_id', source_id.source_feed_id,
+                  'original_source_id', source_id.original_source_id,
+                  'priority', source_id.priority
+                ) ORDER BY source_id.priority, source_id.source_feed_id)
+                FROM stop_source_ids AS source_id
+                WHERE source_id.stop_id = right_stop.id
+              ), '[]'::jsonb)
+            )
+          ) AS stops
+        FROM compatible_pairs AS pair
+        JOIN physical_stops AS left_stop ON left_stop.id = pair.left_stop_id
+        JOIN physical_stops AS right_stop ON right_stop.id = pair.right_stop_id
+        LEFT JOIN stop_usage AS left_usage ON left_usage.stop_id = left_stop.id
+        LEFT JOIN stop_usage AS right_usage ON right_usage.stop_id = right_stop.id
+        ORDER BY pair.distance_m ASC, pair.public_name ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let nearby_direction_groups = combine_nearby_direction_pairs(
+        nearby_direction_rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "normalized_name": row.get::<String, _>("normalized_name"),
+                    "latitude": row.get::<f64, _>("latitude"),
+                    "longitude": row.get::<f64, _>("longitude"),
+                    "distance_m": row.get::<f64, _>("distance_m"),
+                    "stop_count": 2,
+                    "candidate_kind": "nearby_same_direction",
+                    "merge_strategy": "nearby_same_direction",
+                    "suggested_canonical_stop_id": row.get::<String, _>("suggested_canonical_stop_id"),
+                    "high_confidence_candidate": row.get::<bool, _>("high_confidence_candidate"),
+                    "stops": row.get::<Value, _>("stops")
+                })
+            })
+            .collect(),
+    );
     let recent_runs = sqlx::query_scalar::<_, Value>(
         r#"
         SELECT to_jsonb(run)
@@ -2236,6 +2487,12 @@ async fn admin_data_repairs(
                 "label": "Expire inconsistent realtime rows",
                 "count": repairable.get::<i64, _>("realtime_validity"),
                 "description": "Sets an impossible validity end to its fetch time, keeping the stale row out of live results."
+            },
+            {
+                "code": "merge_exact_cross_feed_stops",
+                "label": "Merge exact cross-feed stop aliases",
+                "count": repairable.get::<i64, _>("automatic_stop_merges"),
+                "description": "Automatically merges only different-feed records with the same name, coordinate, platform, type, modes and locality, unless one trip calls at both stops."
             }
         ],
         "duplicate_groups": duplicate_rows.into_iter().map(|row| json!({
@@ -2247,6 +2504,7 @@ async fn admin_data_repairs(
             "high_confidence_candidate": row.get::<bool, _>("high_confidence_candidate"),
             "stops": row.get::<Value, _>("stops")
         })).collect::<Vec<_>>(),
+        "nearby_direction_groups": nearby_direction_groups,
         "recent_runs": recent_runs
     })))
 }
@@ -2301,6 +2559,8 @@ async fn admin_apply_safe_data_repairs(
     .await
     .map_err(internal_error)?;
     transaction.commit().await.map_err(internal_error)?;
+    state.raptor_cache.write().await.clear();
+    state.endpoint_access_cache.write().await.clear();
 
     Ok(Json(json!({
         "database_available": true,
@@ -2316,6 +2576,7 @@ async fn admin_merge_duplicate_stops(
     Json(body): Json<AdminDuplicateStopMergeRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_admin(&state, &headers).await?;
+    let strategy = body.strategy.as_deref().unwrap_or("exact_coordinates");
     let canonical_stop_id = body.canonical_stop_id.trim();
     let duplicate_stop_ids = body
         .duplicate_stop_ids
@@ -2328,6 +2589,7 @@ async fn admin_merge_duplicate_stops(
         || duplicate_stop_ids.len() > 25
         || duplicate_stop_ids.contains(canonical_stop_id)
         || duplicate_stop_ids.iter().any(|id| id.is_empty())
+        || !matches!(strategy, "exact_coordinates" | "nearby_same_direction")
     {
         return Err(ApiError {
             code: "validation_error".to_string(),
@@ -2349,7 +2611,8 @@ async fn admin_merge_duplicate_stops(
         .map_err(internal_error)?;
     let selected_rows = sqlx::query(
         r#"
-        SELECT id, normalized_name,
+        SELECT id, name, normalized_name, municipality, city_id, location_type,
+               lat, lon,
                round(lat::numeric, 5)::double precision AS lat_key,
                round(lon::numeric, 5)::double precision AS lon_key,
                is_active
@@ -2379,20 +2642,156 @@ async fn admin_merge_duplicate_stops(
     let normalized_name = canonical.get::<String, _>("normalized_name");
     let latitude = canonical.get::<Option<f64>, _>("lat_key");
     let longitude = canonical.get::<Option<f64>, _>("lon_key");
-    if normalized_name.trim().is_empty()
-        || latitude.is_none()
-        || longitude.is_none()
-        || selected_rows.iter().any(|row| {
-            row.get::<String, _>("normalized_name") != normalized_name
-                || row.get::<Option<f64>, _>("lat_key") != latitude
-                || row.get::<Option<f64>, _>("lon_key") != longitude
-        })
-    {
+    match strategy {
+        "exact_coordinates" => {
+            if normalized_name.trim().is_empty()
+                || latitude.is_none()
+                || longitude.is_none()
+                || selected_rows.iter().any(|row| {
+                    row.get::<String, _>("normalized_name") != normalized_name
+                        || row.get::<Option<f64>, _>("lat_key") != latitude
+                        || row.get::<Option<f64>, _>("lon_key") != longitude
+                })
+            {
+                return Err(ApiError {
+                    code: "unsafe_stop_merge".to_string(),
+                    message: "Exact-coordinate merges require matching normalized names and coordinates rounded to five decimal places".to_string(),
+                });
+            }
+        }
+        "nearby_same_direction" => {
+            let canonical_name = canonical_stop_name_parts(
+                &canonical.get::<String, _>("name"),
+                canonical
+                    .get::<Option<String>, _>("municipality")
+                    .as_deref(),
+            );
+            let canonical_city = canonical.get::<Option<String>, _>("city_id");
+            let canonical_municipality = canonical
+                .get::<Option<String>, _>("municipality")
+                .as_deref()
+                .map(normalize_search_text);
+            let canonical_location_type = canonical.get::<String, _>("location_type");
+            let canonical_position = canonical
+                .get::<Option<f64>, _>("lat")
+                .zip(canonical.get::<Option<f64>, _>("lon"));
+            let incompatible_stop = selected_rows.iter().any(|row| {
+                let municipality = row.get::<Option<String>, _>("municipality");
+                let public_name =
+                    canonical_stop_name_parts(&row.get::<String, _>("name"), municipality.as_deref());
+                let municipality = municipality.as_deref().map(normalize_search_text);
+                let city = row.get::<Option<String>, _>("city_id");
+                let position = row
+                    .get::<Option<f64>, _>("lat")
+                    .zip(row.get::<Option<f64>, _>("lon"));
+                public_name.is_empty()
+                    || public_name != canonical_name
+                    || row.get::<String, _>("location_type") != canonical_location_type
+                    || matches!((&canonical_city, &city), (Some(left), Some(right)) if left != right)
+                    || matches!((&canonical_municipality, &municipality), (Some(left), Some(right)) if left != right)
+                    || !matches!((canonical_position, position), (Some((left_lat, left_lon)), Some((right_lat, right_lon))) if haversine_m(left_lat, left_lon, right_lat, right_lon) <= 120.0)
+            });
+            if incompatible_stop {
+                return Err(ApiError {
+                    code: "unsafe_stop_merge".to_string(),
+                    message: "Nearby-direction merges require the same public name, locality and stop type within 120 metres".to_string(),
+                });
+            }
+
+            let direction_rows = sqlx::query(
+                r#"
+                WITH direction_counts AS (
+                  SELECT
+                    call.stop_id,
+                    mod(floor((degrees(ST_Azimuth(
+                      origin.geom::geometry,
+                      next_stop.geom::geometry
+                    )) + 22.5) / 45.0)::integer, 8) AS direction_bucket,
+                    count(*) AS sample_count
+                  FROM stop_times AS call
+                  JOIN stops AS origin ON origin.id = call.stop_id
+                  JOIN LATERAL (
+                    SELECT destination.geom
+                    FROM stop_times AS next_call
+                    JOIN stops AS destination ON destination.id = next_call.stop_id
+                    WHERE next_call.trip_id = call.trip_id
+                      AND next_call.stop_sequence > call.stop_sequence
+                      AND destination.geom IS NOT NULL
+                    ORDER BY next_call.stop_sequence ASC
+                    LIMIT 1
+                  ) AS next_stop ON true
+                  WHERE call.stop_id = ANY($1)
+                    AND origin.geom IS NOT NULL
+                    AND ST_Distance(origin.geom, next_stop.geom) > 5
+                  GROUP BY call.stop_id, direction_bucket
+                ), ranked AS (
+                  SELECT *, row_number() OVER (
+                    PARTITION BY stop_id
+                    ORDER BY sample_count DESC, direction_bucket ASC
+                  ) AS rank
+                  FROM direction_counts
+                )
+                SELECT selected_stop_id AS stop_id, ranked.direction_bucket
+                FROM unnest($1::text[]) AS selected_stop_id
+                LEFT JOIN ranked
+                  ON ranked.stop_id = selected_stop_id AND ranked.rank = 1
+                "#,
+            )
+            .bind(&selected_ids)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+            let directions = direction_rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("stop_id"),
+                        row.get::<Option<i32>, _>("direction_bucket"),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let canonical_direction = directions.get(canonical_stop_id).copied().flatten();
+            if canonical_direction.is_none()
+                || selected_ids.iter().any(|id| {
+                    !directions
+                        .get(id)
+                        .copied()
+                        .flatten()
+                        .zip(canonical_direction)
+                        .is_some_and(|(candidate, canonical)| {
+                            direction_buckets_compatible(candidate, canonical)
+                        })
+                })
+            {
+                return Err(ApiError {
+                    code: "unsafe_stop_merge".to_string(),
+                    message: "Every nearby stop must have a compatible measured travel direction"
+                        .to_string(),
+                });
+            }
+        }
+        _ => unreachable!("merge strategy was validated"),
+    }
+    let same_trip_conflict: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1
+          FROM stop_times
+          WHERE stop_id = ANY($1)
+          GROUP BY trip_id
+          HAVING count(DISTINCT stop_id) > 1
+        )
+        "#,
+    )
+    .bind(&selected_ids)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    if same_trip_conflict {
         return Err(ApiError {
             code: "unsafe_stop_merge".to_string(),
-            message:
-                "Stops may be merged here only when normalized name and rounded coordinates match"
-                    .to_string(),
+            message: "Stops used by the same trip cannot be merged because they are distinct calls"
+                .to_string(),
         });
     }
     let conflicting_mapping: bool = sqlx::query_scalar(
@@ -2458,6 +2857,7 @@ async fn admin_merge_duplicate_stops(
     let repair_summary = json!({
         "canonical_stop_id": canonical_stop_id,
         "duplicate_stop_ids": duplicate_stop_ids,
+        "strategy": strategy,
         "merge_result": merge_summary
     });
     sqlx::query(
@@ -7065,6 +7465,9 @@ async fn search_stops_db(
                    modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
+              AND btrim(name) <> ''
+              AND btrim(normalized_name) <> ''
+              AND location_type IN ('stop', 'station')
             ORDER BY source_priority ASC, name ASC, platform_code ASC NULLS FIRST, id ASC
             LIMIT $1
             "#,
@@ -7090,6 +7493,9 @@ async fn search_stops_db(
                modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
+          AND btrim(name) <> ''
+          AND btrim(normalized_name) <> ''
+          AND location_type IN ('stop', 'station')
           AND (
             $1 = ''
             OR id = $4
@@ -7204,6 +7610,9 @@ async fn nearby_stops_db(
                modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
+          AND btrim(name) <> ''
+          AND btrim(normalized_name) <> ''
+          AND location_type IN ('stop', 'station')
           AND geom IS NOT NULL
           AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $3)
         ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
@@ -7232,6 +7641,9 @@ async fn stops_in_bounds_db(
                modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
+          AND btrim(name) <> ''
+          AND btrim(normalized_name) <> ''
+          AND location_type IN ('stop', 'station')
           AND geom IS NOT NULL
           AND geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)::geography
           AND ST_Covers(ST_MakeEnvelope($1, $2, $3, $4, 4326), geom::geometry)
@@ -7695,6 +8107,16 @@ fn parse_query_time_seconds(value: &str) -> Option<u32> {
         return transit_model::parse_gtfs_time(time);
     }
     transit_model::parse_gtfs_time(value)
+}
+
+fn current_prague_time_seconds() -> u32 {
+    prague_time_seconds_at(Utc::now())
+}
+
+fn prague_time_seconds_at(now: DateTime<Utc>) -> u32 {
+    now.with_timezone(&chrono_tz::Europe::Prague)
+        .time()
+        .num_seconds_from_midnight()
 }
 
 fn mock_status(use_mock_data: bool) -> Value {
@@ -8235,6 +8657,90 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * earth_radius_m * a.sqrt().asin()
 }
 
+fn direction_buckets_compatible(left: i32, right: i32) -> bool {
+    let difference = (left - right).abs();
+    difference.min(8 - difference) <= 1
+}
+
+fn combine_nearby_direction_pairs(pairs: Vec<Value>) -> Vec<Value> {
+    let mut groups: Vec<Value> = Vec::new();
+    for pair in pairs {
+        let canonical_id = pair["suggested_canonical_stop_id"]
+            .as_str()
+            .unwrap_or_default();
+        let normalized_name = pair["normalized_name"].as_str().unwrap_or_default();
+        let existing = groups.iter_mut().find(|group| {
+            group["suggested_canonical_stop_id"].as_str() == Some(canonical_id)
+                && group["normalized_name"].as_str() == Some(normalized_name)
+        });
+        let Some(group) = existing else {
+            groups.push(pair);
+            continue;
+        };
+
+        let stop_count = {
+            let incoming_stops = pair["stops"].as_array().cloned().unwrap_or_default();
+            let group_stops = group["stops"]
+                .as_array_mut()
+                .expect("candidate stops array");
+            for stop in incoming_stops {
+                let stop_id = stop["id"].as_str();
+                if !group_stops
+                    .iter()
+                    .any(|existing| existing["id"].as_str() == stop_id)
+                {
+                    group_stops.push(stop);
+                }
+            }
+            group_stops.len()
+        };
+        group["stop_count"] = json!(stop_count);
+        group["distance_m"] = json!(
+            group["distance_m"]
+                .as_f64()
+                .unwrap_or_default()
+                .max(pair["distance_m"].as_f64().unwrap_or_default())
+        );
+        group["high_confidence_candidate"] = json!(
+            group["high_confidence_candidate"]
+                .as_bool()
+                .unwrap_or(false)
+                && pair["high_confidence_candidate"].as_bool().unwrap_or(false)
+        );
+    }
+
+    groups.sort_by(|left, right| {
+        right["stop_count"]
+            .as_u64()
+            .cmp(&left["stop_count"].as_u64())
+            .then_with(|| {
+                left["normalized_name"]
+                    .as_str()
+                    .cmp(&right["normalized_name"].as_str())
+            })
+    });
+    let mut retained_stop_sets: Vec<HashSet<String>> = Vec::new();
+    groups
+        .into_iter()
+        .filter(|group| {
+            let stop_ids = group["stops"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|stop| stop["id"].as_str().map(str::to_string))
+                .collect::<HashSet<_>>();
+            if retained_stop_sets
+                .iter()
+                .any(|retained| stop_ids.is_subset(retained))
+            {
+                return false;
+            }
+            retained_stop_sets.push(stop_ids);
+            true
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -8376,6 +8882,11 @@ mod tests {
         assert!(payload["paths"]["/admin/data-quality/repairs"]["get"].is_object());
         assert!(payload["paths"]["/admin/data-quality/repairs/automatic"]["post"].is_object());
         assert!(payload["paths"]["/admin/data-quality/duplicates/merge"]["post"].is_object());
+        assert_eq!(
+            payload["paths"]["/admin/data-quality/duplicates/merge"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["properties"]["strategy"]["enum"],
+            json!(["exact_coordinates", "nearby_same_direction"])
+        );
         assert!(payload["components"]["schemas"]["RouteSearchDiagnostics"].is_object());
     }
 
@@ -8571,6 +9082,7 @@ mod tests {
         assert!(html.contains("Routing algorithm"));
         assert!(html.contains("Safe automatic repairs"));
         assert!(html.contains("Duplicate-stop review"));
+        assert!(html.contains("Nearby stops in the same direction"));
     }
 
     #[tokio::test]
@@ -8806,6 +9318,63 @@ mod tests {
         let suggestions = ranked_stop_suggestions([&prague, &brno].into_iter(), "namesti", 10);
 
         assert_eq!(suggestions.len(), 2);
+    }
+
+    #[test]
+    fn exact_stop_search_does_not_fill_results_with_unrelated_name_fragments() {
+        let exact = fixture_stop(
+            "pid-mustek",
+            "Můstek",
+            50.0839,
+            14.4233,
+            TransportMode::Metro,
+        );
+        let unrelated = fixture_stop(
+            "regional-lyzarsky-mustek",
+            "Nýdek,Gora,lyžařský můstek",
+            49.6560,
+            18.7560,
+            TransportMode::Bus,
+        );
+
+        let suggestions = ranked_stop_suggestions([&exact, &unrelated].into_iter(), "mustek", 10);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id, "pid-mustek");
+    }
+
+    #[test]
+    fn direction_bucket_matching_handles_north_wraparound() {
+        assert!(direction_buckets_compatible(0, 0));
+        assert!(direction_buckets_compatible(0, 1));
+        assert!(direction_buckets_compatible(0, 7));
+        assert!(!direction_buckets_compatible(0, 2));
+        assert!(!direction_buckets_compatible(1, 7));
+        assert!(!direction_buckets_compatible(0, 4));
+    }
+
+    #[test]
+    fn nearby_direction_pairs_are_combined_for_one_canonical_stop() {
+        let pair = |canonical: &str, left: &str, right: &str| {
+            json!({
+                "normalized_name": "mustek",
+                "suggested_canonical_stop_id": canonical,
+                "stop_count": 2,
+                "distance_m": 15.0,
+                "high_confidence_candidate": true,
+                "stops": [{"id": left}, {"id": right}]
+            })
+        };
+
+        let groups = combine_nearby_direction_pairs(vec![
+            pair("a", "a", "b"),
+            pair("a", "a", "c"),
+            pair("b", "b", "c"),
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["suggested_canonical_stop_id"], "a");
+        assert_eq!(groups[0]["stop_count"], 3);
     }
 
     #[test]
@@ -9618,6 +10187,19 @@ mod tests {
             parse_journey_service_date("2026-07-18T22:15:00Z").unwrap(),
             chrono::NaiveDate::from_ymd_opt(2026, 7, 19).unwrap()
         );
+    }
+
+    #[test]
+    fn default_departure_time_uses_prague_local_time() {
+        let summer = DateTime::parse_from_rfc3339("2026-07-22T10:15:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let winter = DateTime::parse_from_rfc3339("2026-01-22T10:15:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(prague_time_seconds_at(summer), 12 * 3600 + 15 * 60 + 30);
+        assert_eq!(prague_time_seconds_at(winter), 11 * 3600 + 15 * 60 + 30);
     }
 
     #[test]

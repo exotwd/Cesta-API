@@ -167,9 +167,16 @@ pub(crate) fn ranked_stop_suggestions<'a>(
                 .then_with(|| left_index.cmp(right_index))
         },
     );
+    let score_floor = scored_stops
+        .first()
+        .and_then(|(score, _, _)| (*score >= 10_000).then_some(9_000));
 
     let mut suggestions: Vec<Stop> = Vec::new();
-    for stop in scored_stops.into_iter().map(|(_, _, stop)| stop) {
+    for stop in scored_stops
+        .into_iter()
+        .filter(|(score, _, _)| score_floor.is_none_or(|floor| *score >= floor))
+        .map(|(_, _, stop)| stop)
+    {
         if suggestions
             .iter()
             .any(|existing| stops_are_same_suggestion(existing, &stop))
@@ -322,12 +329,12 @@ pub(crate) async fn departures(
     Query(query): Query<DeparturesQuery>,
 ) -> Json<Value> {
     let limit = query.limit.unwrap_or(10);
+    let earliest = query
+        .time
+        .as_deref()
+        .and_then(parse_query_time_seconds)
+        .unwrap_or_else(current_prague_time_seconds);
     if let Some(pool) = &state.db {
-        let earliest = query
-            .time
-            .as_deref()
-            .and_then(parse_query_time_seconds)
-            .unwrap_or(0);
         return match departures_db(pool, &query.stop_id, earliest, limit).await {
             Ok(departures) => Json(json!({
                 "stop_id": query.stop_id,
@@ -349,7 +356,16 @@ pub(crate) async fn departures(
 
     Json(json!({
         "stop_id": query.stop_id,
-        "departures": fixture_departures().into_iter().take(limit).collect::<Vec<_>>(),
+        "departures": fixture_departures()
+            .into_iter()
+            .filter(|departure| {
+                departure["scheduled_departure"]
+                    .as_str()
+                    .and_then(parse_query_time_seconds)
+                    .is_some_and(|departure| departure >= earliest)
+            })
+            .take(limit)
+            .collect::<Vec<_>>(),
         "data_status": {
             "schedule": if state.use_mock_data { "mock" } else { "current" },
             "realtime": "unavailable",
