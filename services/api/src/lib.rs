@@ -9083,6 +9083,7 @@ mod tests {
         assert!(html.contains("Safe automatic repairs"));
         assert!(html.contains("Duplicate-stop review"));
         assert!(html.contains("Nearby stops in the same direction"));
+        assert!(html.contains("merge-all-nearby-matches"));
     }
 
     #[tokio::test]

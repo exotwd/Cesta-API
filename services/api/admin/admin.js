@@ -25,7 +25,8 @@
     routingRefreshTimer: null,
     repairOffset: 0,
     repairLimit: 25,
-    duplicateGroupTotal: 0
+    duplicateGroupTotal: 0,
+    nearbyRepairGroups: []
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -938,6 +939,11 @@
     const groups = repairs.duplicate_groups || [];
     const nearbyGroups = repairs.nearby_direction_groups || [];
     state.repairGroups = groups;
+    state.nearbyRepairGroups = nearbyGroups;
+    const safeNearbyCount = nearbyGroups.filter((group) => group.high_confidence_candidate).length;
+    const mergeAllButton = $("#merge-all-nearby-matches");
+    mergeAllButton.disabled = !safeNearbyCount;
+    mergeAllButton.innerHTML = `<i data-lucide="combine"></i>Merge all safe matches${safeNearbyCount ? ` (${formatNumber(safeNearbyCount)})` : ""}`;
     state.repairOffset = Number(repairs.duplicate_offset ?? state.repairOffset);
     state.repairLimit = Number(repairs.duplicate_limit ?? state.repairLimit);
     const first = groups.length ? state.repairOffset + 1 : 0;
@@ -1084,6 +1090,67 @@
     } catch (error) {
       toast(error.message, "error");
       button.disabled = false;
+    }
+  }
+
+  async function mergeAllNearbyMatches() {
+    const initialCount = state.nearbyRepairGroups.filter((group) => group.high_confidence_candidate).length;
+    if (!initialCount) return;
+    if (!window.confirm("Merge every high-confidence nearby same-direction group? The API will revalidate every group, preserve source IDs, and write a separate audit record for each merge.")) return;
+
+    const button = $("#merge-all-nearby-matches");
+    const failedGroups = new Set();
+    let mergedGroups = 0;
+    let mergedStops = 0;
+    let refreshed = false;
+    button.disabled = true;
+    button.innerHTML = '<i data-lucide="loader-circle"></i>Merging safe matches...';
+    button.classList.add("loading-button");
+    iconRefresh();
+    try {
+      for (let pass = 0; pass < 100; pass += 1) {
+        const repairs = await api("/admin/data-quality/repairs?limit=1&offset=0");
+        const groups = (repairs.nearby_direction_groups || []).filter((group) => group.high_confidence_candidate);
+        let progress = false;
+        for (const group of groups) {
+          const canonical = group.suggested_canonical_stop_id;
+          const duplicateIds = (group.stops || []).map((stop) => stop.id).filter((id) => id && id !== canonical);
+          const groupKey = `${canonical}|${duplicateIds.slice().sort().join("|")}`;
+          if (!canonical || !duplicateIds.length || failedGroups.has(groupKey)) continue;
+          try {
+            await api("/admin/data-quality/duplicates/merge", {
+              method: "POST",
+              body: JSON.stringify({
+                canonical_stop_id: canonical,
+                duplicate_stop_ids: duplicateIds,
+                confirmation: "merge_duplicate_stops",
+                note: "Bulk-confirmed high-confidence nearby same-direction match",
+                strategy: "nearby_same_direction"
+              })
+            });
+            mergedGroups += 1;
+            mergedStops += duplicateIds.length;
+            progress = true;
+          } catch (error) {
+            failedGroups.add(groupKey);
+          }
+        }
+        if (!progress) break;
+      }
+      const remainingRepairs = await api("/admin/data-quality/repairs?limit=1&offset=0");
+      const remainingCount = (remainingRepairs.nearby_direction_groups || []).filter((group) => group.high_confidence_candidate).length;
+      toast(`Bulk merge complete: ${formatNumber(mergedStops)} stop record(s) merged across ${formatNumber(mergedGroups)} group(s)${remainingCount ? `; ${formatNumber(remainingCount)} group(s) left for review` : ""}`, remainingCount && !mergedGroups ? "error" : "success");
+      await runDataValidation();
+      refreshed = true;
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      button.classList.remove("loading-button");
+      if (!refreshed && button.isConnected) {
+        button.disabled = false;
+        button.innerHTML = '<i data-lucide="combine"></i>Merge all safe matches';
+        iconRefresh();
+      }
     }
   }
 
@@ -1436,6 +1503,7 @@
     $$("[data-jump]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.jump)));
     $("#refresh-button").addEventListener("click", () => loadView(state.view));
     $("#apply-safe-repairs").addEventListener("click", applySafeRepairs);
+    $("#merge-all-nearby-matches").addEventListener("click", mergeAllNearbyMatches);
     $("#duplicate-previous").addEventListener("click", async () => {
       state.repairOffset = Math.max(0, state.repairOffset - state.repairLimit);
       try { await loadRepairPage(); } catch (error) { toast(error.message, "error"); }

@@ -45,7 +45,9 @@ The administrator data-quality page separates repairs into two safety levels:
 - Nearby same-direction candidates are proposed up to 120 metres apart. Direction is derived from
   the next scheduled stop across stop-time samples. Confirmation revalidates public name (with a
   municipality prefix removed), locality, physical stop type, distance and direction, and rejects
-  records that occur in the same trip.
+  records that occur in the same trip. The administrator can merge one group or bulk-merge every
+  high-confidence group (at most 30 metres apart with the same direction bucket); uncertain groups
+  remain available for individual review.
 
 Every repair is recorded in `data_repair_runs`. Automatically exact and administrator-confirmed
 duplicate mappings are stored as `manual_stop_matches` with `confidence = confirmed_duplicate`.
