@@ -153,6 +153,15 @@ fn admin_routes() -> Router<AppState> {
             "/admin/data-quality/validate",
             post(admin_run_data_validation),
         )
+        .route("/admin/data-quality/repairs", get(admin_data_repairs))
+        .route(
+            "/admin/data-quality/repairs/automatic",
+            post(admin_apply_safe_data_repairs),
+        )
+        .route(
+            "/admin/data-quality/duplicates/merge",
+            post(admin_merge_duplicate_stops),
+        )
         .route("/admin/unmatched-stops", get(admin_unmatched_stops))
         .route("/admin/manual-stop-match", post(admin_manual_stop_match))
         .route("/admin/source-feeds", get(admin_source_feeds))

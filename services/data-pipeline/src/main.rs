@@ -1524,6 +1524,11 @@ async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
     ))
     .execute(pool)
     .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0016_data_repairs.sql"
+    ))
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2086,6 +2091,32 @@ async fn export_dataset_to_postgres(
         })
     };
 
+    // These database-side repairs are deliberately conservative. Confirmed duplicate mappings
+    // are administrator decisions retained in manual_stop_matches and re-applied after imports.
+    let safe_repairs =
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT cesta_apply_safe_data_repairs()")
+            .fetch_one(pool)
+            .await?;
+    let confirmed_stop_merges =
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT cesta_apply_confirmed_stop_merges()")
+            .fetch_one(pool)
+            .await?;
+    let automatic_repair_summary = serde_json::json!({
+        "safe_repairs": safe_repairs,
+        "confirmed_stop_merges": confirmed_stop_merges,
+        "import_run_id": import_run_id,
+        "source_feed_id": feed_id
+    });
+    sqlx::query(
+        r#"
+        INSERT INTO data_repair_runs (repair_type, status, summary, finished_at)
+        VALUES ('automatic_after_import', 'completed', $1, now())
+        "#,
+    )
+    .bind(&automatic_repair_summary)
+    .execute(pool)
+    .await?;
+
     let mut summary = serde_json::json!({
         "exported": true,
         "import_run_id": import_run_id,
@@ -2106,6 +2137,7 @@ async fn export_dataset_to_postgres(
         "calendar_dates": inserted_calendar_dates,
         "skipped_stop_times": skipped_stop_times,
         "stale_cleanup": stale_cleanup,
+        "automatic_repairs": automatic_repair_summary,
         "validation_issues": dataset.validation_issues.len()
     });
 

@@ -32,4 +32,27 @@ Administrator validation findings use `source_file = admin_database_validation`.
 only findings with that marker, retains importer-generated findings, and stores aggregate counts
 plus sample record IDs in `raw_payload`.
 
+## Repair workflow
+
+The administrator data-quality page separates repairs into two safety levels:
+
+- Safe automatic repairs rebuild a missing normalized stop name only when a public name exists,
+  assign a stop to a city only when its municipality matches exactly one Czech city, and set an
+  impossible realtime `valid_until` value to the row's fetch time so it stays out of live results.
+- Duplicate-stop repairs always require administrator review. The UI compares platform, mode,
+  source identity and stop-time usage before allowing one canonical stop to be selected. The API
+  additionally requires matching normalized names and coordinates rounded to five decimal places.
+
+Every repair is recorded in `data_repair_runs`. Confirmed duplicate mappings are stored as
+`manual_stop_matches` with `confidence = confirmed_duplicate`. Applying a mapping moves stop times,
+transfers, realtime references and account stop references to the canonical record, retains all
+`stop_source_ids` with `suppressed_as_duplicate = true`, and deactivates rather than deletes the
+source stop. The data pipeline re-applies conservative repairs and confirmed mappings after each
+import, preventing a later source refresh from silently undoing an administrator decision.
+
+The repair system intentionally does not invent empty public stop names, synthesize calendars,
+rewrite invalid timetable times, delete orphan trips or routes, disable feeds, or automatically
+merge duplicate candidates. Those cases require correcting the upstream feed or an explicit,
+reviewed administrator decision.
+
 API responses must expose freshness, realtime availability and warnings rather than pretending uncertain data is certain.

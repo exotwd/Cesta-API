@@ -67,6 +67,7 @@ const DB_STAT_TABLES: &[&str] = &[
     "data_source_syncs",
     "route_geometries",
     "manual_stop_matches",
+    "data_repair_runs",
     "offline_packages",
 ];
 const MAX_JOURNEY_RESULTS: usize = 5;
@@ -249,6 +250,7 @@ const ADMIN_ENTITY_SPECS: &[AdminEntitySpec] = &[
     AdminEntitySpec { key: "data_source_syncs", table: "data_source_syncs", label: "Data source syncs", row_expression: "to_jsonb(t)", order_by: "last_attempt_at DESC, source_id ASC", map_available: false },
     AdminEntitySpec { key: "route_geometries", table: "route_geometries", label: "Route geometries", row_expression: "to_jsonb(t) - 'geom'", order_by: "source_route_id ASC, source_feature_id ASC", map_available: false },
     AdminEntitySpec { key: "manual_stop_matches", table: "manual_stop_matches", label: "Manual stop matches", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: true },
+    AdminEntitySpec { key: "data_repair_runs", table: "data_repair_runs", label: "Data repair runs", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
     AdminEntitySpec { key: "validation_issues", table: "validation_issues", label: "Validation issues", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id DESC", map_available: false },
     AdminEntitySpec { key: "offline_packages", table: "offline_packages", label: "Offline packages", row_expression: "to_jsonb(t)", order_by: "created_at DESC, id ASC", map_available: false },
     AdminEntitySpec { key: "ticket_products_mock", table: "ticket_products_mock", label: "Mock ticket products", row_expression: "to_jsonb(t)", order_by: "id ASC", map_available: false },
@@ -605,6 +607,27 @@ struct AdminSourceFeedPatch {
     mode_scope: Option<String>,
     priority: Option<i32>,
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminRepairQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminSafeRepairRequest {
+    confirmation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminDuplicateStopMergeRequest {
+    canonical_stop_id: String,
+    duplicate_stop_ids: Vec<String>,
+    confirmation: String,
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2049,6 +2072,417 @@ async fn admin_run_data_validation(
     Ok(Json(json!({
         "database_available": true,
         "validation": summary
+    })))
+}
+
+async fn admin_data_repairs(
+    Query(query): Query<AdminRepairQuery>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let Some(pool) = &state.db else {
+        return Ok(Json(json!({
+            "database_available": false,
+            "safe_repairs": [],
+            "duplicate_groups": [],
+            "recent_runs": []
+        })));
+    };
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let repairable = sqlx::query(
+        r#"
+        WITH exact_city_matches AS (
+          SELECT stop.id
+          FROM stops AS stop
+          JOIN cities AS city
+            ON city.country_code = 'CZ'
+           AND city.normalized_name = trim(
+             regexp_replace(lower(unaccent(stop.municipality)), '[^a-z0-9]+', ' ', 'g')
+           )
+          WHERE stop.is_active = true
+            AND stop.city_id IS NULL
+            AND COALESCE(btrim(stop.municipality), '') <> ''
+          GROUP BY stop.id
+          HAVING count(*) = 1
+        )
+        SELECT
+          (SELECT count(*) FROM stops
+           WHERE btrim(name) <> '' AND btrim(normalized_name) = '') AS normalized_stop_names,
+          (SELECT count(*) FROM exact_city_matches) AS exact_city_assignments,
+          (SELECT count(*) FROM realtime_updates
+           WHERE valid_until IS NOT NULL AND valid_until < fetched_at) AS realtime_validity
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(internal_error)?;
+    let duplicate_rows = sqlx::query(
+        r#"
+        WITH duplicate_keys AS (
+          SELECT
+            normalized_name,
+            round(lat::numeric, 5) AS lat_key,
+            round(lon::numeric, 5) AS lon_key,
+            count(*) AS stop_count
+          FROM stops
+          WHERE is_active = true
+            AND lat IS NOT NULL
+            AND lon IS NOT NULL
+            AND btrim(normalized_name) <> ''
+          GROUP BY normalized_name, round(lat::numeric, 5), round(lon::numeric, 5)
+          HAVING count(*) > 1
+          ORDER BY count(*) DESC, normalized_name ASC
+          LIMIT $1
+          OFFSET $2
+        ),
+        stop_details AS (
+          SELECT
+            stop.*,
+            (SELECT count(*) FROM stop_times WHERE stop_id = stop.id) AS stop_time_count,
+            COALESCE((
+              SELECT jsonb_agg(
+                jsonb_build_object(
+                  'source_feed_id', source_id.source_feed_id,
+                  'original_source_id', source_id.original_source_id,
+                  'priority', source_id.priority
+                ) ORDER BY source_id.priority, source_id.source_feed_id
+              )
+              FROM stop_source_ids AS source_id
+              WHERE source_id.stop_id = stop.id
+            ), '[]'::jsonb) AS retained_source_ids
+          FROM duplicate_keys AS key
+          JOIN stops AS stop
+            ON stop.is_active = true
+           AND stop.normalized_name = key.normalized_name
+           AND round(stop.lat::numeric, 5) = key.lat_key
+           AND round(stop.lon::numeric, 5) = key.lon_key
+        )
+        SELECT
+          key.normalized_name,
+          key.lat_key::double precision AS latitude,
+          key.lon_key::double precision AS longitude,
+          key.stop_count,
+          (array_agg(stop.id ORDER BY stop.source_priority ASC, stop.id ASC))[1]
+            AS suggested_canonical_stop_id,
+          count(DISTINCT stop.source_feed_id) = count(*)
+            AND count(DISTINCT COALESCE(stop.platform_code, '')) = 1
+            AND count(DISTINCT stop.location_type) = 1
+            AND count(DISTINCT COALESCE(stop.parent_station_id, '')) = 1
+            AND count(DISTINCT array_to_string(stop.modes, ',')) = 1
+            AND count(DISTINCT COALESCE(stop.city_id, '')) = 1
+            AS high_confidence_candidate,
+          jsonb_agg(
+            jsonb_build_object(
+              'id', stop.id,
+              'name', stop.name,
+              'municipality', stop.municipality,
+              'platform_code', stop.platform_code,
+              'location_type', stop.location_type,
+              'parent_station_id', stop.parent_station_id,
+              'modes', stop.modes,
+              'source_feed_id', stop.source_feed_id,
+              'source_priority', stop.source_priority,
+              'stop_times', stop.stop_time_count,
+              'source_ids', stop.retained_source_ids
+            ) ORDER BY stop.source_priority ASC, stop.id ASC
+          ) AS stops
+        FROM duplicate_keys AS key
+        JOIN stop_details AS stop
+          ON stop.normalized_name = key.normalized_name
+         AND round(stop.lat::numeric, 5) = key.lat_key
+         AND round(stop.lon::numeric, 5) = key.lon_key
+        GROUP BY key.normalized_name, key.lat_key, key.lon_key, key.stop_count
+        ORDER BY key.stop_count DESC, key.normalized_name ASC
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+    let recent_runs = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT to_jsonb(run)
+        FROM data_repair_runs AS run
+        ORDER BY created_at DESC, id DESC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "database_available": true,
+        "duplicate_offset": offset,
+        "duplicate_limit": limit,
+        "safe_repairs": [
+            {
+                "code": "normalize_stop_names",
+                "label": "Rebuild missing normalized stop names",
+                "count": repairable.get::<i64, _>("normalized_stop_names"),
+                "description": "Derives only the search form from an existing non-empty public name."
+            },
+            {
+                "code": "assign_exact_stop_cities",
+                "label": "Assign exact municipality matches",
+                "count": repairable.get::<i64, _>("exact_city_assignments"),
+                "description": "Assigns a city only when the stop municipality matches one Czech city exactly."
+            },
+            {
+                "code": "correct_realtime_validity",
+                "label": "Expire inconsistent realtime rows",
+                "count": repairable.get::<i64, _>("realtime_validity"),
+                "description": "Sets an impossible validity end to its fetch time, keeping the stale row out of live results."
+            }
+        ],
+        "duplicate_groups": duplicate_rows.into_iter().map(|row| json!({
+            "normalized_name": row.get::<String, _>("normalized_name"),
+            "latitude": row.get::<f64, _>("latitude"),
+            "longitude": row.get::<f64, _>("longitude"),
+            "stop_count": row.get::<i64, _>("stop_count"),
+            "suggested_canonical_stop_id": row.get::<String, _>("suggested_canonical_stop_id"),
+            "high_confidence_candidate": row.get::<bool, _>("high_confidence_candidate"),
+            "stops": row.get::<Value, _>("stops")
+        })).collect::<Vec<_>>(),
+        "recent_runs": recent_runs
+    })))
+}
+
+async fn admin_apply_safe_data_repairs(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<AdminSafeRepairRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    if body.confirmation != "apply_safe_repairs" {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "confirmation must be apply_safe_repairs".to_string(),
+        });
+    }
+    let pool = state.db.as_ref().ok_or_else(|| ApiError {
+        code: "database_unavailable".to_string(),
+        message: "Data repair requires a configured transport database".to_string(),
+    })?;
+    let repair_run_id = Uuid::new_v4();
+    let mut transaction = pool.begin().await.map_err(internal_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('cesta-data-repair'))")
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO data_repair_runs (id, repair_type, status, requested_by)
+        VALUES ($1, 'safe_automatic', 'running', $2)
+        "#,
+    )
+    .bind(repair_run_id)
+    .bind(user.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    let summary = sqlx::query_scalar::<_, Value>("SELECT cesta_apply_safe_data_repairs()")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal_error)?;
+    sqlx::query(
+        r#"
+        UPDATE data_repair_runs
+        SET status = 'completed', summary = $2, finished_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(repair_run_id)
+    .bind(&summary)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "database_available": true,
+        "repair_run_id": repair_run_id,
+        "status": "completed",
+        "summary": summary
+    })))
+}
+
+async fn admin_merge_duplicate_stops(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<AdminDuplicateStopMergeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    let canonical_stop_id = body.canonical_stop_id.trim();
+    let duplicate_stop_ids = body
+        .duplicate_stop_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .collect::<HashSet<_>>();
+    if body.confirmation != "merge_duplicate_stops"
+        || canonical_stop_id.is_empty()
+        || duplicate_stop_ids.is_empty()
+        || duplicate_stop_ids.len() > 25
+        || duplicate_stop_ids.contains(canonical_stop_id)
+        || duplicate_stop_ids.iter().any(|id| id.is_empty())
+    {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "Choose one canonical stop and between 1 and 25 distinct duplicate stops"
+                .to_string(),
+        });
+    }
+    let duplicate_stop_ids = duplicate_stop_ids.into_iter().collect::<Vec<_>>();
+    let pool = state.db.as_ref().ok_or_else(|| ApiError {
+        code: "database_unavailable".to_string(),
+        message: "Duplicate repair requires a configured transport database".to_string(),
+    })?;
+    let mut selected_ids = duplicate_stop_ids.clone();
+    selected_ids.push(canonical_stop_id.to_string());
+    let mut transaction = pool.begin().await.map_err(internal_error)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('cesta-data-repair'))")
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_error)?;
+    let selected_rows = sqlx::query(
+        r#"
+        SELECT id, normalized_name,
+               round(lat::numeric, 5)::double precision AS lat_key,
+               round(lon::numeric, 5)::double precision AS lon_key,
+               is_active
+        FROM stops
+        WHERE id = ANY($1)
+        FOR UPDATE
+        "#,
+    )
+    .bind(&selected_ids)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    if selected_rows.len() != selected_ids.len()
+        || selected_rows
+            .iter()
+            .any(|row| !row.get::<bool, _>("is_active"))
+    {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "Every selected stop must exist and still be active".to_string(),
+        });
+    }
+    let canonical = selected_rows
+        .iter()
+        .find(|row| row.get::<String, _>("id") == canonical_stop_id)
+        .expect("selected canonical stop exists");
+    let normalized_name = canonical.get::<String, _>("normalized_name");
+    let latitude = canonical.get::<Option<f64>, _>("lat_key");
+    let longitude = canonical.get::<Option<f64>, _>("lon_key");
+    if normalized_name.trim().is_empty()
+        || latitude.is_none()
+        || longitude.is_none()
+        || selected_rows.iter().any(|row| {
+            row.get::<String, _>("normalized_name") != normalized_name
+                || row.get::<Option<f64>, _>("lat_key") != latitude
+                || row.get::<Option<f64>, _>("lon_key") != longitude
+        })
+    {
+        return Err(ApiError {
+            code: "unsafe_stop_merge".to_string(),
+            message:
+                "Stops may be merged here only when normalized name and rounded coordinates match"
+                    .to_string(),
+        });
+    }
+    let conflicting_mapping: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+          SELECT 1
+          FROM manual_stop_matches
+          WHERE confidence = 'confirmed_duplicate'
+            AND (
+              stop_id = $1
+              OR target_stop_id = ANY($2)
+              OR (stop_id = ANY($2) AND target_stop_id IS DISTINCT FROM $1)
+            )
+        )
+        "#,
+    )
+    .bind(canonical_stop_id)
+    .bind(&duplicate_stop_ids)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    if conflicting_mapping {
+        return Err(ApiError {
+            code: "conflicting_stop_merge".to_string(),
+            message: "A selected stop already participates in a different confirmed merge"
+                .to_string(),
+        });
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+    sqlx::query(
+        r#"
+        INSERT INTO manual_stop_matches (
+          stop_id, target_stop_id, confidence, note, created_by
+        )
+        SELECT duplicate_stop_id, $1, 'confirmed_duplicate', $3, $4
+        FROM unnest($2::text[]) AS duplicate_stop_id
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM manual_stop_matches AS existing
+          WHERE existing.stop_id = duplicate_stop_id
+            AND existing.target_stop_id = $1
+            AND existing.confidence = 'confirmed_duplicate'
+        )
+        "#,
+    )
+    .bind(canonical_stop_id)
+    .bind(&duplicate_stop_ids)
+    .bind(note.unwrap_or("Confirmed from the duplicate-stop repair review"))
+    .bind(user.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    let merge_summary =
+        sqlx::query_scalar::<_, Value>("SELECT cesta_apply_confirmed_stop_merges()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal_error)?;
+    let repair_run_id = Uuid::new_v4();
+    let repair_summary = json!({
+        "canonical_stop_id": canonical_stop_id,
+        "duplicate_stop_ids": duplicate_stop_ids,
+        "merge_result": merge_summary
+    });
+    sqlx::query(
+        r#"
+        INSERT INTO data_repair_runs (
+          id, repair_type, status, requested_by, summary, finished_at
+        )
+        VALUES ($1, 'confirmed_duplicate_merge', 'completed', $2, $3, now())
+        "#,
+    )
+    .bind(repair_run_id)
+    .bind(user.id)
+    .bind(&repair_summary)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_error)?;
+    transaction.commit().await.map_err(internal_error)?;
+    state.raptor_cache.write().await.clear();
+    state.endpoint_access_cache.write().await.clear();
+
+    Ok(Json(json!({
+        "database_available": true,
+        "repair_run_id": repair_run_id,
+        "status": "completed",
+        "summary": repair_summary
     })))
 }
 
@@ -4245,6 +4679,7 @@ async fn routing_data_revision(pool: &PgPool) -> Result<RoutingDataRevision, sql
         r#"
         SELECT
           (SELECT max(finished_at) FROM import_runs WHERE status = 'success') AS latest_import,
+          (SELECT max(finished_at) FROM data_repair_runs WHERE status = 'completed') AS latest_repair,
           COALESCE((
             SELECT jsonb_agg(
               jsonb_build_array(feed.id, feed.enabled, latest.import_run_id)
@@ -4265,10 +4700,14 @@ async fn routing_data_revision(pool: &PgPool) -> Result<RoutingDataRevision, sql
     .fetch_one(pool)
     .await?;
     let latest_import = row.get::<Option<DateTime<Utc>>, _>("latest_import");
+    let latest_repair = row.get::<Option<DateTime<Utc>>, _>("latest_repair");
     let source_state = row.get::<Value, _>("source_state");
     let mut digest = Sha256::new();
     if let Some(latest_import) = latest_import {
         digest.update(latest_import.timestamp_millis().to_be_bytes());
+    }
+    if let Some(latest_repair) = latest_repair {
+        digest.update(latest_repair.timestamp_millis().to_be_bytes());
     }
     digest.update(source_state.to_string().as_bytes());
     let token = hex::encode(digest.finalize())[..16].to_string();
@@ -7934,6 +8373,9 @@ mod tests {
         );
         assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
         assert!(payload["paths"]["/admin/routing-algorithm"]["put"].is_object());
+        assert!(payload["paths"]["/admin/data-quality/repairs"]["get"].is_object());
+        assert!(payload["paths"]["/admin/data-quality/repairs/automatic"]["post"].is_object());
+        assert!(payload["paths"]["/admin/data-quality/duplicates/merge"]["post"].is_object());
         assert!(payload["components"]["schemas"]["RouteSearchDiagnostics"].is_object());
     }
 
@@ -8127,6 +8569,8 @@ mod tests {
         assert!(html.contains("Administrator sign in"));
         assert!(html.contains("/admin/assets/admin.js"));
         assert!(html.contains("Routing algorithm"));
+        assert!(html.contains("Safe automatic repairs"));
+        assert!(html.contains("Duplicate-stop review"));
     }
 
     #[tokio::test]
@@ -8176,6 +8620,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_repair_endpoints_require_admin_token() {
+        for (method, uri, body) in [
+            ("GET", "/admin/data-quality/repairs", Body::empty()),
+            (
+                "POST",
+                "/admin/data-quality/repairs/automatic",
+                Body::from(r#"{"confirmation":"apply_safe_repairs"}"#),
+            ),
+            (
+                "POST",
+                "/admin/data-quality/duplicates/merge",
+                Body::from(
+                    r#"{"canonical_stop_id":"a","duplicate_stop_ids":["b"],"confirmation":"merge_duplicate_stops"}"#,
+                ),
+            ),
+        ] {
+            let app = build_router(app_state().await.unwrap());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
     }
 
     #[tokio::test]

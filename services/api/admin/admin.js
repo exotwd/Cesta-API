@@ -22,7 +22,10 @@
     routingConfiguration: null,
     routingDefaults: null,
     routingDatabaseAvailable: false,
-    routingRefreshTimer: null
+    routingRefreshTimer: null,
+    repairOffset: 0,
+    repairLimit: 25,
+    duplicateGroupTotal: 0
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -46,6 +49,7 @@
     data_source_syncs: { group: "Realtime", description: "Health and freshness of automatic public-data synchronization.", columns: ["source_id", "data_kind", "status", "source_timestamp", "last_success_at", "records_written", "error_message"] },
     route_geometries: { group: "Network", description: "Current PID line geometries and validity dates from the official GeoJSON feed.", columns: ["source_route_id", "route_id", "validity", "source_feed_id", "fetched_at"] },
     manual_stop_matches: { group: "Quality", description: "Administrator-reviewed stop coordinate and identity matches.", columns: ["stop_id", "target_stop_id", "confidence", "note", "created_at", "id"] },
+    data_repair_runs: { group: "Quality", description: "Audited automatic and administrator-confirmed data repairs.", columns: ["repair_type", "status", "requested_by", "created_at", "finished_at", "id"] },
     validation_issues: { group: "Quality", description: "Importer and database validation findings.", columns: ["severity", "code", "message", "affected_entity", "source_feed_id", "created_at"] },
     offline_packages: { group: "Distribution", description: "Generated offline transport data packages.", columns: ["name_cs", "version", "valid_from", "valid_until", "size_bytes", "id"] },
     ticket_products_mock: { group: "Development", description: "Clearly separated mock ticket products used for development.", columns: ["name_cs", "provider", "mock", "id"] },
@@ -918,11 +922,146 @@
     }
   }
 
+  function renderSafeRepairs(repairs) {
+    const items = repairs.safe_repairs || [];
+    const total = items.reduce((sum, item) => sum + Number(item.count || 0), 0);
+    $("#apply-safe-repairs").disabled = !total;
+    $("#safe-repair-list").innerHTML = items.map((item) => `
+      <div class="safe-repair-item">
+        <span class="safe-repair-icon"><i data-lucide="${Number(item.count || 0) ? "wand-sparkles" : "check"}"></i></span>
+        <span><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(item.description)}</small></span>
+        <b>${formatNumber(item.count)} repairable</b>
+      </div>`).join("") || '<div class="empty-state compact-empty">No automatic repair catalogue was returned.</div>';
+  }
+
+  function renderDuplicateRepairs(repairs) {
+    const groups = repairs.duplicate_groups || [];
+    state.repairGroups = groups;
+    state.repairOffset = Number(repairs.duplicate_offset ?? state.repairOffset);
+    state.repairLimit = Number(repairs.duplicate_limit ?? state.repairLimit);
+    const first = groups.length ? state.repairOffset + 1 : 0;
+    const last = state.repairOffset + groups.length;
+    $("#duplicate-review-count").textContent = `${formatNumber(first)}–${formatNumber(last)} of ${formatNumber(state.duplicateGroupTotal)}`;
+    $("#duplicate-previous").disabled = state.repairOffset <= 0;
+    $("#duplicate-next").disabled = last >= state.duplicateGroupTotal || !groups.length;
+    $("#duplicate-repair-list").innerHTML = groups.map((group, groupIndex) => {
+      const stops = Array.isArray(group.stops) ? group.stops : [];
+      return `
+        <article class="duplicate-repair-group" data-group-index="${groupIndex}">
+          <div class="duplicate-group-heading">
+            <div>
+              <strong>${escapeHtml(stops[0]?.name || group.normalized_name)}</strong>
+              <small>${escapeHtml(group.latitude)}, ${escapeHtml(group.longitude)} · ${formatNumber(group.stop_count)} records</small>
+            </div>
+            <span class="badge ${group.high_confidence_candidate ? "success" : "warning"}">${group.high_confidence_candidate ? "Close match" : "Review carefully"}</span>
+          </div>
+          <div class="duplicate-stop-options">
+            ${stops.map((stop) => {
+              const canonical = stop.id === group.suggested_canonical_stop_id;
+              const sourceIds = (stop.source_ids || []).map((source) => `${source.source_feed_id}:${source.original_source_id}`).join(", ");
+              return `
+                <div class="duplicate-stop-option">
+                  <label class="canonical-choice" title="Keep this stop as canonical">
+                    <input type="radio" name="canonical-${groupIndex}" value="${escapeHtml(stop.id)}" ${canonical ? "checked" : ""}>
+                    <span>Keep</span>
+                  </label>
+                  <label class="merge-choice" title="Merge this record into the canonical stop">
+                    <input type="checkbox" data-duplicate-id="${escapeHtml(stop.id)}" ${canonical ? "disabled" : "checked"}>
+                    <span>Merge</span>
+                  </label>
+                  <div class="duplicate-stop-copy">
+                    <strong>${escapeHtml(stop.name)}${stop.platform_code ? ` · platform ${escapeHtml(stop.platform_code)}` : ""}</strong>
+                    <small>${escapeHtml(stop.id)}</small>
+                    <small>${escapeHtml(stop.location_type)} · ${escapeHtml((stop.modes || []).join(", ") || "no mode")} · ${formatNumber(stop.stop_times)} stop times</small>
+                    <small>${escapeHtml(sourceIds || stop.source_feed_id || "No retained source ID")}</small>
+                  </div>
+                </div>`;
+            }).join("")}
+          </div>
+          <div class="duplicate-group-actions">
+            <span>Merging moves references and source IDs, deactivates aliases, and persists across imports.</span>
+            <button class="button merge-duplicate-group" type="button"><i data-lucide="git-merge"></i>Merge selected</button>
+          </div>
+        </article>`;
+    }).join("") || '<div class="empty-state compact-empty">No duplicate groups need review.</div>';
+
+    $$("#duplicate-repair-list .duplicate-repair-group").forEach((card) => {
+      const syncCanonical = () => {
+        const canonical = card.querySelector('input[type="radio"]:checked')?.value;
+        card.querySelectorAll("[data-duplicate-id]").forEach((checkbox) => {
+          const isCanonical = checkbox.dataset.duplicateId === canonical;
+          checkbox.disabled = isCanonical;
+          checkbox.checked = !isCanonical;
+        });
+      };
+      card.querySelectorAll('input[type="radio"]').forEach((radio) => radio.addEventListener("change", syncCanonical));
+      card.querySelector(".merge-duplicate-group")?.addEventListener("click", async (event) => {
+        const canonical = card.querySelector('input[type="radio"]:checked')?.value;
+        const duplicateIds = [...card.querySelectorAll("[data-duplicate-id]:checked")].map((input) => input.dataset.duplicateId).filter((id) => id !== canonical);
+        if (!canonical || !duplicateIds.length) {
+          toast("Choose a canonical stop and at least one duplicate", "error");
+          return;
+        }
+        if (!window.confirm(`Merge ${duplicateIds.length} selected stop record(s) into ${canonical}? This changes routing references but keeps an audited, import-persistent source mapping.`)) return;
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          await api("/admin/data-quality/duplicates/merge", {
+            method: "POST",
+            body: JSON.stringify({
+              canonical_stop_id: canonical,
+              duplicate_stop_ids: duplicateIds,
+              confirmation: "merge_duplicate_stops",
+              note: "Confirmed in the administrator duplicate-stop review"
+            })
+          });
+          toast(`${duplicateIds.length} duplicate stop record(s) merged`);
+          await runDataValidation();
+        } catch (error) {
+          toast(error.message, "error");
+          button.disabled = false;
+        }
+      });
+    });
+    iconRefresh();
+  }
+
+  async function applySafeRepairs() {
+    if (!window.confirm("Apply only the listed conservative repairs and record an audit run? Imported source IDs and schedule records will not be deleted.")) return;
+    const button = $("#apply-safe-repairs");
+    button.disabled = true;
+    try {
+      const payload = await api("/admin/data-quality/repairs/automatic", {
+        method: "POST",
+        body: JSON.stringify({ confirmation: "apply_safe_repairs" })
+      });
+      toast(`Safe repair complete: ${formatNumber(payload.summary?.records_changed)} records changed`);
+      await runDataValidation();
+    } catch (error) {
+      toast(error.message, "error");
+      button.disabled = false;
+    }
+  }
+
+  async function loadRepairPage() {
+    const repairs = await api(`/admin/data-quality/repairs?limit=${state.repairLimit}&offset=${state.repairOffset}`);
+    renderSafeRepairs(repairs);
+    renderDuplicateRepairs(repairs);
+    renderTable("#repair-history", repairs.recent_runs || [], ["repair_type", "status", "requested_by", "created_at", "finished_at"], {
+      clickable: true,
+      title: "Repair run",
+      badgeColumns: ["status"],
+      empty: "No repairs have been recorded"
+    });
+  }
+
   async function loadQuality(currentValidation = null) {
-    const [quality, unresolved] = await Promise.all([
+    const [quality, unresolved, repairs] = await Promise.all([
       api("/admin/data-quality"),
-      api("/admin/unmatched-stops")
+      api("/admin/unmatched-stops"),
+      api(`/admin/data-quality/repairs?limit=${state.repairLimit}&offset=${state.repairOffset}`)
     ]);
+    state.duplicateGroupTotal = Number(quality.duplicate_stop_groups || 0);
     const severity = Object.fromEntries((quality.validation_issue_counts || []).map((item) => [item.severity, item.count]));
     $("#quality-metrics").innerHTML = [
       metric("Errors", severity.error || 0, "Validation errors"),
@@ -931,6 +1070,8 @@
       metric("Duplicate groups", quality.duplicate_stop_groups || 0, "Same-name stops at one coordinate")
     ].join("");
     renderValidationResults(currentValidation || quality.last_database_validation);
+    renderSafeRepairs(repairs);
+    renderDuplicateRepairs(repairs);
     renderTable("#quality-codes", quality.issue_codes || [], ["code", "severity", "count"], { badgeColumns: ["severity"] });
     renderTable("#quality-issues", quality.latest_issues || [], ["severity", "code", "message", "source_feed_id", "created_at"], {
       clickable: true,
@@ -941,6 +1082,12 @@
       clickable: true,
       title: "Unresolved stop",
       badgeColumns: ["coordinate_confidence"]
+    });
+    renderTable("#repair-history", repairs.recent_runs || [], ["repair_type", "status", "requested_by", "created_at", "finished_at"], {
+      clickable: true,
+      title: "Repair run",
+      badgeColumns: ["status"],
+      empty: "No repairs have been recorded"
     });
   }
 
@@ -1244,6 +1391,15 @@
     $$(".nav-item").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
     $$("[data-jump]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.jump)));
     $("#refresh-button").addEventListener("click", () => loadView(state.view));
+    $("#apply-safe-repairs").addEventListener("click", applySafeRepairs);
+    $("#duplicate-previous").addEventListener("click", async () => {
+      state.repairOffset = Math.max(0, state.repairOffset - state.repairLimit);
+      try { await loadRepairPage(); } catch (error) { toast(error.message, "error"); }
+    });
+    $("#duplicate-next").addEventListener("click", async () => {
+      state.repairOffset += state.repairLimit;
+      try { await loadRepairPage(); } catch (error) { toast(error.message, "error"); }
+    });
     $("#routing-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       if (!event.currentTarget.reportValidity()) return;

@@ -239,23 +239,45 @@
             </div>
             <button class="button primary" id="run-validation"><i data-lucide="shield-check"></i>Run validation</button>
           </div>
-          <div class="metric-grid quality-metrics" id="quality-metrics"></div>
-          <div class="dashboard-grid">
-            <section class="panel span-3">
+           <div class="metric-grid quality-metrics" id="quality-metrics"></div>
+           <div class="dashboard-grid">
+             <section class="panel span-3">
+               <div class="panel-header repair-panel-header">
+                 <div><h2>Safe automatic repairs</h2><p>Conservative fixes only; source identities and imported schedule meaning stay intact</p></div>
+                 <button class="button" id="apply-safe-repairs" type="button"><i data-lucide="wand-sparkles"></i>Apply safe repairs</button>
+               </div>
+               <div class="safe-repair-list" id="safe-repair-list"></div>
+             </section>
+             <section class="panel span-3">
               <div class="panel-header">
                 <div><h2>Validation checks</h2><p>Latest manual audit across transport data and source tracking</p></div>
                 <span class="badge" id="validation-summary-badge">Not run</span>
               </div>
-              <div class="validation-check-list" id="validation-checks"></div>
-            </section>
-            <section class="panel">
+               <div class="validation-check-list" id="validation-checks"></div>
+             </section>
+             <section class="panel span-3">
+               <div class="panel-header">
+                 <div><h2>Duplicate-stop review</h2><p>Choose the canonical record only after comparing platforms, modes, sources and scheduled usage</p></div>
+                 <div class="duplicate-review-nav">
+                   <button class="icon-button" id="duplicate-previous" type="button" title="Previous duplicate groups" aria-label="Previous duplicate groups"><i data-lucide="chevron-left"></i></button>
+                   <span class="badge" id="duplicate-review-count">0 shown</span>
+                   <button class="icon-button" id="duplicate-next" type="button" title="Next duplicate groups" aria-label="Next duplicate groups"><i data-lucide="chevron-right"></i></button>
+                 </div>
+               </div>
+               <div class="duplicate-repair-list" id="duplicate-repair-list"></div>
+             </section>
+             <section class="panel">
               <div class="panel-header"><div><h2>Issue categories</h2><p>Grouped validation findings</p></div></div>
               <div class="table-wrap compact" id="quality-codes"></div>
             </section>
-            <section class="panel span-2">
+             <section class="panel span-2">
               <div class="panel-header"><div><h2>Latest validation issues</h2><p>Newest pipeline findings</p></div></div>
-              <div class="table-wrap" id="quality-issues"></div>
-            </section>
+               <div class="table-wrap" id="quality-issues"></div>
+             </section>
+             <section class="panel span-3">
+               <div class="panel-header"><div><h2>Repair history</h2><p>Audited manual, automatic and post-import repair runs</p></div></div>
+               <div class="table-wrap" id="repair-history"></div>
+             </section>
             <section class="panel span-3">
               <div class="panel-header">
                 <div><h2>Unresolved stops</h2><p>Missing or unresolved coordinates</p></div>

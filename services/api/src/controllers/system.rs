@@ -163,6 +163,38 @@ pub(crate) async fn openapi() -> Json<Value> {
                 "summary": "Run administrator database validation",
                 "description": "Checks imported transport data for missing, invalid and disconnected records. Replaces only findings from the previous administrator validation run."
             }},
+            "/admin/data-quality/repairs": {"get": {
+                "summary": "Preview safe repairs and review duplicate-stop candidates",
+                "description": "Returns counts for conservative automatic repairs, detailed same-name/same-coordinate stop groups and recent audited repair runs.",
+                "parameters": [
+                    {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25}},
+                    {"name": "offset", "in": "query", "schema": {"type": "integer", "minimum": 0, "default": 0}}
+                ]
+            }},
+            "/admin/data-quality/repairs/automatic": {"post": {
+                "summary": "Apply conservative automatic data repairs",
+                "description": "Rebuilds missing normalized stop names, assigns unique exact municipality matches and safely expires realtime rows whose validity ends before fetch time. Records an audit run.",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                    "type": "object", "required": ["confirmation"],
+                    "properties": {"confirmation": {"const": "apply_safe_repairs"}},
+                    "additionalProperties": false
+                }}}}
+            }},
+            "/admin/data-quality/duplicates/merge": {"post": {
+                "summary": "Confirm and merge duplicate stop records",
+                "description": "Requires matching normalized names and coordinates rounded to five decimal places. Repoints dependent records, preserves original source IDs, deactivates duplicate aliases and stores mappings that are re-applied after imports.",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["canonical_stop_id", "duplicate_stop_ids", "confirmation"],
+                    "properties": {
+                        "canonical_stop_id": {"type": "string", "minLength": 1},
+                        "duplicate_stop_ids": {"type": "array", "minItems": 1, "maxItems": 25, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+                        "confirmation": {"const": "merge_duplicate_stops"},
+                        "note": {"type": ["string", "null"]}
+                    },
+                    "additionalProperties": false
+                }}}}
+            }},
             "/admin/unmatched-stops": {"get": {"summary": "List active stops with unresolved coordinates"}},
             "/admin/source-feeds": {"get": {"summary": "List configured source feeds"}},
             "/admin/source-feeds/{id}": {"patch": {"summary": "Update a source feed configuration"}},
