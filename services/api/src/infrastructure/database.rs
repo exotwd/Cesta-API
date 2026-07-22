@@ -159,6 +159,14 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0017_stop_deduplication",
         include_str!("../../../../infra/postgres/migrations/0017_stop_deduplication.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0018_automatic_directional_stop_merges",
+        include_str!(
+            "../../../../infra/postgres/migrations/0018_automatic_directional_stop_merges.sql"
+        ),
+    )
     .await
 }
 

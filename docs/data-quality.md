@@ -41,13 +41,16 @@ The administrator data-quality page separates repairs into two safety levels:
   impossible realtime `valid_until` value to the row's fetch time, and merge exact cross-feed stop
   aliases only when name, coordinate, platform, type, mode and locality agree. A group is excluded
   whenever one trip calls at more than one selected record.
+- Nearby stops are also merged automatically when they have the same public name (after removing a
+  municipality prefix), locality, physical stop type and dominant eight-way travel direction. One
+  selected canonical stop must be within 120 metres of every member, and no trip may call at two
+  records in the group.
 - Exact-coordinate duplicate repairs remain available for administrator review.
 - Nearby same-direction candidates are proposed up to 120 metres apart. Direction is derived from
   the next scheduled stop across stop-time samples. Confirmation revalidates public name (with a
   municipality prefix removed), locality, physical stop type, distance and direction, and rejects
-  records that occur in the same trip. The administrator can merge one group or bulk-merge every
-  high-confidence group (at most 30 metres apart with the same direction bucket); uncertain groups
-  remain available for individual review.
+  records that occur in the same trip. Candidates that do not meet every automatic condition remain
+  available for individual review.
 
 Every repair is recorded in `data_repair_runs`. Automatically exact and administrator-confirmed
 duplicate mappings are stored as `manual_stop_matches` with `confidence = confirmed_duplicate`.
@@ -58,9 +61,9 @@ source stop. The data pipeline re-applies conservative repairs and confirmed map
 import, preventing a later source refresh from silently undoing an administrator decision.
 
 The repair system intentionally does not invent empty public stop names, synthesize calendars,
-rewrite invalid timetable times, delete orphan trips or routes, disable feeds, or automatically
-merge nearby/same-feed candidates. Empty names and non-physical GTFS nodes are hidden from public
-stop search, nearby and map-bound responses until their source data is corrected. Uncertain merge
-cases require an explicit, reviewed administrator decision.
+rewrite invalid timetable times, delete orphan trips or routes, or disable feeds. Empty names and
+non-physical GTFS nodes are hidden from public stop search, nearby and map-bound responses until
+their source data is corrected. Directionless, conflicting or spatially ambiguous merge cases
+require an explicit, reviewed administrator decision.
 
 API responses must expose freshness, realtime availability and warnings rather than pretending uncertain data is certain.

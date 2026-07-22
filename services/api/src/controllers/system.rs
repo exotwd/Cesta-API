@@ -181,7 +181,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/admin/data-quality/repairs/automatic": {"post": {
                 "summary": "Apply conservative automatic data repairs",
-                "description": "Rebuilds missing normalized stop names, assigns unique exact municipality matches, expires inconsistent realtime rows, and merges only exact cross-feed aliases with matching operational metadata and no same-trip conflict. Records an audit run.",
+                "description": "Rebuilds missing normalized stop names, assigns unique exact municipality matches, expires inconsistent realtime rows, merges exact cross-feed aliases, and automatically flattens nearby same-name physical stops with the same locality, type and measured direction. Directional groups require one canonical stop within 120 metres of every member and no same-trip conflict. Records an audit run.",
                 "requestBody": {"required": true, "content": {"application/json": {"schema": {
                     "type": "object", "required": ["confirmation"],
                     "properties": {"confirmation": {"const": "apply_safe_repairs"}},

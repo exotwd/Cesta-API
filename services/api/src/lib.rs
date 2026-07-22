@@ -2373,6 +2373,9 @@ async fn admin_data_repairs(
             AND pair.left_direction_bucket = pair.right_direction_bucket
             AND left_stop.location_type = right_stop.location_type
             AS high_confidence_candidate,
+          pair.left_direction_bucket = pair.right_direction_bucket
+            AND left_stop.location_type = right_stop.location_type
+            AS automatic_candidate,
           jsonb_build_array(
             jsonb_build_object(
               'id', left_stop.id,
@@ -2448,11 +2451,17 @@ async fn admin_data_repairs(
                     "merge_strategy": "nearby_same_direction",
                     "suggested_canonical_stop_id": row.get::<String, _>("suggested_canonical_stop_id"),
                     "high_confidence_candidate": row.get::<bool, _>("high_confidence_candidate"),
+                    "automatic_candidate": row.get::<bool, _>("automatic_candidate"),
                     "stops": row.get::<Value, _>("stops")
                 })
             })
             .collect(),
     );
+    let automatic_nearby_stop_merges = nearby_direction_groups
+        .iter()
+        .filter(|group| group["automatic_candidate"].as_bool().unwrap_or(false))
+        .map(|group| group["stop_count"].as_i64().unwrap_or(1).saturating_sub(1))
+        .sum::<i64>();
     let recent_runs = sqlx::query_scalar::<_, Value>(
         r#"
         SELECT to_jsonb(run)
@@ -2493,6 +2502,12 @@ async fn admin_data_repairs(
                 "label": "Merge exact cross-feed stop aliases",
                 "count": repairable.get::<i64, _>("automatic_stop_merges"),
                 "description": "Automatically merges only different-feed records with the same name, coordinate, platform, type, modes and locality, unless one trip calls at both stops."
+            },
+            {
+                "code": "merge_nearby_same_direction_stops",
+                "label": "Merge nearby stops in the same direction",
+                "count": automatic_nearby_stop_merges,
+                "description": "Automatically merges same-name physical stops in one locality and direction when every record is within 120 metres of the selected canonical stop and no trip calls at two records."
             }
         ],
         "duplicate_groups": duplicate_rows.into_iter().map(|row| json!({
@@ -8707,6 +8722,10 @@ fn combine_nearby_direction_pairs(pairs: Vec<Value>) -> Vec<Value> {
                 .unwrap_or(false)
                 && pair["high_confidence_candidate"].as_bool().unwrap_or(false)
         );
+        group["automatic_candidate"] = json!(
+            group["automatic_candidate"].as_bool().unwrap_or(false)
+                && pair["automatic_candidate"].as_bool().unwrap_or(false)
+        );
     }
 
     groups.sort_by(|left, right| {
@@ -9083,7 +9102,7 @@ mod tests {
         assert!(html.contains("Safe automatic repairs"));
         assert!(html.contains("Duplicate-stop review"));
         assert!(html.contains("Nearby stops in the same direction"));
-        assert!(html.contains("merge-all-nearby-matches"));
+        assert!(html.contains("Automatically repaired when safe"));
     }
 
     #[tokio::test]
@@ -9363,6 +9382,7 @@ mod tests {
                 "stop_count": 2,
                 "distance_m": 15.0,
                 "high_confidence_candidate": true,
+                "automatic_candidate": true,
                 "stops": [{"id": left}, {"id": right}]
             })
         };
@@ -9376,6 +9396,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["suggested_canonical_stop_id"], "a");
         assert_eq!(groups[0]["stop_count"], 3);
+        assert_eq!(groups[0]["automatic_candidate"], true);
     }
 
     #[test]
