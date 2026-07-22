@@ -88,11 +88,24 @@
     if (window.lucide) window.lucide.createIcons();
   }
 
+  function apiUnavailableMessage() {
+    const origin = window.location.protocol === "file:"
+      ? "http://localhost:8070"
+      : window.location.origin;
+    return `Cesta API is unavailable. Open the admin at ${origin}/admin and verify ${origin}/health returns status ok.`;
+  }
+
   async function api(path, options = {}) {
     const headers = new Headers(options.headers || {});
     if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
     if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const response = await fetch(path, { ...options, headers });
+    let response;
+    try {
+      response = await fetch(path, { ...options, headers });
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      throw new Error(apiUnavailableMessage(), { cause: error });
+    }
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401 || response.status === 403) {
       if (path !== "/auth/login") showLogin("Administrator access is required.");
