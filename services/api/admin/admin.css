@@ -214,6 +214,76 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .skeleton { background: #e9edf0; animation: pulse 1.3s infinite alternate; }
 @keyframes pulse { to { opacity: 0.55; } }
 
+.storage-overview { min-height: 260px; }
+.storage-skeleton { min-height: 260px; }
+.storage-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-bottom: 1px solid var(--border);
+}
+.storage-summary-grid > div {
+  min-width: 0;
+  padding: 16px;
+  border-right: 1px solid var(--border);
+  display: grid;
+  gap: 5px;
+}
+.storage-summary-grid > div:last-child { border-right: 0; }
+.storage-summary-grid span, .runtime-strip span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+.storage-summary-grid strong { overflow-wrap: anywhere; font-size: 21px; }
+.storage-summary-grid small, .runtime-strip small { color: #536170; font-size: 10px; line-height: 1.4; }
+.storage-composition { padding: 16px; border-bottom: 1px solid var(--border); }
+.storage-bar {
+  height: 14px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #edf1f4;
+  display: flex;
+}
+.storage-segment { min-width: 0; height: 100%; }
+.storage-segment.table-data, .storage-swatch.table-data { background: #1261a0; }
+.storage-segment.indexes, .storage-swatch.indexes { background: #7656a3; }
+.storage-segment.auxiliary, .storage-swatch.auxiliary { background: #2d8b78; }
+.storage-segment.other, .storage-swatch.other { background: #9da9b6; }
+.storage-legend {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+.storage-legend-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 3px 7px;
+  align-items: center;
+  font-size: 11px;
+}
+.storage-swatch { width: 9px; height: 9px; border-radius: 2px; }
+.storage-legend-item span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #435160; }
+.storage-legend-item strong { font-size: 11px; }
+.storage-legend-item small { grid-column: 2 / -1; color: var(--muted); font-size: 10px; }
+.runtime-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-bottom: 1px solid var(--border);
+}
+.runtime-strip > div {
+  min-width: 0;
+  padding: 14px 16px;
+  border-right: 1px solid var(--border);
+  display: grid;
+  gap: 4px;
+}
+.runtime-strip > div:last-child { border-right: 0; }
+.runtime-strip strong { overflow-wrap: anywhere; font-size: 14px; }
+.storage-note { margin: 0; padding: 10px 16px; color: var(--muted); background: var(--surface-alt); font-size: 10px; line-height: 1.45; }
+
 .dashboard-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .span-2 { grid-column: span 2; }
 .span-3 { grid-column: span 3; }
@@ -570,6 +640,13 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .dashboard-grid { grid-template-columns: repeat(2, 1fr); }
   .span-3 { grid-column: span 2; }
+  .storage-summary-grid, .storage-legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .storage-summary-grid > div:nth-child(2n) { border-right: 0; }
+  .storage-summary-grid > div:nth-child(-n + 2) { border-bottom: 1px solid var(--border); }
+  .runtime-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .runtime-strip > div:nth-child(2n) { border-right: 0; }
+  .runtime-strip > div { border-bottom: 1px solid var(--border); }
+  .runtime-strip > div:last-child { grid-column: span 2; border-bottom: 0; }
   .map-layout { grid-template-columns: minmax(0, 1fr) 280px; }
   .source-editor { grid-template-columns: 1fr 1.5fr 100px auto; }
   .source-editor .toggle-field { grid-column: 3; }
@@ -603,6 +680,13 @@ dialog::backdrop { background: rgba(24, 33, 43, 0.45); }
   .content { padding: 14px; }
   .metric-grid, .dashboard-grid, .quality-metrics { grid-template-columns: 1fr; }
   .span-2, .span-3 { grid-column: span 1; }
+  .storage-summary-grid, .storage-legend, .runtime-strip { grid-template-columns: 1fr; }
+  .storage-summary-grid > div, .storage-summary-grid > div:nth-child(2n), .runtime-strip > div, .runtime-strip > div:nth-child(2n), .runtime-strip > div:last-child {
+    grid-column: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .storage-summary-grid > div:last-child, .runtime-strip > div:last-child { border-bottom: 0; }
   .toolbar { align-items: stretch; flex-direction: column; }
   .compact-field, .search-field { width: 100%; }
   .quality-strip { grid-template-columns: 1fr; }

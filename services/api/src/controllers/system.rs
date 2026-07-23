@@ -165,7 +165,15 @@ pub(crate) async fn openapi() -> Json<Value> {
             "/admin/imports": {"get": {"summary": "List import runs"}},
             "/admin/imports/{id}": {"get": {"summary": "Get an import run and its validation issues"}},
             "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
-            "/admin/database/stats": {"get": {"summary": "Database row counts and table sizes"}},
+            "/admin/database/stats": {"get": {
+                "summary": "Current database and routing-cache usage",
+                "description": "Returns current PostgreSQL storage composition, estimated live and dead rows, largest indexes, connection and cache statistics, recent imports, source coverage and routing snapshot usage. Requires an admin or data_admin token.",
+                "responses": {
+                    "200": {"description": "Current administrator usage overview", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminDatabaseStats"}}}},
+                    "401": {"description": "Administrator authentication required"},
+                    "403": {"description": "Authenticated account lacks an administrator role"}
+                }
+            }},
             "/admin/data-quality": {"get": {"summary": "Validation, duplicate and unresolved-stop metrics"}},
             "/admin/data-quality/validate": {"post": {
                 "summary": "Run administrator database validation",
@@ -466,6 +474,101 @@ pub(crate) async fn openapi() -> Json<Value> {
     let schemas = specification["components"]["schemas"]
         .as_object_mut()
         .expect("OpenAPI schemas object");
+    schemas.insert(
+        "AdminDatabaseStats".to_string(),
+        json!({
+            "type": "object",
+            "required": ["database_available"],
+            "properties": {
+                "database_available": {"type": "boolean"},
+                "generated_at": {"type": ["string", "null"], "format": "date-time"},
+                "database": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "total_size_bytes": {"type": "integer", "minimum": 0},
+                        "total_size_pretty": {"type": "string"}
+                    }
+                },
+                "storage": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "database_size_bytes": {"type": "integer", "minimum": 0},
+                        "user_relations_bytes": {"type": "integer", "minimum": 0},
+                        "table_data_bytes": {"type": "integer", "minimum": 0},
+                        "index_bytes": {"type": "integer", "minimum": 0},
+                        "auxiliary_bytes": {"type": "integer", "minimum": 0},
+                        "database_other_bytes": {"type": "integer", "minimum": 0},
+                        "routing_snapshot_bytes": {"type": "integer", "minimum": 0},
+                        "note": {"type": "string"}
+                    }
+                },
+                "runtime": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "total_connections": {"type": "integer", "minimum": 0},
+                        "max_connections": {"type": "integer", "minimum": 1},
+                        "active_connections": {"type": "integer", "minimum": 0},
+                        "idle_connections": {"type": "integer", "minimum": 0},
+                        "cache_hit_percent": {"type": "number", "minimum": 0, "maximum": 100},
+                        "commit_percent": {"type": "number", "minimum": 0, "maximum": 100},
+                        "temp_files": {"type": "integer", "minimum": 0},
+                        "temp_bytes": {"type": "integer", "minimum": 0},
+                        "deadlocks": {"type": "integer", "minimum": 0},
+                        "stats_reset": {"type": ["string", "null"], "format": "date-time"},
+                        "server_started_at": {"type": "string", "format": "date-time"},
+                        "uptime_seconds": {"type": "integer", "minimum": 0}
+                    }
+                },
+                "totals": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "tracked_rows": {"type": "integer", "minimum": 0},
+                        "tracked_rows_are_estimated": {"type": "boolean"},
+                        "dead_rows": {"type": "integer", "minimum": 0},
+                        "dead_row_percent": {"type": "number", "minimum": 0, "maximum": 100}
+                    }
+                },
+                "tables": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["table", "rows", "rows_are_estimated", "dead_rows", "table_size_bytes", "indexes_size_bytes", "total_size_bytes"],
+                        "properties": {
+                            "table": {"type": "string"},
+                            "rows": {"type": "integer", "minimum": 0},
+                            "rows_are_estimated": {"type": "boolean"},
+                            "dead_rows": {"type": "integer", "minimum": 0},
+                            "table_size_bytes": {"type": "integer", "minimum": 0},
+                            "indexes_size_bytes": {"type": "integer", "minimum": 0},
+                            "auxiliary_size_bytes": {"type": "integer", "minimum": 0},
+                            "total_size_bytes": {"type": "integer", "minimum": 0},
+                            "table_size_pretty": {"type": "string"},
+                            "indexes_size_pretty": {"type": "string"},
+                            "total_size_pretty": {"type": "string"},
+                            "last_autovacuum": {"type": ["string", "null"], "format": "date-time"},
+                            "last_autoanalyze": {"type": ["string", "null"], "format": "date-time"}
+                        }
+                    }
+                },
+                "largest_indexes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["table", "index", "size_bytes", "size_pretty", "scans"],
+                        "properties": {
+                            "table": {"type": "string"},
+                            "index": {"type": "string"},
+                            "size_bytes": {"type": "integer", "minimum": 0},
+                            "size_pretty": {"type": "string"},
+                            "scans": {"type": "integer", "minimum": 0}
+                        }
+                    }
+                },
+                "routing_snapshots": {"$ref": "#/components/schemas/RoutingSnapshotStatus"}
+            }
+        }),
+    );
     schemas.insert(
         "RoutingAlgorithmPayload".to_string(),
         json!({

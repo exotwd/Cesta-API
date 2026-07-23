@@ -52,24 +52,6 @@ use services::auth::{
     verify_password,
 };
 
-const DB_STAT_TABLES: &[&str] = &[
-    "import_runs",
-    "source_feeds",
-    "agencies",
-    "cities",
-    "stops",
-    "stop_source_ids",
-    "routes",
-    "trips",
-    "stop_times",
-    "validation_issues",
-    "realtime_updates",
-    "data_source_syncs",
-    "route_geometries",
-    "manual_stop_matches",
-    "data_repair_runs",
-    "offline_packages",
-];
 const MAX_JOURNEY_RESULTS: usize = 5;
 const MAX_DIRECT_JOURNEY_CANDIDATES: i64 = 20;
 const MAX_TRANSFER_JOURNEY_CANDIDATES: i64 = 40;
@@ -1845,16 +1827,35 @@ async fn admin_database_stats(
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
     let Some(pool) = &state.db else {
+        let routing_snapshots = routing_snapshot_status(
+            None,
+            &state.raptor_cache,
+            &state.config.routing_snapshot_dir,
+            &state.routing_warmup_status,
+        )
+        .await;
         return Ok(Json(json!({
             "database_available": false,
             "mock": state.use_mock_data,
-            "warning": "database is not configured; set USE_MOCK_DATA=false and DATABASE_URL"
+            "warning": "database is not configured; set USE_MOCK_DATA=false and DATABASE_URL",
+            "routing_snapshots": routing_snapshots
         })));
     };
 
-    Ok(Json(
-        database_admin_stats(pool).await.map_err(internal_error)?,
-    ))
+    let (database_stats, routing_snapshots) = tokio::join!(
+        database_admin_stats(pool),
+        routing_snapshot_status(
+            Some(pool),
+            &state.raptor_cache,
+            &state.config.routing_snapshot_dir,
+            &state.routing_warmup_status,
+        )
+    );
+    let mut database_stats = database_stats.map_err(internal_error)?;
+    database_stats["storage"]["routing_snapshot_bytes"] =
+        routing_snapshots["total_size_bytes"].clone();
+    database_stats["routing_snapshots"] = routing_snapshots;
+    Ok(Json(database_stats))
 }
 
 async fn admin_data_quality(
@@ -3635,31 +3636,73 @@ async fn database_admin_stats(pool: &PgPool) -> Result<Value, sqlx::Error> {
     .fetch_one(pool)
     .await?;
 
+    let table_rows = sqlx::query(
+        r#"
+        SELECT
+          relname AS table_name,
+          n_live_tup::bigint AS estimated_rows,
+          n_dead_tup::bigint AS dead_rows,
+          pg_relation_size(relid)::bigint AS table_size_bytes,
+          pg_indexes_size(relid)::bigint AS indexes_size_bytes,
+          GREATEST(
+            pg_total_relation_size(relid)
+              - pg_relation_size(relid)
+              - pg_indexes_size(relid),
+            0
+          )::bigint AS auxiliary_size_bytes,
+          pg_total_relation_size(relid)::bigint AS total_size_bytes,
+          pg_size_pretty(pg_relation_size(relid)) AS table_size_pretty,
+          pg_size_pretty(pg_indexes_size(relid)) AS indexes_size_pretty,
+          pg_size_pretty(pg_total_relation_size(relid)) AS total_size_pretty,
+          last_vacuum,
+          last_autovacuum,
+          last_analyze,
+          last_autoanalyze
+        FROM pg_catalog.pg_stat_user_tables
+        WHERE schemaname = 'public'
+        ORDER BY pg_total_relation_size(relid) DESC, relname ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
     let mut tables = Vec::new();
     let mut total_rows = 0_i64;
-    for table in DB_STAT_TABLES {
-        let row_count = table_row_count(pool, table).await?;
-        total_rows += row_count;
-        let size = sqlx::query(
-            r#"
-            SELECT
-              pg_total_relation_size($1::regclass) AS total_size_bytes,
-              pg_relation_size($1::regclass) AS table_size_bytes,
-              pg_indexes_size($1::regclass) AS indexes_size_bytes,
-              pg_size_pretty(pg_total_relation_size($1::regclass)) AS total_size_pretty
-            "#,
-        )
-        .bind(*table)
-        .fetch_one(pool)
-        .await?;
+    let mut total_dead_rows = 0_i64;
+    let mut table_data_bytes = 0_i64;
+    let mut index_bytes = 0_i64;
+    let mut auxiliary_bytes = 0_i64;
+    let mut user_relation_bytes = 0_i64;
+    for row in table_rows {
+        let estimated_rows = row.get::<i64, _>("estimated_rows").max(0);
+        let dead_rows = row.get::<i64, _>("dead_rows").max(0);
+        let row_table_bytes = row.get::<i64, _>("table_size_bytes").max(0);
+        let row_index_bytes = row.get::<i64, _>("indexes_size_bytes").max(0);
+        let row_auxiliary_bytes = row.get::<i64, _>("auxiliary_size_bytes").max(0);
+        let row_total_bytes = row.get::<i64, _>("total_size_bytes").max(0);
+        total_rows = total_rows.saturating_add(estimated_rows);
+        total_dead_rows = total_dead_rows.saturating_add(dead_rows);
+        table_data_bytes = table_data_bytes.saturating_add(row_table_bytes);
+        index_bytes = index_bytes.saturating_add(row_index_bytes);
+        auxiliary_bytes = auxiliary_bytes.saturating_add(row_auxiliary_bytes);
+        user_relation_bytes = user_relation_bytes.saturating_add(row_total_bytes);
 
         tables.push(json!({
-            "table": table,
-            "rows": row_count,
-            "total_size_bytes": size.get::<i64, _>("total_size_bytes"),
-            "table_size_bytes": size.get::<i64, _>("table_size_bytes"),
-            "indexes_size_bytes": size.get::<i64, _>("indexes_size_bytes"),
-            "total_size_pretty": size.get::<String, _>("total_size_pretty")
+            "table": row.get::<String, _>("table_name"),
+            "rows": estimated_rows,
+            "rows_are_estimated": true,
+            "dead_rows": dead_rows,
+            "total_size_bytes": row_total_bytes,
+            "table_size_bytes": row_table_bytes,
+            "indexes_size_bytes": row_index_bytes,
+            "auxiliary_size_bytes": row_auxiliary_bytes,
+            "table_size_pretty": row.get::<String, _>("table_size_pretty"),
+            "indexes_size_pretty": row.get::<String, _>("indexes_size_pretty"),
+            "total_size_pretty": row.get::<String, _>("total_size_pretty"),
+            "last_vacuum": row.get::<Option<DateTime<Utc>>, _>("last_vacuum"),
+            "last_autovacuum": row.get::<Option<DateTime<Utc>>, _>("last_autovacuum"),
+            "last_analyze": row.get::<Option<DateTime<Utc>>, _>("last_analyze"),
+            "last_autoanalyze": row.get::<Option<DateTime<Utc>>, _>("last_autoanalyze")
         }));
     }
 
@@ -3670,27 +3713,23 @@ async fn database_admin_stats(pool: &PgPool) -> Result<Value, sqlx::Error> {
           sf.name,
           sf.type,
           sf.priority,
-          COALESCE(stop_counts.count, 0) AS stops,
-          COALESCE(route_counts.count, 0) AS routes,
-          COALESCE(trip_counts.count, 0) AS trips,
-          COALESCE(stop_time_counts.count, 0) AS stop_times,
-          COALESCE(issue_counts.count, 0) AS validation_issues
+          COALESCE((latest.summary->>'stops')::bigint, 0) AS stops,
+          COALESCE((latest.summary->>'routes')::bigint, 0) AS routes,
+          COALESCE((latest.summary->>'trips')::bigint, 0) AS trips,
+          COALESCE((latest.summary->>'stop_times')::bigint, 0) AS stop_times,
+          COALESCE((latest.summary->>'validation_issues')::bigint, 0) AS validation_issues
         FROM source_feeds sf
-        LEFT JOIN (
-          SELECT source_feed_id, COUNT(*) AS count FROM stops GROUP BY source_feed_id
-        ) stop_counts ON stop_counts.source_feed_id = sf.id
-        LEFT JOIN (
-          SELECT source_feed_id, COUNT(*) AS count FROM routes GROUP BY source_feed_id
-        ) route_counts ON route_counts.source_feed_id = sf.id
-        LEFT JOIN (
-          SELECT source_feed_id, COUNT(*) AS count FROM trips GROUP BY source_feed_id
-        ) trip_counts ON trip_counts.source_feed_id = sf.id
-        LEFT JOIN (
-          SELECT source_feed_id, COUNT(*) AS count FROM stop_times GROUP BY source_feed_id
-        ) stop_time_counts ON stop_time_counts.source_feed_id = sf.id
-        LEFT JOIN (
-          SELECT source_feed_id, COUNT(*) AS count FROM validation_issues GROUP BY source_feed_id
-        ) issue_counts ON issue_counts.source_feed_id = sf.id
+        LEFT JOIN LATERAL (
+          SELECT run.summary
+          FROM import_runs run
+          WHERE run.status = 'success'
+            AND (
+              run.summary->>'feed_id' = sf.id
+              OR run.source LIKE sf.id || ':%'
+            )
+          ORDER BY run.finished_at DESC NULLS LAST, run.started_at DESC
+          LIMIT 1
+        ) latest ON true
         ORDER BY sf.priority, sf.id
         "#,
     )
@@ -3765,28 +3804,140 @@ async fn database_admin_stats(pool: &PgPool) -> Result<Value, sqlx::Error> {
     .fetch_one(pool)
     .await?;
 
+    let index_rows = sqlx::query(
+        r#"
+        SELECT
+          relname AS table_name,
+          indexrelname AS index_name,
+          pg_relation_size(indexrelid)::bigint AS size_bytes,
+          pg_size_pretty(pg_relation_size(indexrelid)) AS size_pretty,
+          idx_scan::bigint AS scans
+        FROM pg_catalog.pg_stat_user_indexes
+        WHERE schemaname = 'public'
+        ORDER BY pg_relation_size(indexrelid) DESC, indexrelname ASC
+        LIMIT 20
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let largest_indexes = index_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "table": row.get::<String, _>("table_name"),
+                "index": row.get::<String, _>("index_name"),
+                "size_bytes": row.get::<i64, _>("size_bytes"),
+                "size_pretty": row.get::<String, _>("size_pretty"),
+                "scans": row.get::<i64, _>("scans")
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let runtime_row = sqlx::query(
+        r#"
+        SELECT
+          stats.numbackends::bigint AS total_connections,
+          current_setting('max_connections')::bigint AS max_connections,
+          (
+            SELECT COUNT(*)::bigint
+            FROM pg_catalog.pg_stat_activity activity
+            WHERE activity.datname = current_database()
+              AND activity.state = 'active'
+          ) AS active_connections,
+          (
+            SELECT COUNT(*)::bigint
+            FROM pg_catalog.pg_stat_activity activity
+            WHERE activity.datname = current_database()
+              AND activity.state = 'idle'
+          ) AS idle_connections,
+          stats.xact_commit::bigint AS committed_transactions,
+          stats.xact_rollback::bigint AS rolled_back_transactions,
+          stats.blks_read::bigint AS blocks_read,
+          stats.blks_hit::bigint AS blocks_hit,
+          stats.temp_files::bigint AS temp_files,
+          stats.temp_bytes::bigint AS temp_bytes,
+          stats.deadlocks::bigint AS deadlocks,
+          stats.stats_reset,
+          pg_postmaster_start_time() AS server_started_at
+        FROM pg_catalog.pg_stat_database stats
+        WHERE stats.datname = current_database()
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let blocks_read = runtime_row.get::<i64, _>("blocks_read").max(0);
+    let blocks_hit = runtime_row.get::<i64, _>("blocks_hit").max(0);
+    let total_block_accesses = blocks_read.saturating_add(blocks_hit);
+    let cache_hit_percent = if total_block_accesses == 0 {
+        100.0
+    } else {
+        blocks_hit as f64 * 100.0 / total_block_accesses as f64
+    };
+    let committed_transactions = runtime_row.get::<i64, _>("committed_transactions").max(0);
+    let rolled_back_transactions = runtime_row.get::<i64, _>("rolled_back_transactions").max(0);
+    let transaction_count = committed_transactions.saturating_add(rolled_back_transactions);
+    let commit_percent = if transaction_count == 0 {
+        100.0
+    } else {
+        committed_transactions as f64 * 100.0 / transaction_count as f64
+    };
+    let server_started_at = runtime_row.get::<DateTime<Utc>, _>("server_started_at");
+    let database_size_bytes = database_row.get::<i64, _>("total_size_bytes").max(0);
+    let database_other_bytes = database_size_bytes.saturating_sub(user_relation_bytes);
+    let row_slots = total_rows.saturating_add(total_dead_rows);
+    let dead_row_percent = if row_slots == 0 {
+        0.0
+    } else {
+        total_dead_rows as f64 * 100.0 / row_slots as f64
+    };
+
     Ok(json!({
         "database_available": true,
+        "generated_at": Utc::now(),
         "database": {
             "name": database_row.get::<String, _>("database_name"),
-            "total_size_bytes": database_row.get::<i64, _>("total_size_bytes"),
+            "total_size_bytes": database_size_bytes,
             "total_size_pretty": database_row.get::<String, _>("total_size_pretty")
+        },
+        "storage": {
+            "database_size_bytes": database_size_bytes,
+            "user_relations_bytes": user_relation_bytes,
+            "table_data_bytes": table_data_bytes,
+            "index_bytes": index_bytes,
+            "auxiliary_bytes": auxiliary_bytes,
+            "database_other_bytes": database_other_bytes,
+            "routing_snapshot_bytes": 0,
+            "note": "Database usage excludes routing snapshot files. Host disk capacity is not available from PostgreSQL."
+        },
+        "runtime": {
+            "total_connections": runtime_row.get::<i64, _>("total_connections"),
+            "max_connections": runtime_row.get::<i64, _>("max_connections"),
+            "active_connections": runtime_row.get::<i64, _>("active_connections"),
+            "idle_connections": runtime_row.get::<i64, _>("idle_connections"),
+            "committed_transactions": committed_transactions,
+            "rolled_back_transactions": rolled_back_transactions,
+            "commit_percent": commit_percent,
+            "cache_hit_percent": cache_hit_percent,
+            "temp_files": runtime_row.get::<i64, _>("temp_files"),
+            "temp_bytes": runtime_row.get::<i64, _>("temp_bytes"),
+            "deadlocks": runtime_row.get::<i64, _>("deadlocks"),
+            "stats_reset": runtime_row.get::<Option<DateTime<Utc>>, _>("stats_reset"),
+            "server_started_at": server_started_at,
+            "uptime_seconds": (Utc::now() - server_started_at).num_seconds().max(0)
         },
         "totals": {
             "tracked_rows": total_rows,
+            "tracked_rows_are_estimated": true,
+            "dead_rows": total_dead_rows,
+            "dead_row_percent": dead_row_percent,
             "unresolved_active_stops": unresolved_stop_count
         },
         "tables": tables,
+        "largest_indexes": largest_indexes,
         "source_feeds": source_feeds,
         "latest_imports": latest_imports,
         "validation_issues": validation_issues
     }))
-}
-
-async fn table_row_count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-        .fetch_one(pool)
-        .await
 }
 
 async fn query_journeys_db(
@@ -9049,6 +9200,19 @@ mod tests {
         assert!(payload["paths"]["/admin/data-quality/repairs/automatic"]["post"].is_object());
         assert!(payload["paths"]["/admin/data-quality/duplicates/merge"]["post"].is_object());
         assert_eq!(
+            payload["paths"]["/admin/database/stats"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/AdminDatabaseStats"
+        );
+        assert!(
+            payload["components"]["schemas"]["AdminDatabaseStats"]["properties"]["storage"]
+                .is_object()
+        );
+        assert!(
+            payload["components"]["schemas"]["AdminDatabaseStats"]["properties"]["largest_indexes"]
+                .is_object()
+        );
+        assert_eq!(
             payload["paths"]["/admin/data-quality/duplicates/merge"]["post"]["requestBody"]["content"]
                 ["application/json"]["schema"]["properties"]["strategy"]["enum"],
             json!(["exact_coordinates", "nearby_same_direction"])
@@ -9250,6 +9414,9 @@ mod tests {
         assert!(html.contains("Duplicate-stop review"));
         assert!(html.contains("Nearby stops in the same direction"));
         assert!(html.contains("Automatically repaired when safe"));
+        assert!(html.contains("Current storage usage"));
+        assert!(html.contains("Largest indexes"));
+        assert!(html.contains("Table rows are PostgreSQL estimates"));
     }
 
     #[tokio::test]
@@ -9259,6 +9426,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_database_usage_requires_admin_token() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/database/stats")
                     .body(Body::empty())
                     .unwrap(),
             )

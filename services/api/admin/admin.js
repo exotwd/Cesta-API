@@ -159,6 +159,11 @@
     return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
   }
 
+  function formatPercent(value, digits = 1) {
+    const number = Number(value);
+    return Number.isFinite(number) ? `${number.toFixed(digits)}%` : "—";
+  }
+
   function formatDate(value) {
     if (!value) return "—";
     const date = new Date(value);
@@ -525,9 +530,20 @@
       metric("Stops", tableLookup.stops?.rows, `${tableLookup.stops?.total_size_pretty || "—"} stored`),
       metric("Routes", tableLookup.routes?.rows, `${tableLookup.routes?.total_size_pretty || "—"} stored`),
       metric("Trips", tableLookup.trips?.rows, `${tableLookup.trips?.total_size_pretty || "—"} stored`),
-      metric("Stop times", tableLookup.stop_times?.rows, stats.database?.total_size_pretty || "Database size unavailable")
+      metric("Stop times", tableLookup.stop_times?.rows, `${tableLookup.stop_times?.total_size_pretty || "—"} stored`)
     ].join("");
-    renderTable("#dashboard-tables", (stats.tables || []).slice(0, 12), ["table", "rows", "total_size_pretty"]);
+    renderStorageOverview(stats);
+    renderTable(
+      "#dashboard-tables",
+      (stats.tables || []).slice(0, 12),
+      ["table", "rows", "table_size_pretty", "indexes_size_pretty", "dead_rows", "total_size_pretty"]
+    );
+    renderTable(
+      "#dashboard-indexes",
+      (stats.largest_indexes || []).slice(0, 10),
+      ["index", "table", "size_pretty", "scans"],
+      { empty: "No index statistics are available" }
+    );
     renderImportActivity("#dashboard-imports", (stats.latest_imports || []).slice(0, 6));
     $("#dashboard-sources").innerHTML = (stats.source_feeds || []).map((source) => `
       <div class="source-item">
@@ -540,6 +556,62 @@
       qualityStat((quality.latest_issues || []).length, "Recent validation issues")
     ].join("");
     iconRefresh();
+  }
+
+  function renderStorageOverview(stats) {
+    if (stats.database_available === false) {
+      $("#dashboard-storage").innerHTML = '<div class="empty-state compact-empty">Connect PostgreSQL to view current storage usage.</div>';
+      $("#storage-updated").textContent = "Unavailable";
+      return;
+    }
+
+    const storage = stats.storage || {};
+    const runtime = stats.runtime || {};
+    const snapshots = stats.routing_snapshots || {};
+    const databaseBytes = Number(storage.database_size_bytes || 0);
+    const segments = [
+      { label: "Table data", value: Number(storage.table_data_bytes || 0), className: "table-data" },
+      { label: "Indexes", value: Number(storage.index_bytes || 0), className: "indexes" },
+      { label: "TOAST and auxiliary", value: Number(storage.auxiliary_bytes || 0), className: "auxiliary" },
+      { label: "Catalog and other", value: Number(storage.database_other_bytes || 0), className: "other" }
+    ];
+    const snapshotFiles = (snapshots.snapshots || []).filter((snapshot) => snapshot.exists);
+    const memoryCached = (snapshots.snapshots || []).filter((snapshot) => snapshot.memory_cached).length;
+    const segmentHtml = segments.map((segment) => {
+      const percent = databaseBytes > 0 ? segment.value * 100 / databaseBytes : 0;
+      return `<span class="storage-segment ${segment.className}" style="width:${Math.max(0, Math.min(100, percent))}%" title="${escapeHtml(segment.label)}: ${escapeHtml(formatBytes(segment.value))} (${escapeHtml(formatPercent(percent))})"></span>`;
+    }).join("");
+    const legendHtml = segments.map((segment) => {
+      const percent = databaseBytes > 0 ? segment.value * 100 / databaseBytes : 0;
+      return `
+        <div class="storage-legend-item">
+          <span class="storage-swatch ${segment.className}"></span>
+          <span>${escapeHtml(segment.label)}</span>
+          <strong>${escapeHtml(formatBytes(segment.value))}</strong>
+          <small>${escapeHtml(formatPercent(percent))}</small>
+        </div>`;
+    }).join("");
+
+    $("#dashboard-storage").innerHTML = `
+      <div class="storage-summary-grid">
+        <div><span>Database total</span><strong>${escapeHtml(formatBytes(databaseBytes))}</strong><small>${escapeHtml(stats.database?.name || "PostgreSQL")}</small></div>
+        <div><span>Table data</span><strong>${escapeHtml(formatBytes(storage.table_data_bytes))}</strong><small>${formatNumber(stats.totals?.tracked_rows)} estimated live rows</small></div>
+        <div><span>Indexes</span><strong>${escapeHtml(formatBytes(storage.index_bytes))}</strong><small>${escapeHtml(formatPercent(databaseBytes ? Number(storage.index_bytes || 0) * 100 / databaseBytes : 0))} of database</small></div>
+        <div><span>Routing snapshots</span><strong>${escapeHtml(formatBytes(snapshots.total_size_bytes))}</strong><small>${formatNumber(snapshotFiles.length)} files · ${formatNumber(memoryCached)} in memory</small></div>
+      </div>
+      <div class="storage-composition">
+        <div class="storage-bar" aria-label="Database storage composition">${segmentHtml}</div>
+        <div class="storage-legend">${legendHtml}</div>
+      </div>
+      <div class="runtime-strip">
+        <div><span>Cache hit</span><strong>${escapeHtml(formatPercent(runtime.cache_hit_percent, 2))}</strong><small>PostgreSQL buffer cache</small></div>
+        <div><span>Connections</span><strong>${formatNumber(runtime.active_connections)} active</strong><small>${formatNumber(runtime.total_connections)} open / ${formatNumber(runtime.max_connections)} maximum</small></div>
+        <div><span>Dead rows</span><strong>${formatNumber(stats.totals?.dead_rows)}</strong><small>${escapeHtml(formatPercent(stats.totals?.dead_row_percent))} of tracked row versions</small></div>
+        <div><span>Temporary data</span><strong>${escapeHtml(formatBytes(runtime.temp_bytes))}</strong><small>${formatNumber(runtime.temp_files)} files since statistics reset</small></div>
+        <div><span>Database uptime</span><strong>${escapeHtml(formatDurationSeconds(runtime.uptime_seconds))}</strong><small>${runtime.stats_reset ? `Stats since ${escapeHtml(formatDate(runtime.stats_reset))}` : "Statistics have not been reset"}</small></div>
+      </div>
+      <p class="storage-note">${escapeHtml(storage.note || "Database usage does not include host disk capacity.")}</p>`;
+    $("#storage-updated").textContent = stats.generated_at ? `Updated ${formatDate(stats.generated_at)}` : "Current";
   }
 
   function metric(label, value, detail) {

@@ -109,12 +109,27 @@
             <div class="metric skeleton"></div>
           </div>
           <div class="dashboard-grid">
+            <section class="panel span-3">
+              <div class="panel-header">
+                <div><h2>Current storage usage</h2><p>Database composition, routing snapshots and PostgreSQL runtime health</p></div>
+                <span class="badge" id="storage-updated">Loading</span>
+              </div>
+              <div class="storage-overview" id="dashboard-storage">
+                <div class="storage-skeleton skeleton"></div>
+              </div>
+            </section>
             <section class="panel span-2">
               <div class="panel-header">
-                <div><h2>Database tables</h2><p>Tracked rows and storage usage</p></div>
+                <div><h2>Database tables</h2><p>Table rows are PostgreSQL estimates; sizes are current on-disk values</p></div>
                 <button class="text-button" data-jump="data">Open browser</button>
               </div>
               <div class="table-wrap compact" id="dashboard-tables"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-header">
+                <div><h2>Largest indexes</h2><p>Size and scans since PostgreSQL statistics were reset</p></div>
+              </div>
+              <div class="table-wrap compact" id="dashboard-indexes"></div>
             </section>
             <section class="panel">
               <div class="panel-header">
