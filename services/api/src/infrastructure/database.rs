@@ -167,6 +167,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "../../../../infra/postgres/migrations/0018_automatic_directional_stop_merges.sql"
         ),
     )
+    .await?;
+    apply_nontransactional_startup_migration(
+        pool,
+        "0019_storage_optimization",
+        include_str!("../../../../infra/postgres/migrations/0019_storage_optimization.sql"),
+    )
     .await
 }
 
@@ -196,4 +202,46 @@ async fn apply_startup_migration(
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await
+}
+
+async fn apply_nontransactional_startup_migration(
+    pool: &PgPool,
+    version: &str,
+    statements: &str,
+) -> Result<(), sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('cesta-api-startup-migrations'))")
+        .execute(&mut *connection)
+        .await?;
+
+    let migration_result = async {
+        let already_applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cesta_schema_migrations WHERE version = $1)",
+        )
+        .bind(version)
+        .fetch_one(&mut *connection)
+        .await?;
+        if already_applied {
+            return Ok(());
+        }
+
+        // PostgreSQL operations such as DROP INDEX CONCURRENTLY cannot run inside
+        // a transaction. These migrations must therefore be idempotent so a crash
+        // between the operation and version recording remains safe to retry.
+        sqlx::raw_sql(statements).execute(&mut *connection).await?;
+        sqlx::query("INSERT INTO cesta_schema_migrations (version) VALUES ($1)")
+            .bind(version)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+
+    let unlock_result =
+        sqlx::query("SELECT pg_advisory_unlock(hashtext('cesta-api-startup-migrations'))")
+            .execute(&mut *connection)
+            .await;
+    migration_result?;
+    unlock_result?;
+    Ok(())
 }

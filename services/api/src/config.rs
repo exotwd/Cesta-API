@@ -97,7 +97,7 @@ impl AppConfig {
                 .unwrap_or_else(|_| PathBuf::from("storage").join("processed").join("routing")),
             routing_snapshot_files_to_keep: parse_number(
                 "ROUTING_SNAPSHOT_FILES_TO_KEEP",
-                8_usize,
+                2_usize,
             )?
             .max(2),
             use_mock_data,
@@ -148,13 +148,13 @@ mod tests {
             jwt_secret: DEVELOPMENT_JWT_SECRET.to_string(),
             request_body_limit_bytes: 1024 * 1024,
             routing_snapshot_dir: PathBuf::from("storage").join("processed").join("routing"),
-            routing_snapshot_files_to_keep: 8,
+            routing_snapshot_files_to_keep: 2,
             use_mock_data: true,
             production: false,
         };
 
         assert!(config.use_mock_data);
         assert!(config.database_url.is_none());
-        assert_eq!(config.routing_snapshot_files_to_keep, 8);
+        assert_eq!(config.routing_snapshot_files_to_keep, 2);
     }
 }

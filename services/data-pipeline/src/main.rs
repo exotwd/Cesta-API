@@ -41,7 +41,7 @@ const PID_FEED_ID: &str = "pid_gtfs";
 const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
 const PID_SOURCE_PRIORITY: i32 = 10;
 const DEFAULT_RAW_RUNS_TO_KEEP: usize = 3;
-const DEFAULT_DB_IMPORT_RUNS_TO_KEEP: usize = 3;
+const DEFAULT_DB_IMPORT_RUNS_TO_KEEP: usize = 1;
 const DEFAULT_INCOMPLETE_RAW_RUN_MAX_AGE_HOURS: u64 = 24;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1594,6 +1594,11 @@ async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../../infra/postgres/migrations/0018_automatic_directional_stop_merges.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0019_storage_optimization.sql"
     ))
     .execute(pool)
     .await?;

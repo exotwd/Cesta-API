@@ -16,7 +16,7 @@ received a complete manifest and required source files are deleted after
 `RAW_INCOMPLETE_RUN_MAX_AGE_HOURS` (default `24`), except for the currently active run. Manual or
 unrecognized directories and `storage/reports` are never removed by this cleanup. PostgreSQL keeps
 the latest `DB_IMPORT_RUNS_TO_KEEP` successful import audits and their validation findings per feed
-(default `3`), plus every running import and all rows still referenced by imported transport data.
+(default `1`), plus every running import and all rows still referenced by imported transport data.
 - PID current and seven-day route geometry: `https://data.pid.cz/geodata/Linky_7d_WGS84.json`
 
 Current realtime sources:
