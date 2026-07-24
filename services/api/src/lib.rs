@@ -6339,8 +6339,13 @@ fn canonical_journey_stop_id(stop_id: &str) -> String {
 }
 
 fn railway_station_stop_base(stop_id: &str) -> Option<String> {
-    let marker_index = stop_id.rfind("SR70S-CZ-")?;
-    let marker_end = marker_index + "SR70S-CZ-".len();
+    let (marker_index, marker, canonical_marker) =
+        if let Some(marker_index) = stop_id.rfind("SR70ST-CZ-") {
+            (marker_index, "SR70ST-CZ-", "SR70S-CZ-")
+        } else {
+            (stop_id.rfind("SR70S-CZ-")?, "SR70S-CZ-", "SR70S-CZ-")
+        };
+    let marker_end = marker_index + marker.len();
     let station_and_platform = &stop_id[marker_end..];
     let mut parts = station_and_platform.split('-');
     let station_code = parts.next()?;
@@ -6362,7 +6367,10 @@ fn railway_station_stop_base(stop_id: &str) -> Option<String> {
         }
     }
 
-    Some(format!("{}{}", &stop_id[..marker_end], station_code))
+    Some(format!(
+        "{}{canonical_marker}{station_code}",
+        &stop_id[..marker_index]
+    ))
 }
 
 fn escaped_like_prefix(value: &str) -> String {
@@ -8398,6 +8406,40 @@ fn mock_status(use_mock_data: bool) -> Value {
 }
 
 fn stop_search_score(stop: &Stop, query: &str) -> Option<i32> {
+    let score = stop_search_score_for_query(stop, query);
+    let railway_alias_score = railway_station_query_base(stop, query)
+        .and_then(|query| stop_search_score_for_query(stop, query));
+    score.max(railway_alias_score)
+}
+
+fn railway_station_query_base<'a>(stop: &Stop, query: &'a str) -> Option<&'a str> {
+    let station_like =
+        railway_station_stop_base(&stop.id).is_some() || stop.modes.contains(&TransportMode::Train);
+    if !station_like {
+        return None;
+    }
+
+    [
+        " hlavni nadrazi",
+        " hlavni stanice",
+        " zeleznicni stanice",
+        " railway station",
+        " train station",
+        " hlavni n",
+        " hl n",
+        " zel st",
+        " nadrazi",
+    ]
+    .into_iter()
+    .find_map(|suffix| {
+        query
+            .strip_suffix(suffix)
+            .map(str::trim_end)
+            .filter(|base| !base.is_empty())
+    })
+}
+
+fn stop_search_score_for_query(stop: &Stop, query: &str) -> Option<i32> {
     if query.is_empty() {
         return Some(if stop.is_active { 10 } else { 0 });
     }
@@ -10037,6 +10079,10 @@ mod tests {
         let station = "ggu_czptt_gtfs_latest:-SR70S-CZ-35442";
         assert_eq!(railway_station_stop_base(station).as_deref(), Some(station));
         assert_eq!(
+            railway_station_stop_base("ggu_czptt_gtfs_latest:-SR70ST-CZ-35442").as_deref(),
+            Some(station)
+        );
+        assert_eq!(
             railway_station_stop_base("ggu_czptt_gtfs_latest:-SR70S-CZ-35442-4b").as_deref(),
             Some(station)
         );
@@ -10096,6 +10142,34 @@ mod tests {
             canonical_journey_stop_id("ordinary-stop-2"),
             "ordinary-stop-2"
         );
+    }
+
+    #[test]
+    fn stop_search_accepts_main_station_suffix_missing_from_rail_feed_name() {
+        let mut station = fixture_stop(
+            "ggu_czptt_gtfs_latest:-SR70ST-CZ-35442",
+            "Vsetin",
+            49.335427,
+            17.99336,
+            TransportMode::Train,
+        );
+        station.location_type = StopLocationType::Station;
+        station.modes.clear();
+        let ordinary_stop = fixture_stop(
+            "ordinary-vsetin",
+            "Vsetin",
+            49.335427,
+            17.99336,
+            TransportMode::Bus,
+        );
+
+        assert!(stop_search_score(&station, "vsetin hl n").is_some());
+        assert!(
+            ranked_stop_suggestions([&station].into_iter(), "vsetin hlavni nadrazi", 1)
+                .first()
+                .is_some_and(|suggestion| suggestion.id == station.id)
+        );
+        assert!(stop_search_score(&ordinary_stop, "vsetin hl n").is_none());
     }
 
     #[test]
