@@ -32,7 +32,9 @@ import that has no calendar data remains searchable as an explicitly unverified 
 snapshot is missing or stale, the API rebuilds the timetable from PostgreSQL, writes a replacement
 snapshot, and stores it in the in-memory cache. A background warmer refreshes today and tomorrow
 every minute so new imports are picked up before most user searches; it never runs an import on API
-startup.
+startup. If a timetable is already in memory but its disk snapshot is missing, every warmup pass
+retries the atomic snapshot write. Filesystem failures are reported in `snapshot_status.warmup`
+without taking the in-memory routing timetable out of service.
 
 RAPTOR first searches only calendar-verified trips, preventing a faster legacy trip from suppressing
 a real service during round scanning. It reruns with legacy trips enabled only when the verified

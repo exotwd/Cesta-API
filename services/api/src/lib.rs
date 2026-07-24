@@ -5118,15 +5118,24 @@ async fn raptor_timetable_cached_db(
     service_date: chrono::NaiveDate,
 ) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
     let revision = routing_data_revision(pool).await?;
-    raptor_timetable_cached_for_revision_db(
+    let (timetable, _) = raptor_timetable_cached_for_revision_db(
         pool,
         cache,
         routing_snapshot_dir,
         service_date,
         &revision,
     )
-    .await
-    .map(|(timetable, _)| timetable)
+    .await?;
+    let snapshot_path =
+        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, &revision);
+    ensure_raptor_timetable_snapshot(&snapshot_path, service_date, &revision, timetable.as_ref())
+        .await
+        .map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "RAPTOR snapshot persistence failed for {service_date}: {error}"
+            ))
+        })?;
+    Ok(timetable)
 }
 
 async fn raptor_timetable_cached_for_revision_db(
@@ -5173,8 +5182,17 @@ async fn raptor_timetable_cached_for_revision_db(
                 service_date = %service_date,
                 "built RAPTOR timetable from database"
             );
-            write_raptor_timetable_snapshot(&snapshot_path, service_date, &revision, &timetable)
-                .await;
+            if let Err(error) =
+                write_raptor_timetable_snapshot(&snapshot_path, service_date, &revision, &timetable)
+                    .await
+            {
+                tracing::warn!(
+                    %error,
+                    service_date = %service_date,
+                    path = %snapshot_path.display(),
+                    "failed to persist RAPTOR timetable snapshot; routing will continue from memory"
+                );
+            }
             Ok::<Arc<RaptorTimetable>, sqlx::Error>(Arc::new(timetable))
         })
         .await
@@ -5484,7 +5502,7 @@ async fn write_raptor_timetable_snapshot(
     service_date: chrono::NaiveDate,
     revision: &RoutingDataRevision,
     timetable: &RaptorTimetable,
-) {
+) -> anyhow::Result<()> {
     let snapshot = RaptorTimetableSnapshot {
         version: RAPTOR_TIMETABLE_SNAPSHOT_VERSION,
         service_date,
@@ -5492,37 +5510,34 @@ async fn write_raptor_timetable_snapshot(
         revision_token: revision.token.clone(),
         timetable: timetable.clone(),
     };
-    let bytes = match serde_json::to_vec(&snapshot) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(%error, "failed to serialize RAPTOR timetable snapshot");
-            return;
-        }
-    };
-    let Some(parent) = path.parent() else {
-        tracing::warn!(path = %path.display(), "RAPTOR timetable snapshot path has no parent directory");
-        return;
-    };
-    if let Err(error) = tokio::fs::create_dir_all(parent).await {
-        tracing::warn!(%error, path = %parent.display(), "failed to create RAPTOR snapshot directory");
-        return;
-    }
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|error| anyhow::anyhow!("failed to serialize timetable: {error}"))?;
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("snapshot path '{}' has no parent directory", path.display())
+    })?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        anyhow::anyhow!(
+            "failed to create snapshot directory '{}': {error}",
+            parent.display()
+        )
+    })?;
     let temporary_path = path.with_extension("json.tmp");
-    if let Err(error) = tokio::fs::write(&temporary_path, bytes).await {
-        tracing::warn!(%error, path = %temporary_path.display(), "failed to write RAPTOR timetable snapshot");
-        return;
-    }
+    tokio::fs::write(&temporary_path, bytes)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to write temporary snapshot '{}': {error}",
+                temporary_path.display()
+            )
+        })?;
     if let Err(error) = tokio::fs::rename(&temporary_path, path).await {
         let _ = tokio::fs::remove_file(path).await;
         if let Err(second_error) = tokio::fs::rename(&temporary_path, path).await {
-            tracing::warn!(
-                error = %error,
-                retry_error = %second_error,
-                path = %path.display(),
-                "failed to publish RAPTOR timetable snapshot"
-            );
             let _ = tokio::fs::remove_file(&temporary_path).await;
-            return;
+            return Err(anyhow::anyhow!(
+                "failed to publish snapshot '{}': {error}; retry failed: {second_error}",
+                path.display()
+            ));
         }
     }
     tracing::info!(
@@ -5531,6 +5546,28 @@ async fn write_raptor_timetable_snapshot(
         trips = timetable.trip_count(),
         "wrote RAPTOR timetable snapshot"
     );
+    Ok(())
+}
+
+async fn ensure_raptor_timetable_snapshot(
+    path: &FsPath,
+    service_date: chrono::NaiveDate,
+    revision: &RoutingDataRevision,
+    timetable: &RaptorTimetable,
+) -> anyhow::Result<bool> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to inspect snapshot '{}': {error}",
+                path.display()
+            ));
+        }
+    }
+    write_raptor_timetable_snapshot(path, service_date, revision, timetable).await?;
+    Ok(true)
 }
 
 async fn raptor_timetable_db(
@@ -9116,6 +9153,69 @@ mod tests {
         assert!(directory.join("raptor-v8-2026-07-08-current.json").exists());
         assert!(directory.join("raptor-v9-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warmup_recreates_a_missing_snapshot_from_memory() {
+        let directory =
+            std::env::temp_dir().join(format!("cesta-raptor-persistence-{}", Uuid::new_v4()));
+        let revision = RoutingDataRevision {
+            latest_import: DateTime::from_timestamp_millis(1_783_479_136_328),
+            token: "0123456789abcdef".to_string(),
+        };
+        let service_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        let path = raptor_timetable_snapshot_path(&directory, service_date, &revision);
+        let timetable = RaptorTimetable::default();
+
+        assert!(
+            ensure_raptor_timetable_snapshot(&path, service_date, &revision, &timetable)
+                .await
+                .unwrap()
+        );
+        assert!(path.is_file());
+        assert!(
+            !ensure_raptor_timetable_snapshot(&path, service_date, &revision, &timetable)
+                .await
+                .unwrap()
+        );
+        assert!(
+            load_raptor_timetable_snapshot(&path, service_date, &revision)
+                .await
+                .is_some()
+        );
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warmup_reports_snapshot_directory_write_failures() {
+        let directory =
+            std::env::temp_dir().join(format!("cesta-raptor-write-error-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let blocked_parent = directory.join("not-a-directory");
+        tokio::fs::write(&blocked_parent, b"file").await.unwrap();
+        let path = blocked_parent.join("snapshot.json");
+        let revision = RoutingDataRevision {
+            latest_import: None,
+            token: "write-error".to_string(),
+        };
+        let service_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+
+        let error = ensure_raptor_timetable_snapshot(
+            &path,
+            service_date,
+            &revision,
+            &RaptorTimetable::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create snapshot directory")
+        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

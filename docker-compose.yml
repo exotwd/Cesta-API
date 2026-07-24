@@ -34,6 +34,7 @@ services:
       JWT_SECRET: dev-only-change-me
       REFRESH_TOKEN_SECRET: dev-only-change-me-too
       STORAGE_DIR: /app/storage
+      ROUTING_SNAPSHOT_DIR: /app/storage/processed/routing
       ROUTING_SNAPSHOT_FILES_TO_KEEP: ${ROUTING_SNAPSHOT_FILES_TO_KEEP:-2}
       USE_MOCK_DATA: "false"
       API_PORT: 8070

@@ -1327,7 +1327,11 @@
             <div>
               <span>${snapshot.memory_cached ? "In memory" : "Cold"}</span>
               <strong>${escapeHtml(snapshot.file_name || "snapshot not written yet")}</strong>
-              <small>${snapshot.modified_at ? `Modified ${escapeHtml(formatDate(snapshot.modified_at))}` : "Will be created after first warmup/search"}</small>
+              <small>${snapshot.modified_at
+                ? `Modified ${escapeHtml(formatDate(snapshot.modified_at))}`
+                : snapshot.memory_cached
+                  ? "Memory cache is ready, but its disk snapshot is missing; check the warmup error and directory permissions"
+                  : "Will be created after first warmup/search"}</small>
             </div>
           </div>`).join("")}
       </div>`;
