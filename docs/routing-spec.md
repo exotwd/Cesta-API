@@ -49,6 +49,12 @@ those probes are merged, deduplicated and ranked after RAPTOR; weighted scoring 
 the RAPTOR round scan. Evening searches also skip next-service-day RAPTOR when the current service
 day already produced enough candidates.
 
+When a range probe reaches the first transit leg through an endpoint walking link, the returned
+walk is scheduled backwards from that vehicle's departure using its computed walking duration.
+This reports the latest feasible walking departure instead of the arbitrary probe time. Final
+deduplication ignores the absolute probe time of otherwise identical leading walks while retaining
+their endpoints and duration, so one transit itinerary is not repeated for every range probe.
+
 RFC3339 journey timestamps are converted to `Europe/Prague` before the service date and seconds
 since midnight are derived. Offset-less date-times remain Prague-local wall times for backward
 compatibility. A final API-boundary guard removes any same-day candidate whose first departure is

@@ -6043,17 +6043,32 @@ fn is_walking_leg(leg: &JourneyLeg) -> bool {
 }
 
 fn visible_journey_key(journey: &Journey, stop_signatures: &HashMap<String, String>) -> String {
+    let leading_walk_count = journey
+        .legs
+        .iter()
+        .take_while(|leg| is_walking_leg(leg))
+        .count();
     journey
         .legs
         .iter()
-        .map(|leg| {
-            format!(
-                "{}:{}:{}:{}",
-                stop_signature(&leg.from_stop_id, stop_signatures),
-                stop_signature(&leg.to_stop_id, stop_signatures),
-                leg.departure_time,
-                leg.arrival_time
-            )
+        .enumerate()
+        .map(|(index, leg)| {
+            if index < leading_walk_count {
+                format!(
+                    "walk:{}:{}:{}",
+                    stop_signature(&leg.from_stop_id, stop_signatures),
+                    stop_signature(&leg.to_stop_id, stop_signatures),
+                    leg.arrival_time.saturating_sub(leg.departure_time)
+                )
+            } else {
+                format!(
+                    "{}:{}:{}:{}",
+                    stop_signature(&leg.from_stop_id, stop_signatures),
+                    stop_signature(&leg.to_stop_id, stop_signatures),
+                    leg.departure_time,
+                    leg.arrival_time
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -10971,6 +10986,54 @@ mod tests {
 
         assert_eq!(deduplicated.len(), 1);
         assert_eq!(deduplicated[0].id, "official");
+    }
+
+    #[test]
+    fn deduplication_ignores_probe_time_for_identical_leading_walks() {
+        let journey = |id: &str, walk_departure: u32| Journey {
+            id: id.to_string(),
+            legs: vec![
+                JourneyLeg {
+                    from_stop_id: "selected-origin".to_string(),
+                    to_stop_id: "nearby-stop".to_string(),
+                    route_id: None,
+                    trip_id: None,
+                    departure_time: walk_departure,
+                    arrival_time: walk_departure + 120,
+                    mode: TransportMode::Unknown,
+                    warnings: vec!["walking_transfer:150".to_string()],
+                },
+                JourneyLeg {
+                    from_stop_id: "nearby-stop".to_string(),
+                    to_stop_id: "destination".to_string(),
+                    route_id: Some("route".to_string()),
+                    trip_id: Some("same-trip".to_string()),
+                    departure_time: 4_000,
+                    arrival_time: 5_000,
+                    mode: TransportMode::Bus,
+                    warnings: Vec::new(),
+                },
+            ],
+            departure_time: walk_departure,
+            arrival_time: 5_000,
+            duration_seconds: 5_000 - walk_departure,
+            transfer_count: 0,
+            walking_distance_meters: 150,
+            realtime_status: RealtimeStatus::Unavailable,
+            risk_score: 0.0,
+            labels: Vec::new(),
+        };
+        let first_probe = journey("first-probe", 3_500);
+        let second_probe = journey("second-probe", 3_600);
+
+        let deduplicated = dedupe_relevant_journeys(
+            vec![first_probe, second_probe],
+            &HashMap::new(),
+            &HashMap::new(),
+            &RoutingAlgorithmConfig::default(),
+        );
+
+        assert_eq!(deduplicated.len(), 1);
     }
 
     #[test]

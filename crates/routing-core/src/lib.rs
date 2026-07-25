@@ -539,11 +539,12 @@ pub fn raptor_with_stats(
         else {
             continue;
         };
-        let Some(legs) =
+        let Some(mut legs) =
             reconstruct_raptor_journey(timetable, &request_stop_ids, round, target, &parents)
         else {
             continue;
         };
+        align_leading_walk_to_first_transit_departure(&mut legs);
         let departure_time = legs
             .first()
             .map_or(request.departure_time, |leg| leg.departure_time);
@@ -729,6 +730,43 @@ fn journey_walking_distance_meters(legs: &[JourneyLeg]) -> u32 {
         .filter_map(|warning| warning.strip_prefix("walking_transfer:"))
         .filter_map(|distance| distance.parse::<u32>().ok())
         .sum()
+}
+
+fn align_leading_walk_to_first_transit_departure(legs: &mut [JourneyLeg]) {
+    let leading_walk_count = legs
+        .iter()
+        .take_while(|leg| leg.route_id.is_none() && leg.trip_id.is_none())
+        .count();
+    let Some(first_transit) = legs.get(leading_walk_count) else {
+        return;
+    };
+    if leading_walk_count == 0 {
+        return;
+    }
+
+    let durations = legs[..leading_walk_count]
+        .iter()
+        .map(|leg| leg.arrival_time.checked_sub(leg.departure_time))
+        .collect::<Option<Vec<_>>>();
+    let Some(durations) = durations else {
+        return;
+    };
+    let total_duration = durations
+        .iter()
+        .try_fold(0_u32, |total, duration| total.checked_add(*duration));
+    let Some(total_duration) = total_duration else {
+        return;
+    };
+    if first_transit.departure_time < total_duration {
+        return;
+    }
+
+    let mut next_departure = first_transit.departure_time;
+    for (leg, duration) in legs[..leading_walk_count].iter_mut().zip(durations).rev() {
+        leg.arrival_time = next_departure;
+        leg.departure_time = next_departure - duration;
+        next_departure = leg.departure_time;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1187,6 +1225,9 @@ mod tests {
         assert_eq!(journeys.len(), 1);
         assert_eq!(journeys[0].legs[0].from_stop_id, "selected");
         assert_eq!(journeys[0].legs[0].to_stop_id, "nearby");
+        assert_eq!(journeys[0].legs[0].departure_time, 8 * 3600 + 60);
+        assert_eq!(journeys[0].legs[0].arrival_time, 8 * 3600 + 180);
+        assert_eq!(journeys[0].departure_time, 8 * 3600 + 60);
         assert_eq!(journeys[0].walking_distance_meters, 150);
     }
 
