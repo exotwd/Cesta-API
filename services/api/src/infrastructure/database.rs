@@ -5,6 +5,9 @@ use tokio::time;
 
 use crate::config::DatabasePoolConfig;
 
+const PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION: &str =
+    include_str!("../../../../infra/postgres/migrations/0021_pid_public_query_performance.sql");
+
 pub(crate) async fn connect_with_retry(
     database_url: &str,
     pool_config: &DatabasePoolConfig,
@@ -179,6 +182,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0020_pid_only_sources",
         include_str!("../../../../infra/postgres/migrations/0020_pid_only_sources.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0021_pid_public_query_performance",
+        PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION,
+    )
     .await
 }
 
@@ -250,4 +259,36 @@ async fn apply_nontransactional_startup_migration(
     migration_result?;
     unlock_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION;
+
+    #[test]
+    fn pid_public_stop_projection_excludes_indirect_source_mappings() {
+        let migration = PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION.to_ascii_lowercase();
+
+        assert!(migration.contains("where stop.source_feed_id = 'pid_gtfs'"));
+        assert!(!migration.contains("lateral"));
+        assert!(!migration.contains("stop_source_ids"));
+    }
+
+    #[test]
+    fn pid_public_stop_projection_has_a_matching_spatial_index() {
+        let migration = PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION.to_ascii_lowercase();
+
+        assert!(migration.contains("on stops using gist (geom)"));
+        assert!(migration.contains("where source_feed_id = 'pid_gtfs'"));
+        assert!(migration.contains("and is_active = true"));
+    }
+
+    #[test]
+    fn pid_vehicle_map_has_a_latest_position_index() {
+        let migration = PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION.to_ascii_lowercase();
+
+        assert!(migration.contains("realtime_updates_pid_vehicle_latest_idx"));
+        assert!(migration.contains("(source_feed_id, vehicle_id, fetched_at desc)"));
+        assert!(migration.contains("where source_feed_id = 'pid_realtime'"));
+    }
 }

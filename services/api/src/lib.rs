@@ -4143,6 +4143,32 @@ async fn query_journeys_profiled_db(
             "discarded {departed_candidate_count} already-departed journey candidates"
         ));
     }
+    if journeys.is_empty() {
+        let stage_started = time::Instant::now();
+        let mut direct_journeys = direct_journeys_db(
+            pool,
+            &from_stop_ids,
+            &to_stop_ids,
+            departure_time,
+            &mode_filters,
+            service_date,
+            routing_config.max_results.max(1) as i64,
+        )
+        .await?;
+        let direct_count = direct_journeys.len();
+        journeys.append(&mut direct_journeys);
+        timing.push(
+            "direct_pid_fallback",
+            stage_started,
+            Some(format!("{direct_count} direct PID candidates")),
+        );
+        if direct_count > 0 {
+            warnings.push(
+                "used the direct PID schedule fallback because RAPTOR returned no same-day route"
+                    .to_string(),
+            );
+        }
+    }
     append_transfer_search_warning(
         &mut warnings,
         transfer_search_status,
@@ -6600,7 +6626,6 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
     Ok(ids)
 }
 
-#[allow(dead_code)] // Retained temporarily for rollback comparison while RAPTOR is deployed.
 async fn direct_journeys_db(
     pool: &PgPool,
     from_stop_ids: &[String],
@@ -6670,6 +6695,10 @@ async fn direct_journeys_db(
             ON st_to.trip_id = st_from.trip_id
            AND st_to.stop_sequence > st_from.stop_sequence
           JOIN trips t ON t.id = st_from.trip_id
+          JOIN source_feeds feed
+            ON feed.id = t.source_feed_id
+           AND feed.id = 'pid_gtfs'
+           AND feed.enabled = true
           LEFT JOIN latest_import_runs lir
             ON lir.source_feed_id = t.source_feed_id
            AND lir.import_run_id = t.import_run_id

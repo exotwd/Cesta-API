@@ -428,8 +428,10 @@ pub(crate) async fn realtime_vehicles(
         FROM realtime_updates realtime
         JOIN source_feeds feed
           ON feed.id = realtime.source_feed_id
+         AND feed.id = 'pid_realtime'
          AND feed.enabled = true
         WHERE realtime.vehicle_id IS NOT NULL
+          AND realtime.source_feed_id = 'pid_realtime'
           AND vehicle_position IS NOT NULL
           AND (valid_until IS NULL OR valid_until >= now())
           AND ($1::text IS NULL OR realtime.source = $1 OR realtime.source_feed_id = $1)
