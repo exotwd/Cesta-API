@@ -164,7 +164,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/admin/imports": {"get": {"summary": "List import runs"}},
             "/admin/imports/{id}": {"get": {"summary": "Get an import run and its validation issues"}},
-            "/admin/imports/ggu-latest/start": {"post": {"summary": "Start GGU latest import"}},
+            "/admin/imports/pid/start": {"post": {"summary": "Start PID schedule synchronization"}},
             "/admin/database/stats": {"get": {
                 "summary": "Current database and routing-cache usage",
                 "description": "Returns current PostgreSQL storage composition, estimated live and dead rows, largest indexes, connection and cache statistics, recent imports, source coverage and routing snapshot usage. Requires an admin or data_admin token.",
@@ -685,9 +685,9 @@ pub(crate) async fn data_status(State(state): State<AppState>) -> Json<Value> {
 pub(crate) async fn sources() -> Json<Value> {
     Json(json!({
         "sources": [
-            {"id":"ggu_jdf_gtfs_latest","url":"https://data.jr.ggu.cz/results/latest/JDF_merged_GTFS.zip","priority":30,"type":"gtfs"},
-            {"id":"ggu_czptt_gtfs_latest","url":"https://data.jr.ggu.cz/results/latest/CZPTT_GTFS.zip","priority":20,"type":"gtfs"},
-            {"id":"ggu_jdf_raw_latest","url":"https://data.jr.ggu.cz/results/latest/JDF_merged.zip","priority":40,"type":"jdf_raw"}
+            {"id":"pid_gtfs","url":"https://data.pid.cz/PID_GTFS.zip","priority":10,"type":"gtfs"},
+            {"id":"pid_lines_geodata","url":"https://data.pid.cz/geodata/Linky_7d_WGS84.json","priority":10,"type":"geojson"},
+            {"id":"pid_realtime","url":"https://api.golemio.cz/v2/vehiclepositions/gtfsrt/trip_updates.pb","priority":10,"type":"gtfs_realtime"}
         ]
     }))
 }

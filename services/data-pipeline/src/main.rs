@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
         Command::Download {
             source: Source::GguLatest,
         } => {
+            ensure_ggu_imports_enabled()?;
             let run_dir = download_ggu_latest(&cli.storage_dir, &cli.ggu_latest_base_url).await?;
             println!("{}", run_dir.display());
         }
@@ -275,6 +276,7 @@ async fn main() -> Result<()> {
             limit_rows,
             force_db_export,
         } => {
+            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             import_ggu_latest(
                 &run_dir,
@@ -301,6 +303,7 @@ async fn main() -> Result<()> {
         Command::Validate {
             target: Target::Latest,
         } => {
+            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             validate_latest(&run_dir)?;
         }
@@ -309,6 +312,7 @@ async fn main() -> Result<()> {
             limit_rows,
             force_db_export,
         } => {
+            ensure_ggu_imports_enabled()?;
             let run_dir = download_ggu_latest(&cli.storage_dir, &cli.ggu_latest_base_url).await?;
             import_ggu_latest(
                 &run_dir,
@@ -336,6 +340,7 @@ async fn main() -> Result<()> {
         Command::Summarize {
             target: Target::Latest,
         } => {
+            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             summarize(&run_dir)?;
         }
@@ -376,6 +381,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_ggu_imports_enabled() -> Result<()> {
+    let enabled = std::env::var("GGU_IMPORTS_ENABLED")
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if enabled {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "GGU imports are disabled while PID-only mode is active; use sync-pid instead"
+        )
+    }
 }
 
 async fn import_czech_cities(database_url: &str, source_url: &str) -> Result<()> {

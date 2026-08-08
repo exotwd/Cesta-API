@@ -173,6 +173,12 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "0019_storage_optimization",
         include_str!("../../../../infra/postgres/migrations/0019_storage_optimization.sql"),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0020_pid_only_sources",
+        include_str!("../../../../infra/postgres/migrations/0020_pid_only_sources.sql"),
+    )
     .await
 }
 

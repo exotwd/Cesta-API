@@ -426,7 +426,9 @@ pub(crate) async fn realtime_vehicles(
           feed.url AS source_url, feed.license_id, feed.attribution,
           feed.terms_url, feed.redistribution_allowed
         FROM realtime_updates realtime
-        LEFT JOIN source_feeds feed ON feed.id = realtime.source_feed_id
+        JOIN source_feeds feed
+          ON feed.id = realtime.source_feed_id
+         AND feed.enabled = true
         WHERE realtime.vehicle_id IS NOT NULL
           AND vehicle_position IS NOT NULL
           AND (valid_until IS NULL OR valid_until >= now())
@@ -521,6 +523,7 @@ pub(crate) async fn data_sources_status(State(state): State<AppState>) -> Json<V
                last_success_at, source_timestamp, records_received,
                records_written, error_message, metadata
         FROM data_source_syncs
+        WHERE source_id IN ('pid_gtfs', 'pid_lines_geodata', 'pid_gtfs_rt')
         ORDER BY source_id ASC
         "#,
     )

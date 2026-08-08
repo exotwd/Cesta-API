@@ -146,7 +146,7 @@ fn admin_routes() -> Router<AppState> {
         .route("/admin/imports", get(admin_imports))
         .route("/admin/imports/{id}", get(admin_import))
         .route("/admin/imports/latest", get(admin_import_latest))
-        .route("/admin/imports/ggu-latest/start", post(admin_import_start))
+        .route("/admin/imports/pid/start", post(admin_import_start))
         .route("/admin/database/stats", get(admin_database_stats))
         .route("/admin/data-quality", get(admin_data_quality))
         .route(

@@ -52,8 +52,8 @@ Example API leg:
 
 ```json
 {
-  "from_stop_id": "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-2",
-  "to_stop_id": "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-7",
+  "from_stop_id": "pid_gtfs:U1Z1P",
+  "to_stop_id": "pid_gtfs:U1Z2P",
   "route_id": null,
   "trip_id": null,
   "departure_time": 65220,

@@ -73,6 +73,7 @@ services:
       PID_API_TOKEN: ${PID_API_TOKEN:-}
       PID_VEHICLE_POSITIONS_JSON_URL: ${PID_VEHICLE_POSITIONS_JSON_URL:-https://api.golemio.cz/v2/vehiclepositions}
       PID_POLL_INTERVAL_SECONDS: ${PID_POLL_INTERVAL_SECONDS:-20}
+      NON_PID_REALTIME_ENABLED: ${NON_PID_REALTIME_ENABLED:-false}
       IDS_JMK_VEHICLES_URL: ${IDS_JMK_VEHICLES_URL:-https://kordis-jmk.cz/gtfs/gtfsReal.dat}
       IDS_JMK_POLL_INTERVAL_SECONDS: ${IDS_JMK_POLL_INTERVAL_SECONDS:-30}
       DUK_ENABLED: ${DUK_ENABLED:-false}
@@ -91,7 +92,7 @@ services:
     environment:
       DATABASE_URL: postgres://cesta:cesta@postgres:5432/cesta
       STORAGE_DIR: /app/storage
-      GGU_LATEST_BASE_URL: https://data.jr.ggu.cz/results/latest/
+      GGU_IMPORTS_ENABLED: ${GGU_IMPORTS_ENABLED:-false}
       RAW_IMPORT_RUNS_TO_KEEP: ${RAW_IMPORT_RUNS_TO_KEEP:-3}
       RAW_INCOMPLETE_RUN_MAX_AGE_HOURS: ${RAW_INCOMPLETE_RUN_MAX_AGE_HOURS:-24}
       DB_IMPORT_RUNS_TO_KEEP: ${DB_IMPORT_RUNS_TO_KEEP:-1}

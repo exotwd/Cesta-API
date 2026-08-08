@@ -1816,8 +1816,8 @@ async fn admin_import_start(
     require_admin(&state, &headers).await?;
     Ok(Json(json!({
         "status": "accepted",
-        "command": "cargo run -p data-pipeline -- import-and-validate ggu-latest",
-        "warning": "API does not run the full import inline; use a worker/job runner"
+        "command": "cargo run -p data-pipeline -- sync-pid",
+        "warning": "API does not run synchronization inline; use the schedule updater or a worker/job runner"
     })))
 }
 
@@ -3551,25 +3551,35 @@ fn source_feed_row_json(row: sqlx::postgres::PgRow) -> Value {
 async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
     let latest = sqlx::query(
         r#"
-        SELECT id, source, status, started_at, finished_at, summary
-        FROM import_runs
-        WHERE status = 'success'
+        SELECT run.id, run.source, run.status, run.started_at, run.finished_at, run.summary
+        FROM import_runs AS run
+        JOIN source_feeds AS feed
+          ON feed.id = run.summary->>'feed_id'
+         AND feed.enabled = true
+        WHERE run.status = 'success'
         ORDER BY finished_at DESC NULLS LAST, started_at DESC
         LIMIT 1
         "#,
     )
     .fetch_optional(pool)
     .await?;
-    let stop_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stops WHERE is_active = true")
+    let stop_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM enabled_source_stops WHERE is_active = true")
+            .fetch_one(pool)
+            .await?;
+    let route_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM routes JOIN source_feeds feed ON feed.id = routes.source_feed_id AND feed.enabled = true WHERE routes.is_active = true",
+    )
         .fetch_one(pool)
         .await?;
-    let route_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE is_active = true")
-        .fetch_one(pool)
-        .await?;
-    let trip_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trips")
-        .fetch_one(pool)
-        .await?;
-    let stop_time_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stop_times")
+    let trip_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trips JOIN source_feeds feed ON feed.id = trips.source_feed_id AND feed.enabled = true",
+    )
+    .fetch_one(pool)
+    .await?;
+    let stop_time_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM stop_times JOIN trips ON trips.id = stop_times.trip_id JOIN source_feeds feed ON feed.id = trips.source_feed_id AND feed.enabled = true",
+    )
         .fetch_one(pool)
         .await?;
     let realtime_sources = sqlx::query(
@@ -3577,10 +3587,11 @@ async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
         SELECT source_id, status, last_success_at, source_timestamp,
                records_received, records_written, error_message
         FROM data_source_syncs
-        WHERE data_kind IN ('gtfs_realtime', 'vehicle_positions')
+        WHERE source_id = $1
         ORDER BY source_id ASC
         "#,
     )
+    .bind(PID_SOURCE_STATUS_ID)
     .fetch_all(pool)
     .await?;
     let pid_realtime_current = realtime_sources.iter().any(|row| {
@@ -4657,8 +4668,8 @@ async fn nearby_endpoint_transfers_db(
             selected.id AS from_stop_id,
             candidate.id AS to_stop_id,
             ST_Distance(selected.geom, candidate.geom)::integer AS distance_meters
-          FROM stops selected
-          JOIN stops candidate
+          FROM enabled_source_stops selected
+          JOIN enabled_source_stops candidate
             ON candidate.is_active = true
            AND candidate.geom IS NOT NULL
            AND candidate.id <> ALL($1)
@@ -4679,8 +4690,8 @@ async fn nearby_endpoint_transfers_db(
             candidate.id AS from_stop_id,
             selected.id AS to_stop_id,
             ST_Distance(candidate.geom, selected.geom)::integer AS distance_meters
-          FROM stops selected
-          JOIN stops candidate
+          FROM enabled_source_stops selected
+          JOIN enabled_source_stops candidate
             ON candidate.is_active = true
            AND candidate.geom IS NOT NULL
            AND candidate.id <> ALL($1)
@@ -5666,8 +5677,8 @@ async fn raptor_timetable_db(
                transfer.walking_geometry, transfer.confidence,
                transfer.accessibility_level, transfer.source
         FROM transfers transfer
-        JOIN stops origin ON origin.id = transfer.from_stop_id AND origin.is_active = true
-        JOIN stops destination ON destination.id = transfer.to_stop_id AND destination.is_active = true
+        JOIN enabled_source_stops origin ON origin.id = transfer.from_stop_id AND origin.is_active = true
+        JOIN enabled_source_stops destination ON destination.id = transfer.to_stop_id AND destination.is_active = true
         "#,
     )
     .fetch_all(pool)
@@ -5716,7 +5727,7 @@ async fn implicit_station_transfers_db(
     let rows = sqlx::query(
         r#"
         SELECT id, name, municipality, lat, lon, stop_area_id, platform_code, modes
-        FROM stops
+        FROM enabled_source_stops
         WHERE is_active = true AND id = ANY($1)
         "#,
     )
@@ -6449,7 +6460,7 @@ async fn resolve_journey_point_db(
 
     if point.point_type == "city" {
         let stop_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM stops WHERE is_active = true AND city_id = $1 ORDER BY id",
+            "SELECT id FROM enabled_source_stops WHERE is_active = true AND city_id = $1 ORDER BY id",
         )
         .bind(candidate)
         .fetch_all(pool)
@@ -6526,7 +6537,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
 
     if let Some(stop_area_id) = &stop.stop_area_id {
         let mut area_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM stops WHERE is_active = true AND stop_area_id = $1 LIMIT 250",
+            "SELECT id FROM enabled_source_stops WHERE is_active = true AND stop_area_id = $1 LIMIT 250",
         )
         .bind(stop_area_id)
         .fetch_all(pool)
@@ -6539,7 +6550,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         let station_ids = sqlx::query_scalar::<_, String>(
             r#"
             SELECT id
-            FROM stops
+            FROM enabled_source_stops
             WHERE is_active = true
               AND (id = $1 OR id LIKE $2 ESCAPE '\')
             LIMIT 250
@@ -6563,7 +6574,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                    platform_code, location_type, parent_station_id, wheelchair_boarding,
                    modes, source_priority, is_active
-            FROM stops
+            FROM enabled_source_stops
             WHERE is_active = true
               AND lat IS NOT NULL
               AND lon IS NOT NULL
@@ -7682,7 +7693,10 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         r#"
         SELECT stop_id, source_feed_id, original_source_id, import_run_id, priority,
                confidence, suppressed_as_duplicate
-        FROM stop_source_ids
+        FROM stop_source_ids AS source_id
+        JOIN source_feeds AS source_feed
+          ON source_feed.id = source_id.source_feed_id
+         AND source_feed.enabled = true
         WHERE stop_id = ANY($1)
         ORDER BY stop_id ASC, priority ASC, source_feed_id ASC
         "#,
@@ -7718,6 +7732,7 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         FROM stop_times st
         JOIN trips t ON t.id = st.trip_id
         JOIN routes r ON r.id = t.route_id
+        JOIN source_feeds feed ON feed.id = t.source_feed_id AND feed.enabled = true
         WHERE st.stop_id = ANY($1)
         ORDER BY r.source_priority ASC, r.short_name ASC NULLS LAST, r.id ASC
         LIMIT 200
@@ -7792,7 +7807,7 @@ async fn search_stops_db(
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                    platform_code, location_type, parent_station_id, wheelchair_boarding,
                    modes, source_priority, is_active
-            FROM stops
+            FROM enabled_source_stops
             WHERE is_active = true
               AND btrim(name) <> ''
               AND btrim(normalized_name) <> ''
@@ -7820,7 +7835,7 @@ async fn search_stops_db(
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                platform_code, location_type, parent_station_id, wheelchair_boarding,
                modes, source_priority, is_active
-        FROM stops
+        FROM enabled_source_stops
         WHERE is_active = true
           AND btrim(name) <> ''
           AND btrim(normalized_name) <> ''
@@ -7937,7 +7952,7 @@ async fn nearby_stops_db(
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                platform_code, location_type, parent_station_id, wheelchair_boarding,
                modes, source_priority, is_active
-        FROM stops
+        FROM enabled_source_stops
         WHERE is_active = true
           AND btrim(name) <> ''
           AND btrim(normalized_name) <> ''
@@ -7968,7 +7983,7 @@ async fn stops_in_bounds_db(
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                platform_code, location_type, parent_station_id, wheelchair_boarding,
                modes, source_priority, is_active
-        FROM stops
+        FROM enabled_source_stops
         WHERE is_active = true
           AND btrim(name) <> ''
           AND btrim(normalized_name) <> ''
@@ -8000,7 +8015,7 @@ async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Erro
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                platform_code, location_type, parent_station_id, wheelchair_boarding,
                modes, source_priority, is_active
-        FROM stops
+        FROM enabled_source_stops
         WHERE id = $1 AND is_active = true
         "#,
     )
@@ -8039,6 +8054,7 @@ async fn departures_db(
         FROM stop_times st
         JOIN trips t ON t.id = st.trip_id
         JOIN routes r ON r.id = t.route_id
+        JOIN source_feeds feed ON feed.id = t.source_feed_id AND feed.enabled = true
         LEFT JOIN LATERAL (
           SELECT delay_seconds, estimated_arrival, estimated_departure,
                  cancellation_status, platform_change, source, fetched_at, valid_until
@@ -8267,7 +8283,7 @@ async fn fetch_source_feeds_json(
         r#"
         SELECT id, name, url, type, mode_scope, priority, enabled
         FROM source_feeds
-        WHERE id = ANY($1)
+        WHERE id = ANY($1) AND enabled = true
         ORDER BY priority ASC, id ASC
         "#,
     )
@@ -9343,6 +9359,8 @@ mod tests {
         assert!(payload["paths"]["/vehicles"].is_object());
         assert!(payload["components"]["schemas"]["Vehicle"].is_object());
         assert!(payload["paths"]["/data-sources/status"].is_object());
+        assert!(payload["paths"]["/admin/imports/pid/start"]["post"].is_object());
+        assert!(payload["paths"]["/admin/imports/ggu-latest/start"].is_null());
         assert!(payload["paths"]["/stops/in-bounds"]["get"].is_object());
         assert!(payload["components"]["schemas"]["StopsInBoundsResponse"].is_object());
         assert!(payload["components"]["schemas"]["JourneyLegRealtime"].is_object());
@@ -9375,6 +9393,33 @@ mod tests {
             json!(["exact_coordinates", "nearby_same_direction"])
         );
         assert!(payload["components"]["schemas"]["RouteSearchDiagnostics"].is_object());
+    }
+
+    #[tokio::test]
+    async fn metadata_sources_lists_only_pid_feeds() {
+        let app = build_router(app_state().await.unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metadata/sources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let source_ids = payload["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_ids,
+            vec!["pid_gtfs", "pid_lines_geodata", "pid_realtime"]
+        );
     }
 
     #[tokio::test]

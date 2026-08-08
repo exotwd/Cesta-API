@@ -11,7 +11,7 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 - Shared transport domain model crates.
 - Fixture-backed routing core with a simple Connection Scan Algorithm.
 - GTFS importer crate that parses core GTFS files from zip archives and validates common data-quality issues.
-- GGU latest downloader/import CLI foundation for `https://data.jr.ggu.cz/results/latest/`.
+- PID GTFS schedule, line geometry and realtime import pipelines.
 - API endpoints for health, metadata, auth, user data, stops, departures, journeys, realtime status, offline packages, tickets, public boards and admin import/data-quality status.
 - Authenticated ČD Ticket API integration for searches, quotes, add-ons, verified checkout/issuance, owned documents, and refunds.
 - Embedded administrator interface for database browsing, stop maps, import history, validation issues and source-feed management.
@@ -28,9 +28,8 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 
 ## What Uses Real Data
 
-- The `data-pipeline` service can download GGU latest GTFS and log files, archive them without overwrites, compute SHA-256 checksums, parse GTFS core files and export agencies, stops, routes, trips, stop times and validation issues to PostgreSQL.
 - The `schedule-updater` checks official PID GTFS and seven-day line geometry every six hours and imports only changed schedules.
-- The realtime worker consumes PID GTFS-Realtime and rich Golemio vehicle data every 20 seconds plus the official IDS JMK GTFS-Realtime feed every 30 seconds. The DÚK adapter is disabled until redistribution terms are confirmed. PID delays are joined to concrete trips and stops.
+- The realtime worker consumes PID GTFS-Realtime and rich Golemio vehicle data every 20 seconds. Non-PID connectors are disabled in PID-only mode. PID delays are joined to concrete trips and stops.
 - `/metadata/data-status`, `/stops/search`, `/stops/{id}` and `/departures` read imported database data when `USE_MOCK_DATA=false`.
 - API response shapes include data freshness and warnings so mock or unavailable data is not hidden.
 
@@ -62,8 +61,7 @@ Useful local commands:
 ```powershell
 cargo test
 cargo run -p cesta-api
-cargo run -p data-pipeline -- import-and-validate ggu-latest --limit-rows 1000
-cargo run -p data-pipeline -- summarize latest
+cargo run -p data-pipeline -- sync-pid
 cargo run -p realtime-worker
 cargo run -p realtime-worker -- --check-feeds
 ```
@@ -133,13 +131,9 @@ Invoke-RestMethod ("http://localhost:8070/departures?stopId=" + [uri]::EscapeDat
 Invoke-RestMethod -Method Post http://localhost:8070/journeys/search -ContentType "application/json" -Body '{"from":{"type":"stop","id":"stop-praha-hl-n"},"to":{"type":"stop","id":"stop-brno-hl-n"},"datetime":"2026-07-06T21:05:00+02:00","mode":"depart_at","transport_modes":["train"],"max_transfers":4,"walking_speed":"normal","prefer_reliable_transfers":true,"offline_compatible":false}'
 ```
 
-## GGU Latest Import
+## PID-Only Source Policy
 
-```powershell
-docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest --limit-rows 1000
-```
-
-This downloads real GGU latest files into `storage/raw/...`, parses GTFS core files and exports imported rows to PostgreSQL. Conditional HTTP checks reuse files confirmed unchanged by `ETag`, `Last-Modified`, or `304 Not Modified`; size alone is never treated as proof that a timetable is unchanged. Mixed GGU runs hard-link unchanged files and download only changed files. Database export skips a source when the same SHA-256 was already imported successfully, upserts changed rows, and removes schedule rows, source identifiers and inactive stops that disappeared upstream. `RAW_IMPORT_RUNS_TO_KEEP` controls completed raw-run retention and defaults to `3`; incomplete timestamped runs older than `RAW_INCOMPLETE_RUN_MAX_AGE_HOURS` (default `24`) are also removed automatically. `DB_IMPORT_RUNS_TO_KEEP` controls recent PostgreSQL import audit and validation retention per feed and defaults to `1`. Processed RAPTOR cache retention is bounded by `ROUTING_SNAPSHOT_FILES_TO_KEEP` (default `2`, covering today and tomorrow). Active runs, current transport rows, today/tomorrow routing caches, reports, and unrecognized/manual files remain protected. Use `--force-db-export` only when you intentionally want to rewrite an unchanged feed. Full national imports can be large. Use `--limit-rows` for development and remove it for production-style runs.
+PID GTFS, PID line geometry and PID realtime are the only enabled transport feeds. Historical GGU rows and validation reports remain in PostgreSQL for auditability, but public queries and routing exclude disabled feeds. Legacy GGU CLI operations are blocked unless `GGU_IMPORTS_ENABLED=true` is set explicitly.
 
 Inspect PostgreSQL table and index usage before and after storage maintenance:
 
@@ -182,7 +176,7 @@ Flutter integration for detailed journey stop calls is documented in [`docs/app-
 
 Flutter map integration for normalized live vehicles and typed stop markers is documented in [`docs/app-vehicle-map.md`](docs/app-vehicle-map.md).
 
-After deploying calendar-aware routing, refresh existing schedule feeds once. PID refreshes automatically; refresh a legacy GGU import with `docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest`.
+After deploying calendar-aware routing, refresh PID once with `docker compose --profile tools run --rm data-pipeline sync-pid`; subsequent refreshes run automatically.
 
 ## Next Connections
 

@@ -189,12 +189,21 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("starting public transport realtime worker");
+    let non_pid_enabled = env_bool("NON_PID_REALTIME_ENABLED", false);
     let duk_enabled = env_bool("DUK_ENABLED", false);
+    let ids_jmk_pool = pool.clone();
+    let ids_jmk_client = client.clone();
     tokio::join!(
         run_pid_loop(pool.clone(), client.clone()),
-        run_ids_jmk_loop(pool.clone(), client.clone()),
         async move {
-            if duk_enabled {
+            if non_pid_enabled {
+                run_ids_jmk_loop(ids_jmk_pool, ids_jmk_client).await;
+            } else {
+                tracing::info!("IDS JMK realtime connector is disabled in PID-only mode");
+            }
+        },
+        async move {
+            if non_pid_enabled && duk_enabled {
                 run_duk_loop(pool, client).await;
             } else {
                 tracing::info!(
@@ -219,10 +228,6 @@ async fn check_external_feeds() -> Result<()> {
     let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
     });
-    let jmk_url = env::var("IDS_JMK_VEHICLES_URL")
-        .unwrap_or_else(|_| "https://kordis-jmk.cz/gtfs/gtfsReal.dat".to_string());
-    let duk_url = env::var("DUK_VEHICLES_URL")
-        .unwrap_or_else(|_| "https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0".to_string());
     let (trip_bytes, vehicle_bytes) = tokio::try_join!(
         fetch_bytes(&client, &trip_updates_url, token.as_deref()),
         fetch_bytes(&client, &vehicle_positions_url, token.as_deref())
@@ -231,25 +236,6 @@ async fn check_external_feeds() -> Result<()> {
     let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_slice())?;
     let trip_records = pid_trip_records(&trip_feed)?;
     let vehicle_records = pid_vehicle_records(&vehicle_feed)?;
-    let jmk_bytes = fetch_bytes(&client, &jmk_url, None).await?;
-    let jmk_feed = FeedMessage::decode(jmk_bytes.as_slice())?;
-    let jmk_records = ids_jmk_vehicle_records(&jmk_feed);
-    let duk_vehicles = if env_bool("DUK_ENABLED", false) {
-        let duk: Value = client
-            .get(&duk_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Some(
-            duk.get("VehicleList")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len),
-        )
-    } else {
-        None
-    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -259,15 +245,6 @@ async fn check_external_feeds() -> Result<()> {
                 "vehicle_entities": vehicle_feed.entity.len(),
                 "vehicle_records": vehicle_records.len(),
                 "source_timestamp": feed_timestamp(&trip_feed)
-            },
-            "ids_jmk": {
-                "entities": jmk_feed.entity.len(),
-                "vehicle_records": jmk_records.len(),
-                "source_timestamp": feed_timestamp(&jmk_feed)
-            },
-            "duk": {
-                "enabled": env_bool("DUK_ENABLED", false),
-                "vehicles": duk_vehicles
             }
         }))?
     );

@@ -388,10 +388,10 @@
 
   <dialog id="command-dialog">
     <div class="dialog-header">
-      <div><h2>Run a full data import</h2><p>Execute from the repository root or deployment host.</p></div>
+      <div><h2>Synchronize PID data</h2><p>Execute from the repository root or deployment host.</p></div>
       <button class="icon-button" id="command-close" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
     </div>
-    <code class="command-block">docker compose --profile tools run --rm data-pipeline import-and-validate ggu-latest</code>
+    <code class="command-block">docker compose --profile tools run --rm data-pipeline sync-pid</code>
   </dialog>
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>

@@ -8,7 +8,7 @@ MVP scope:
 - stop search, nearby stops and stop detail
 - departures and public board data
 - journey search response format with delay-aware metadata
-- real GGU latest data download/import foundation
+- official PID schedule, geometry and realtime imports
 - data-quality and admin import endpoints
 - offline package metadata foundation
 - realtime architecture with explicit unavailable/mock status
@@ -19,4 +19,3 @@ Out of scope:
 - real payment processing
 - production ticket purchase
 - final commercial deployment
-
