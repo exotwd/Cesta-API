@@ -44,10 +44,27 @@ For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The 
 departure time is searched first. If it produces too few distinct candidates, evenly spaced
 coverage probes and real departures from resolved origin stops within
 `range_search_window_seconds` are searched two at a time, up to `max_range_departures`, stopping as
-soon as the candidate floor is reached. Each small batch uses bounded concurrency. Candidates from
+soon as the route-pattern diversity floor is reached. Repeated departures of the same line pattern
+do not end expansion early. Each small batch uses bounded concurrency. Candidates from
 those probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside
 the RAPTOR round scan. Evening searches also skip next-service-day RAPTOR when the current service
 day already produced enough candidates.
+
+If all bounded departure probes still produce too few reasonable route patterns, up to two
+additional bounded passes exclude the winning route and then the first route of the best alternative.
+This exposes genuinely different itineraries, including metro combinations, without turning the
+search into an unbounded combinatorial alternatives scan. Patterns outside the same 15-minute
+quality window do not satisfy the diversity target or receive a reserved result slot.
+
+Final selection applies objective Pareto dominance before transfer-count, route and carrier
+diversity. A candidate is removed when another allowed candidate departs no earlier, arrives no
+later and has no more transfers, with at least one strict improvement. Carrier and route diversity
+cannot restore such a candidate.
+
+When final selection returns no journey, `related.routing_diagnostics` identifies the failure
+stage and reports expanded endpoint IDs, coordinate-access status, timetable size, active mode and
+transfer filters, and candidate counts after service validation, deduplication, geometry validation
+and dominance pruning. Successful public responses omit this diagnostic block.
 
 When a range probe reaches the first transit leg through an endpoint walking link, the returned
 walk is scheduled backwards from that vehicle's departure using its computed walking duration.
@@ -61,21 +78,62 @@ compatibility. A final API-boundary guard removes any same-day candidate whose f
 earlier than the requested Prague-local time, so stale or malformed timetable data cannot surface
 an already-departed connection.
 
-RAPTOR timetables include imported transfers plus implicit same-station/platform interchange
-footpaths derived from stop areas, railway station IDs, and conservative station-like
-name/municipality/coordinate grouping. This lets transfers between platform-level stop records work
-without adding route-specific exceptions.
+RAPTOR timetables include PID's general `transfer_type=2` minimum-change times, including official
+same-stop change times. Candidate station complexes come from `stop_area_id`, `parent_station_id`,
+source-native station relationships and conservative name/proximity grouping. Cross-mode implicit
+edges are admitted only after the pedestrian engine finds a walking-only route; source proximity
+never creates an edge by itself. Trip-pair `transfer_type=1` guarantees are counted in the import
+summary but are not widened into generic links.
 
-Nearby origin and destination walking access is cached by routing-data revision, endpoint stop set,
-direction and walking speed when `endpoint_access_cache_enabled` is true. Cache misses use the same
-PostGIS radius query as before, so repeated searches avoid endpoint transfer latency without
-changing option coverage.
+Among valid GTFS pickup and drop-off values, `1` is the prohibited action. PID values `2` and `3`
+remain routable because they permit service with advance or driver coordination; the API exposes
+the original values in related stop-time and stop-call metadata.
+
+An explicit stop endpoint is expanded deterministically to its active station children, stop-area
+members, PID complex members, railway platforms and co-located same-name siblings. Those IDs are
+direct routing origins/destinations and never require a street-routing request to reach their own
+platforms. Coordinate endpoints use a bounded indexed PostGIS lookup to find several nearby
+boarding candidates. Air distance is only candidate generation: every coordinate-access edge must
+then be returned by the configured Valhalla or OSRM pedestrian engine, must contain only walking
+steps, and must stay within the walking limit. Ferry or other vehicle steps, missing routes,
+excessive network distance and invalid endpoint snaps are rejected with diagnostic codes. Results
+and negative results are stored in `pedestrian_route_cache` by rounded endpoints and router graph
+revision, while concurrent request misses share a process-wide concurrency limit. A local
+pedestrian engine owns a persistent, prebuilt OSM graph; Cesta never rebuilds that graph per query.
+If that engine is unavailable while station transfers are verified, the incomplete timetable is
+not published as a snapshot.
+
+Fresh PID trip-summary delays are loaded once before the production API starts listening, refreshed
+into a process-local routing cache every 60 seconds and passed into RAPTOR. `/health` reports
+scheduled and realtime routing readiness separately and remains degraded in production until both
+caches are ready. Detailed stop-level realtime remains part of response enrichment, but it is not
+bulk-loaded on the route-search path. Route-search requests only read the process-local cache and
+never wait for the realtime table; if the cache is not ready or is older than 90 seconds, scheduled
+routing is returned immediately with an explicit warning. Effective delayed arrival and departure
+times determine whether a transfer is catchable and which candidate arrives first. Journey-leg
+`departure_time` and `arrival_time` remain scheduled service-day seconds; the existing `realtime`
+object carries delay and estimated timestamps to the app. Top-level journey arrival and duration
+reflect the effective times used for routing when delay data is available.
+
+Every returned leg is enriched from its route, trip and stop records with `line`, `mode_name`, `route_name`,
+`destination`, `display_name`, `from_stop_name` and `to_stop_name`. Internal route, trip and stop IDs
+remain stable correlation keys but are not intended as user-visible labels. Each transit leg has its
+GTFS `shape_id` geometry clipped between boarding and alighting in trip direction. Each walking leg
+has the pedestrian-router geometry used to validate its edge. A candidate is rejected if any leg
+lacks usable geometry; direct stop-to-stop fallback lines are never synthesized. `LineString` is the
+normal representation and `MultiLineString` is accepted for genuinely discontinuous source paths.
 
 Within a RAPTOR probe, route-queue scratch storage is reused between rounds and request-only
 walking links use a sparse index. Static journey metadata queries run concurrently. Ticketing
 references are installed in the process-local store before the response and are persisted to
 PostgreSQL asynchronously, keeping database fsync latency outside the public route-search critical
 path while preserving the existing opaque-reference API.
+
+Trips are grouped by route and stop pattern, then split into non-overtaking chains before the
+timetable is cached. This preserves RAPTOR's FIFO route assumption when an express service passes a
+slower service on the same pattern. Boarding lookup uses the per-stop departure index directly for
+routes without realtime changes; when realtime is present, only the affected route's bounded delay
+window is scanned, so an unrelated delayed trip cannot widen every route scan.
 
 On API startup and after every background warmup pass, processed snapshot retention removes lower
 format versions, stale temporary files, duplicate data revisions for the same service date, and the

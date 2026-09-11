@@ -30,6 +30,24 @@ The camelCase alias `includeIntermediateStops` is accepted. Prefer the snake_cas
 
 ## Response
 
+Journey cards and details should use the human-readable fields returned directly on every leg:
+
+```json
+{
+  "line": "991",
+  "mode_name": "Autobus",
+  "route_name": "Praha – Nádraží Hostivař",
+  "destination": "Nádraží Hostivař",
+  "display_name": "Autobus 991 směr Nádraží Hostivař",
+  "from_stop_name": "Muzeum",
+  "to_stop_name": "Nádraží Hostivař"
+}
+```
+
+Keep `route_id`, `trip_id`, `from_stop_id` and `to_stop_id` only for correlation. Do not show their
+source-prefixed values as labels. Realtime delays already influence connection feasibility and result
+ordering; continue to render the leg's `realtime.delay_seconds`, estimates and status as described below.
+
 Every item in `journeys[].legs[]` receives:
 
 ```json

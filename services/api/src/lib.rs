@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -16,8 +17,9 @@ use axum::{
 };
 use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use routing_core::{
-    RaptorRequest, RaptorSearchStats, RaptorStopTime, RaptorTimetable, RaptorTrip,
-    SearchRequest as RoutingSearchRequest, earliest_arrivals, fixture_snapshot, raptor_with_stats,
+    RaptorRealtimeData, RaptorRealtimeUpdate, RaptorRequest, RaptorSearchStats, RaptorStopTime,
+    RaptorTimetable, RaptorTrip, SearchRequest as RoutingSearchRequest, earliest_arrivals,
+    fixture_snapshot, raptor_with_stats_excluding_routes,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -60,17 +62,43 @@ const NEXT_SERVICE_DAY_SEARCH_FROM_SECONDS: u32 = 18 * 3600;
 const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
+const STOP_SEARCH_TIMEOUT_SECONDS: u64 = 3;
+const PID_INTERCHANGE_ALIAS_RADIUS_M: f64 = 300.0;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
 const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
 const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
 const MAX_RANGE_DEPARTURES: usize = 10;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 8;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 12;
 const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 2;
 const RAPTOR_INITIAL_RANGE_DEPARTURES: usize = 1;
 const RAPTOR_RANGE_EXPANSION_BATCH_DEPARTURES: usize = 2;
 const RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES: usize = 3;
+const RAPTOR_ALTERNATIVE_ROUTE_PASSES: usize = 2;
+const REASONABLE_ALTERNATIVE_SLACK_SECONDS: u32 = 15 * 60;
 const RAPTOR_WARMUP_INTERVAL_SECONDS: u64 = 60;
 const ROUTE_SEARCH_TIMING_HISTORY: usize = 50;
+const ROUTING_ENDPOINT_ACCESS_BUDGET_MILLIS: u64 = 4_000;
+const MAX_ENDPOINT_WALKING_DISTANCE_M: u32 = 1_500;
+const MAX_INTERCHANGE_WALKING_DISTANCE_M: u32 = 1_000;
+const MIN_STATION_INTERCHANGE_SECONDS: u32 = 180;
+const MAX_WALKING_SNAP_DISTANCE_M: f64 = 80.0;
+const MAX_TRANSIT_SHAPE_SNAP_DISTANCE_M: f64 = 250.0;
+const ROUTING_REALTIME_REFRESH_INTERVAL_SECONDS: u64 = 60;
+const ROUTING_REALTIME_CACHE_TTL_SECONDS: u64 = 90;
+const ROUTING_REALTIME_STATEMENT_TIMEOUT_MILLIS: u64 = 15_000;
+const JOURNEY_ROUTING_REALTIME_QUERY: &str = r#"
+        SELECT trip_id, stop_id, delay_seconds
+        FROM realtime_updates
+        WHERE source = 'pid_gtfs_rt'
+          AND source_entity_id >= 'trip-summary:'
+          AND source_entity_id < 'trip-summary;'
+          AND trip_id IS NOT NULL
+          AND stop_id IS NULL
+          AND delay_seconds IS NOT NULL
+          AND valid_until >= now()
+          AND service_date = $1
+        LIMIT 10000
+        "#;
 const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
@@ -80,7 +108,9 @@ const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
 type RaptorCacheKey = (chrono::NaiveDate, String);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
 type RaptorCache = Arc<RwLock<HashMap<RaptorCacheKey, RaptorCacheCell>>>;
-type EndpointAccessCache = Arc<RwLock<HashMap<EndpointAccessCacheKey, Vec<Transfer>>>>;
+type EndpointAccessCacheCell = Arc<OnceCell<EndpointAccessResult>>;
+type EndpointAccessCache = Arc<RwLock<HashMap<EndpointAccessCacheKey, EndpointAccessCacheCell>>>;
+type RoutingRealtimeCache = Arc<RwLock<Option<RoutingRealtimeCacheEntry>>>;
 type RoutingWarmupStatus = Arc<RwLock<RoutingWarmupState>>;
 type RouteSearchDiagnostics = Arc<RwLock<VecDeque<RouteSearchTiming>>>;
 
@@ -90,6 +120,68 @@ struct EndpointAccessCacheKey {
     selected_stop_ids: Vec<String>,
     access_to_origin: bool,
     walking_speed_centimeters_per_second: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EndpointAccessResult {
+    transfers: Vec<Transfer>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Clone)]
+struct PedestrianRouter {
+    client: reqwest::Client,
+    engine: PedestrianRouterEngine,
+    base_url: String,
+    revision: String,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PedestrianRouterEngine {
+    Osrm,
+    Valhalla,
+}
+
+#[derive(Debug, Clone)]
+struct WalkingRoute {
+    distance_meters: u32,
+    duration_seconds: u32,
+    geometry: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkingRouteRejection {
+    NoRoute,
+    NonWalkingSegment,
+    InvalidGeometry,
+    ExceededDistance,
+    RouterUnavailable,
+}
+
+impl WalkingRouteRejection {
+    fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::NoRoute => "nonexistent_walking_route",
+            Self::NonWalkingSegment => "non_walking_segment",
+            Self::InvalidGeometry => "invalid_walking_geometry",
+            Self::ExceededDistance => "walking_distance_exceeded",
+            Self::RouterUnavailable => "walking_router_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RoutingRealtimeCacheEntry {
+    service_date: chrono::NaiveDate,
+    loaded_at: time::Instant,
+    data: Arc<RaptorRealtimeData>,
+}
+
+#[derive(Debug)]
+struct RoutingRealtimeSnapshot {
+    data: Arc<RaptorRealtimeData>,
+    cache_hit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +376,8 @@ struct AppState {
     ticketing: ticketing::TicketingService,
     raptor_cache: RaptorCache,
     endpoint_access_cache: EndpointAccessCache,
+    pedestrian_router: PedestrianRouter,
+    routing_realtime_cache: RoutingRealtimeCache,
     routing_warmup_status: RoutingWarmupStatus,
     route_search_diagnostics: RouteSearchDiagnostics,
 }
@@ -555,7 +649,7 @@ struct JourneyStopCall {
     platform_code: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct JourneyPoint {
     #[serde(rename = "type")]
     point_type: String,
@@ -656,7 +750,7 @@ impl Default for RoutingAlgorithmConfig {
             preserve_each_transfer_count: true,
             preserve_carrier_diversity: true,
             remove_dominated: true,
-            dominate_only_same_carrier: true,
+            dominate_only_same_carrier: false,
         }
     }
 }
@@ -899,7 +993,29 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         _ => Arc::new(ticketing::DisabledPaymentProvider),
     };
     let ticketing = ticketing::TicketingService::new(cd_client, payment_provider, db.clone());
+    let pedestrian_router = PedestrianRouter {
+        client: reqwest::Client::builder()
+            .timeout(config.pedestrian_router_timeout)
+            .user_agent("Cesta-API/0.1 pedestrian-routing")
+            .build()
+            .context("could not create pedestrian routing HTTP client")?,
+        engine: match config.pedestrian_router_engine.as_str() {
+            "osrm" => PedestrianRouterEngine::Osrm,
+            _ => PedestrianRouterEngine::Valhalla,
+        },
+        base_url: config.pedestrian_router_url.clone(),
+        revision: config.pedestrian_router_revision.clone(),
+        permits: Arc::new(tokio::sync::Semaphore::new(
+            config.pedestrian_router_concurrency,
+        )),
+    };
 
+    let routing_realtime_cache = Arc::new(RwLock::new(None));
+    let routing_realtime_initially_ready = if let Some(pool) = &db {
+        refresh_routing_realtime(pool, &routing_realtime_cache).await
+    } else {
+        false
+    };
     let state = AppState {
         config: Arc::new(config.clone()),
         users: Arc::new(RwLock::new(HashMap::new())),
@@ -914,14 +1030,23 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         ticketing,
         raptor_cache: Arc::new(RwLock::new(HashMap::new())),
         endpoint_access_cache: Arc::new(RwLock::new(HashMap::new())),
+        pedestrian_router,
+        routing_realtime_cache,
         routing_warmup_status: Arc::new(RwLock::new(RoutingWarmupState::default())),
         route_search_diagnostics: Arc::new(RwLock::new(VecDeque::new())),
     };
     if let Some(pool) = state.db.clone() {
         let cache = state.raptor_cache.clone();
+        let routing_realtime_cache = state.routing_realtime_cache.clone();
         let snapshot_dir = state.config.routing_snapshot_dir.clone();
         let snapshot_files_to_keep = state.config.routing_snapshot_files_to_keep;
         let warmup_status = state.routing_warmup_status.clone();
+        let pedestrian_router = state.pedestrian_router.clone();
+        tokio::spawn(warm_routing_realtime(
+            pool.clone(),
+            routing_realtime_cache,
+            routing_realtime_initially_ready,
+        ));
         tokio::spawn(async move {
             warm_raptor_timetables(
                 pool,
@@ -929,6 +1054,7 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
                 snapshot_dir,
                 snapshot_files_to_keep,
                 warmup_status,
+                pedestrian_router,
             )
             .await
         });
@@ -3341,7 +3467,7 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
         .map(|(stage, (sum, max, samples))| {
             json!({
                 "stage": stage,
-                "average_ms": if samples == 0 { 0 } else { sum / samples },
+                "average_ms": sum.checked_div(samples).unwrap_or(0),
                 "max_ms": max,
                 "samples": samples
             })
@@ -3369,7 +3495,9 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Run each small range-probe batch with bounded concurrency",
             "Skip next-service-day RAPTOR when current service-day candidates are sufficient",
             "Add implicit same-station/platform interchange footpaths to RAPTOR timetables",
-            "Cache endpoint nearby walking access by routing-data revision",
+            "Bound endpoint spatial candidates with indexed lateral lookups",
+            "Cache endpoint nearby walking access and coalesce concurrent misses by routing-data revision",
+            "Apply fresh stop-level realtime delays inside RAPTOR transfer checks and arrival ranking",
             "Fetch related entities concurrently, then fetch realtime and intermediate stops concurrently",
             "Persist ticketing references after response annotation instead of blocking route search on database fsync",
             "Convert offset timestamps to Europe/Prague and reject any already-departed same-day candidate"
@@ -3951,10 +4079,13 @@ async fn database_admin_stats(pool: &PgPool) -> Result<Value, sqlx::Error> {
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
     endpoint_access_cache: &EndpointAccessCache,
+    pedestrian_router: &PedestrianRouter,
+    routing_realtime_cache: &RoutingRealtimeCache,
     routing_snapshot_dir: &FsPath,
     diagnostics: &RouteSearchDiagnostics,
     body: &JourneySearchBody,
@@ -3967,6 +4098,8 @@ async fn query_journeys_db(
         pool,
         raptor_cache,
         endpoint_access_cache,
+        pedestrian_router,
+        routing_realtime_cache,
         routing_snapshot_dir,
         body,
         departure_time,
@@ -3995,6 +4128,8 @@ async fn query_journeys_profiled_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
     endpoint_access_cache: &EndpointAccessCache,
+    pedestrian_router: &PedestrianRouter,
+    routing_realtime_cache: &RoutingRealtimeCache,
     routing_snapshot_dir: &FsPath,
     body: &JourneySearchBody,
     departure_time: u32,
@@ -4030,7 +4165,17 @@ async fn query_journeys_profiled_db(
         return Ok((
             Vec::new(),
             warnings,
-            json!({"query_context": journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids, 0)}),
+            json!({
+                "query_context": journey_query_context(body, departure_time, &from_stop_ids, &to_stop_ids, 0),
+                "routing_diagnostics": {
+                    "failure_stage": "endpoint_resolution",
+                    "endpoint_resolution": {
+                        "from_expanded_stop_ids": from_stop_ids,
+                        "to_expanded_stop_ids": to_stop_ids
+                    },
+                    "final_candidate_count": 0
+                }
+            }),
         ));
     }
 
@@ -4038,29 +4183,112 @@ async fn query_journeys_profiled_db(
     let routing_revision = routing_data_revision(pool).await?;
     timing.push("routing_revision", stage_started, None);
 
-    let stage_started = time::Instant::now();
-    let nearby_transfers = nearby_journey_transfers_db(
-        pool,
-        endpoint_access_cache,
-        &routing_revision,
-        routing_config.endpoint_access_cache_enabled,
-        &body.from,
-        &from_stop_ids,
-        &body.to,
-        &to_stop_ids,
-        walking_speed_meters_per_second(&body.walking_speed),
-    )
-    .await?;
-    timing.push(
-        "nearby_transfers",
-        stage_started,
-        Some(format!(
-            "{} walking links; {} cache hits, {} misses",
-            nearby_transfers.transfers.len(),
-            nearby_transfers.cache_hits,
-            nearby_transfers.cache_misses
+    let nearby_future = async {
+        let started = time::Instant::now();
+        let pool = pool.clone();
+        let endpoint_access_cache = endpoint_access_cache.clone();
+        let pedestrian_router = pedestrian_router.clone();
+        let routing_revision = routing_revision.clone();
+        let from_point = body.from.clone();
+        let from_stop_ids = from_stop_ids.clone();
+        let to_point = body.to.clone();
+        let to_stop_ids = to_stop_ids.clone();
+        let walking_speed_mps = walking_speed_meters_per_second(&body.walking_speed);
+        let cache_enabled = routing_config.endpoint_access_cache_enabled;
+        let task = tokio::spawn(async move {
+            nearby_journey_transfers_db(
+                &pool,
+                &endpoint_access_cache,
+                &pedestrian_router,
+                &routing_revision,
+                cache_enabled,
+                &from_point,
+                &from_stop_ids,
+                &to_point,
+                &to_stop_ids,
+                walking_speed_mps,
+            )
+            .await
+        });
+        match time::timeout(
+            std::time::Duration::from_millis(ROUTING_ENDPOINT_ACCESS_BUDGET_MILLIS),
+            task,
+        )
+        .await
+        {
+            Ok(Ok(result)) => (result, elapsed_millis(started), false),
+            Ok(Err(error)) => {
+                tracing::error!(%error, "nearby endpoint cache task failed");
+                (
+                    Ok::<NearbyJourneyTransfers, sqlx::Error>(NearbyJourneyTransfers::default()),
+                    elapsed_millis(started),
+                    true,
+                )
+            }
+            Err(_) => (
+                Ok::<NearbyJourneyTransfers, sqlx::Error>(NearbyJourneyTransfers::default()),
+                elapsed_millis(started),
+                true,
+            ),
+        }
+    };
+    let realtime_future = async {
+        let started = time::Instant::now();
+        let (result, fallback) =
+            match journey_routing_realtime_cached(routing_realtime_cache, service_date).await {
+                Some(result) => (result, false),
+                None => (
+                    RoutingRealtimeSnapshot {
+                        data: Arc::new(RaptorRealtimeData::default()),
+                        cache_hit: false,
+                    },
+                    true,
+                ),
+            };
+        (result, elapsed_millis(started), fallback)
+    };
+    let (nearby_result, realtime_result) = tokio::join!(nearby_future, realtime_future);
+    let nearby_transfers = nearby_result.0?;
+    warnings.extend(nearby_transfers.diagnostics.iter().cloned());
+    if nearby_result.2 {
+        warnings.push(format!(
+            "nearby walking access exceeded the {ROUTING_ENDPOINT_ACCESS_BUDGET_MILLIS}ms latency budget; the cache is warming in the background"
+        ));
+    }
+    timing.stages.push(RouteSearchStageTiming {
+        stage: "nearby_transfers".to_string(),
+        elapsed_ms: nearby_result.1,
+        detail: Some(if nearby_result.2 {
+            "latency budget reached; background cache warmup continues".to_string()
+        } else {
+            format!(
+                "{} walking links; {} cache hits, {} misses",
+                nearby_transfers.transfers.len(),
+                nearby_transfers.cache_hits,
+                nearby_transfers.cache_misses
+            )
+        }),
+    });
+    let routing_realtime = realtime_result.0;
+    if realtime_result.2 {
+        warnings
+            .push("realtime routing cache was not ready; scheduled times were used".to_string());
+    }
+    timing.stages.push(RouteSearchStageTiming {
+        stage: "routing_realtime".to_string(),
+        elapsed_ms: realtime_result.1,
+        detail: Some(format!(
+            "{} delayed trips available to RAPTOR; {}",
+            routing_realtime.data.trip_count(),
+            if realtime_result.2 {
+                "background cache unavailable, scheduled-time fallback"
+            } else if routing_realtime.cache_hit {
+                "background cache hit"
+            } else {
+                "cache miss"
+            }
         )),
-    );
+    });
 
     let mode_filters = body
         .transport_modes
@@ -4070,6 +4298,7 @@ async fn query_journeys_profiled_db(
     let current_service_day_result = service_day_journeys_db(
         pool,
         raptor_cache,
+        pedestrian_router,
         routing_snapshot_dir,
         &routing_revision,
         &from_stop_ids,
@@ -4080,6 +4309,7 @@ async fn query_journeys_profiled_db(
         service_date,
         &routing_config,
         &nearby_transfers.transfers,
+        routing_realtime.data.clone(),
     )
     .await;
     let include_next_service_day = should_search_next_service_day(
@@ -4088,6 +4318,8 @@ async fn query_journeys_profiled_db(
     );
 
     let (mut journeys, transfer_search_status, current_timing) = current_service_day_result?;
+    let current_service_day_candidate_count = journeys.len();
+    let mut legacy_search_attempted = current_timing.legacy_search_attempted;
     timing.stages.push(RouteSearchStageTiming {
         stage: "current_timetable_access".to_string(),
         elapsed_ms: current_timing.timetable_ms,
@@ -4191,6 +4423,7 @@ async fn query_journeys_profiled_db(
                 service_date.succ_opt().unwrap_or(service_date),
                 &routing_config,
                 &nearby_transfers.transfers,
+                routing_realtime.data.clone(),
             )
             .await?
             {
@@ -4226,6 +4459,7 @@ async fn query_journeys_profiled_db(
     if let Some(next_service_day_result) = next_service_day_result {
         let (next_service_day_journeys, next_transfer_search_status, next_timing) =
             next_service_day_result;
+        legacy_search_attempted |= next_timing.legacy_search_attempted;
         timing.stages.push(RouteSearchStageTiming {
             stage: "next_timetable_access".to_string(),
             elapsed_ms: next_timing.timetable_ms,
@@ -4298,11 +4532,13 @@ async fn query_journeys_profiled_db(
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
             &nearby_transfers.transfers,
+            routing_realtime.data.clone(),
         )
         .await?;
         if let Some((next_service_day_journeys, next_transfer_search_status, next_timing)) =
             next_service_day_result
         {
+            legacy_search_attempted |= next_timing.legacy_search_attempted;
             timing.stages.push(RouteSearchStageTiming {
                 stage: "next_timetable_access".to_string(),
                 elapsed_ms: next_timing.timetable_ms,
@@ -4375,10 +4611,15 @@ async fn query_journeys_profiled_db(
     }
     let candidate_count = journeys.len();
     let stage_started = time::Instant::now();
-    let legacy_trip_ids = legacy_journey_trip_ids_db(pool, &journeys).await?;
+    let legacy_trip_ids = if legacy_search_attempted {
+        legacy_journey_trip_ids_db(pool, &journeys).await?
+    } else {
+        HashSet::new()
+    };
     let (preferred_journeys, verified_candidate_count, legacy_candidate_count) =
         prefer_calendar_verified_journeys(journeys, &legacy_trip_ids);
     journeys = preferred_journeys;
+    let service_valid_candidate_count = journeys.len();
     if verified_candidate_count > 0 && legacy_candidate_count > 0 {
         warnings.push(format!(
             "discarded {legacy_candidate_count} calendar-unverified journey candidates because verified alternatives were available"
@@ -4387,12 +4628,19 @@ async fn query_journeys_profiled_db(
     timing.push(
         "legacy_service_validation",
         stage_started,
-        Some(format!(
-            "{verified_candidate_count} verified, {legacy_candidate_count} legacy candidates"
-        )),
+        Some(if legacy_search_attempted {
+            format!(
+                "{verified_candidate_count} verified, {legacy_candidate_count} legacy candidates"
+            )
+        } else {
+            format!(
+                "database validation skipped; RAPTOR returned {verified_candidate_count} verified candidates"
+            )
+        }),
     );
     let stage_started = time::Instant::now();
     journeys = dedupe_relevant_journeys_db(pool, journeys, &routing_config).await?;
+    let deduplicated_candidate_count = journeys.len();
     timing.push(
         "dedupe_candidates",
         stage_started,
@@ -4408,8 +4656,32 @@ async fn query_journeys_profiled_db(
         ));
     }
     let stage_started = time::Instant::now();
+    let geometry_diagnostics =
+        attach_journey_geometries_db(pool, pedestrian_router, &mut journeys).await?;
+    let geometry_valid_candidate_count = journeys.len();
+    warnings.extend(geometry_diagnostics);
+    timing.push(
+        "leg_geometries",
+        stage_started,
+        Some(format!(
+            "{} candidates have complete real geometry",
+            journeys.len()
+        )),
+    );
+    let stage_started = time::Instant::now();
     let carrier_keys = journey_carrier_keys_db(pool, &journeys).await?;
+    let dominance_removed = if routing_config.remove_dominated {
+        journeys.len().saturating_sub(
+            remove_dominated_journeys(journeys.clone(), &carrier_keys, &routing_config).len(),
+        )
+    } else {
+        0
+    };
     journeys = ranked_journey_results_with_carriers(journeys, &carrier_keys, &routing_config);
+    let final_candidate_count = journeys.len();
+    if dominance_removed > 0 {
+        warnings.push(format!("candidate_rejected:dominance:{dominance_removed}"));
+    }
     timing.push(
         "carrier_lookup_and_rank",
         stage_started,
@@ -4435,7 +4707,10 @@ async fn query_journeys_profiled_db(
 
     let related_future = async {
         let started = time::Instant::now();
-        (journey_related_data_db(pool, &journeys).await, started)
+        (
+            journey_related_data_db(pool, &journeys, body.offline_compatible).await,
+            started,
+        )
     };
     let realtime_future = async {
         let started = time::Instant::now();
@@ -4467,6 +4742,7 @@ async fn query_journeys_profiled_db(
     };
     let stage_started = time::Instant::now();
     let mut journey_values = journeys_with_realtime(&journeys, &realtime_updates);
+    attach_journey_display_metadata(&mut journey_values, &related);
     if let Some(stop_calls) = &stop_calls {
         attach_stop_calls(
             &journeys,
@@ -4485,6 +4761,38 @@ async fn query_journeys_profiled_db(
         &to_stop_ids,
         nearby_transfers.transfers.len(),
     );
+    if journey_values.is_empty() {
+        related["routing_diagnostics"] = json!({
+            "failure_stage": "candidate_selection",
+            "endpoint_resolution": {
+                "from_expanded_stop_ids": from_stop_ids,
+                "to_expanded_stop_ids": to_stop_ids
+            },
+            "access": {
+                "nearby_transfer_count": nearby_transfers.transfers.len(),
+                "timed_out": nearby_result.2,
+                "rejections": nearby_transfers.diagnostics
+            },
+            "timetable": {
+                "service_date": service_date,
+                "trip_count": current_timing.trip_count,
+                "route_pattern_count": current_timing.route_count
+            },
+            "filters": {
+                "allowed_modes": mode_filters,
+                "max_transfers": body.max_transfers
+            },
+            "candidates": {
+                "current_service_day_generated": current_service_day_candidate_count,
+                "generated_before_service_validation": candidate_count,
+                "after_service_validation": service_valid_candidate_count,
+                "after_deduplication": deduplicated_candidate_count,
+                "after_geometry_validation": geometry_valid_candidate_count,
+                "dominance_rejections": dominance_removed
+            },
+            "final_candidate_count": final_candidate_count
+        });
+    }
     timing.push("response_assembly", stage_started, None);
 
     Ok((journey_values, warnings, related))
@@ -4556,12 +4864,14 @@ struct NearbyJourneyTransfers {
     transfers: Vec<Transfer>,
     cache_hits: usize,
     cache_misses: usize,
+    diagnostics: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn nearby_journey_transfers_db(
     pool: &PgPool,
     endpoint_access_cache: &EndpointAccessCache,
+    pedestrian_router: &PedestrianRouter,
     routing_revision: &RoutingDataRevision,
     cache_enabled: bool,
     from_point: &JourneyPoint,
@@ -4571,92 +4881,124 @@ async fn nearby_journey_transfers_db(
     walking_speed_mps: f64,
 ) -> Result<NearbyJourneyTransfers, sqlx::Error> {
     let origin_transfers = async {
-        if from_point.point_type == "stop" {
+        if from_point.point_type == "coordinate" {
             nearby_endpoint_transfers_cached_db(
                 pool,
                 endpoint_access_cache,
+                pedestrian_router,
                 routing_revision,
                 cache_enabled,
+                from_point,
                 from_stop_ids,
                 true,
                 walking_speed_mps,
             )
             .await
         } else {
-            Ok((Vec::new(), false))
+            Ok((EndpointAccessResult::default(), false))
         }
     };
     let destination_transfers = async {
-        if to_point.point_type == "stop" {
+        if to_point.point_type == "coordinate" {
             nearby_endpoint_transfers_cached_db(
                 pool,
                 endpoint_access_cache,
+                pedestrian_router,
                 routing_revision,
                 cache_enabled,
+                to_point,
                 to_stop_ids,
                 false,
                 walking_speed_mps,
             )
             .await
         } else {
-            Ok((Vec::new(), false))
+            Ok((EndpointAccessResult::default(), false))
         }
     };
     let (origin_transfers, destination_transfers) =
         tokio::join!(origin_transfers, destination_transfers);
-    let (mut transfers, origin_cache_hit) = origin_transfers?;
-    let (destination_transfers, destination_cache_hit) = destination_transfers?;
-    transfers.extend(destination_transfers);
+    let (mut origin, origin_cache_hit) = origin_transfers?;
+    let (destination, destination_cache_hit) = destination_transfers?;
+    origin.transfers.extend(destination.transfers);
+    origin.diagnostics.extend(destination.diagnostics);
 
-    transfers.sort_by(|left, right| {
+    origin.transfers.sort_by(|left, right| {
         left.from_stop_id
             .cmp(&right.from_stop_id)
             .then_with(|| left.to_stop_id.cmp(&right.to_stop_id))
             .then_with(|| left.min_transfer_seconds.cmp(&right.min_transfer_seconds))
     });
-    transfers.dedup_by(|left, right| {
+    origin.transfers.dedup_by(|left, right| {
         left.from_stop_id == right.from_stop_id && left.to_stop_id == right.to_stop_id
     });
 
     let cache_hits = usize::from(origin_cache_hit) + usize::from(destination_cache_hit);
-    let cache_misses = usize::from(from_point.point_type == "stop" && !origin_cache_hit)
-        + usize::from(to_point.point_type == "stop" && !destination_cache_hit);
+    let cache_misses = usize::from(from_point.point_type == "coordinate" && !origin_cache_hit)
+        + usize::from(to_point.point_type == "coordinate" && !destination_cache_hit);
     Ok(NearbyJourneyTransfers {
-        transfers,
+        transfers: origin.transfers,
         cache_hits,
         cache_misses,
+        diagnostics: origin.diagnostics,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn nearby_endpoint_transfers_cached_db(
     pool: &PgPool,
     endpoint_access_cache: &EndpointAccessCache,
+    pedestrian_router: &PedestrianRouter,
     routing_revision: &RoutingDataRevision,
     cache_enabled: bool,
+    point: &JourneyPoint,
     selected_stop_ids: &[String],
     access_to_origin: bool,
     walking_speed_mps: f64,
-) -> Result<(Vec<Transfer>, bool), sqlx::Error> {
+) -> Result<(EndpointAccessResult, bool), sqlx::Error> {
     let key = endpoint_access_cache_key(
         routing_revision,
         selected_stop_ids,
         access_to_origin,
         walking_speed_mps,
     );
-    if cache_enabled && let Some(transfers) = endpoint_access_cache.read().await.get(&key).cloned()
-    {
-        return Ok((transfers, true));
+    if !cache_enabled {
+        return nearby_endpoint_transfers_db(
+            pool,
+            pedestrian_router,
+            point,
+            selected_stop_ids,
+            access_to_origin,
+            walking_speed_mps,
+        )
+        .await
+        .map(|transfers| (transfers, false));
     }
 
-    let transfers =
-        nearby_endpoint_transfers_db(pool, selected_stop_ids, access_to_origin, walking_speed_mps)
-            .await?;
-    if cache_enabled {
+    let cell = {
         let mut cache = endpoint_access_cache.write().await;
         cache.retain(|known, _| known.revision_token == routing_revision.token);
-        cache.insert(key, transfers.clone());
-    }
-    Ok((transfers, false))
+        cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+    let cache_hit = cell.get().is_some();
+    let transfers = cell
+        .get_or_try_init(|| async {
+            nearby_endpoint_transfers_db(
+                pool,
+                pedestrian_router,
+                point,
+                selected_stop_ids,
+                access_to_origin,
+                walking_speed_mps,
+            )
+            .await
+        })
+        .await?
+        .clone();
+    Ok((transfers, cache_hit))
 }
 
 fn endpoint_access_cache_key(
@@ -4678,83 +5020,595 @@ fn endpoint_access_cache_key(
 
 async fn nearby_endpoint_transfers_db(
     pool: &PgPool,
+    pedestrian_router: &PedestrianRouter,
+    point: &JourneyPoint,
     selected_stop_ids: &[String],
     access_to_origin: bool,
     walking_speed_mps: f64,
-) -> Result<Vec<Transfer>, sqlx::Error> {
+) -> Result<EndpointAccessResult, sqlx::Error> {
     if selected_stop_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(EndpointAccessResult::default());
     }
 
-    let sql = if access_to_origin {
-        r#"
-        SELECT from_stop_id, to_stop_id, distance_meters
-        FROM (
-          SELECT DISTINCT ON (candidate.id)
-            selected.id AS from_stop_id,
-            candidate.id AS to_stop_id,
-            ST_Distance(selected.geom, candidate.geom)::integer AS distance_meters
-          FROM enabled_source_stops selected
-          JOIN enabled_source_stops candidate
-            ON candidate.is_active = true
-           AND candidate.geom IS NOT NULL
-           AND candidate.id <> ALL($1)
-           AND ST_DWithin(selected.geom, candidate.geom, $2)
-          WHERE selected.id = ANY($1)
-            AND selected.is_active = true
-            AND selected.geom IS NOT NULL
-          ORDER BY candidate.id, ST_Distance(selected.geom, candidate.geom) ASC
-        ) candidates
-        ORDER BY distance_meters ASC
-        LIMIT $3
-        "#
+    let rows = if point.point_type == "coordinate" {
+        let (lat, lon) = point
+            .lat
+            .zip(point.lon)
+            .expect("coordinate point was validated");
+        sqlx::query(
+            r#"
+            WITH selected AS (
+              SELECT $1::text AS id,
+                     ST_SetSRID(ST_MakePoint($2, $3), 4326)::geography AS geom
+            )
+            SELECT selected.id AS selected_id, candidate.id AS candidate_id,
+                   ST_Y(selected.geom::geometry) AS selected_lat,
+                   ST_X(selected.geom::geometry) AS selected_lon,
+                   candidate.lat AS candidate_lat, candidate.lon AS candidate_lon,
+                   ST_Distance(selected.geom, candidate.geom)::integer AS air_distance_meters
+            FROM selected
+            CROSS JOIN LATERAL (
+              SELECT stop.id, stop.lat, stop.lon, stop.geom
+              FROM enabled_source_stops stop
+              WHERE stop.is_active = true AND stop.geom IS NOT NULL
+                AND stop.location_type IN ('stop', 'station')
+                AND ST_DWithin(selected.geom, stop.geom, $4)
+              ORDER BY selected.geom <-> stop.geom
+              LIMIT $5
+            ) candidate
+            ORDER BY air_distance_meters, candidate.id
+            "#,
+        )
+        .bind(&selected_stop_ids[0])
+        .bind(lon)
+        .bind(lat)
+        .bind(NEARBY_JOURNEY_STOP_RADIUS_M)
+        .bind(MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT)
+        .fetch_all(pool)
+        .await?
     } else {
-        r#"
-        SELECT from_stop_id, to_stop_id, distance_meters
-        FROM (
-          SELECT DISTINCT ON (candidate.id)
-            candidate.id AS from_stop_id,
-            selected.id AS to_stop_id,
-            ST_Distance(candidate.geom, selected.geom)::integer AS distance_meters
-          FROM enabled_source_stops selected
-          JOIN enabled_source_stops candidate
-            ON candidate.is_active = true
-           AND candidate.geom IS NOT NULL
-           AND candidate.id <> ALL($1)
-           AND ST_DWithin(candidate.geom, selected.geom, $2)
-          WHERE selected.id = ANY($1)
-            AND selected.is_active = true
-            AND selected.geom IS NOT NULL
-          ORDER BY candidate.id, ST_Distance(candidate.geom, selected.geom) ASC
-        ) candidates
-        ORDER BY distance_meters ASC
-        LIMIT $3
-        "#
-    };
-
-    let rows = sqlx::query(sql)
+        sqlx::query(
+            r#"
+            WITH selected AS MATERIALIZED (
+              SELECT id, lat, lon, geom
+              FROM enabled_source_stops
+              WHERE id = ANY($1) AND is_active = true AND geom IS NOT NULL
+            )
+            SELECT selected.id AS selected_id, candidate.id AS candidate_id,
+                   selected.lat AS selected_lat, selected.lon AS selected_lon,
+                   candidate.lat AS candidate_lat, candidate.lon AS candidate_lon,
+                   ST_Distance(selected.geom, candidate.geom)::integer AS air_distance_meters
+            FROM selected
+            CROSS JOIN LATERAL (
+              SELECT stop.id, stop.lat, stop.lon, stop.geom
+              FROM enabled_source_stops stop
+              WHERE stop.is_active = true AND stop.geom IS NOT NULL
+                AND stop.location_type IN ('stop', 'station')
+                AND stop.id <> ALL($1)
+                AND ST_DWithin(selected.geom, stop.geom, $2)
+              ORDER BY selected.geom <-> stop.geom
+              LIMIT $3
+            ) candidate
+            ORDER BY air_distance_meters, candidate.id
+            "#,
+        )
         .bind(selected_stop_ids.to_vec())
         .bind(NEARBY_JOURNEY_STOP_RADIUS_M)
         .bind(MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT)
         .fetch_all(pool)
-        .await?;
+        .await?
+    };
 
-    Ok(rows
+    let candidates = rows
         .into_iter()
-        .map(|row| {
-            let distance = row.get::<i32, _>("distance_meters").max(0) as u32;
-            Transfer {
-                from_stop_id: row.get("from_stop_id"),
-                to_stop_id: row.get("to_stop_id"),
-                min_transfer_seconds: walking_transfer_seconds(distance, walking_speed_mps),
-                distance_meters: Some(distance),
-                walking_geometry: None,
-                confidence: CoordinateConfidence::Medium,
-                accessibility_level: None,
-                source: "journey_nearby_stop_fallback".to_string(),
-            }
+        .map(|row| WalkingCandidate {
+            selected_id: row.get("selected_id"),
+            candidate_id: row.get("candidate_id"),
+            selected: (row.get("selected_lat"), row.get("selected_lon")),
+            candidate: (row.get("candidate_lat"), row.get("candidate_lon")),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    verified_walking_transfers(
+        pool,
+        pedestrian_router,
+        candidates,
+        access_to_origin,
+        walking_speed_mps,
+        MAX_ENDPOINT_WALKING_DISTANCE_M,
+        "endpoint_access",
+        Some(MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT as usize),
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct WalkingCandidate {
+    selected_id: String,
+    candidate_id: String,
+    selected: (f64, f64),
+    candidate: (f64, f64),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verified_walking_transfers(
+    pool: &PgPool,
+    pedestrian_router: &PedestrianRouter,
+    candidates: Vec<WalkingCandidate>,
+    access_to_origin: bool,
+    walking_speed_mps: f64,
+    max_distance_meters: u32,
+    source: &str,
+    limit: Option<usize>,
+) -> Result<EndpointAccessResult, sqlx::Error> {
+    let mut candidates = VecDeque::from(candidates);
+    let mut tasks = tokio::task::JoinSet::new();
+    let in_flight_limit = pedestrian_router.permits.available_permits().max(1);
+    while tasks.len() < in_flight_limit {
+        let Some(candidate) = candidates.pop_front() else {
+            break;
+        };
+        spawn_verified_walking_candidate(
+            &mut tasks,
+            pool.clone(),
+            pedestrian_router.clone(),
+            candidate,
+            access_to_origin,
+            max_distance_meters,
+        );
+    }
+
+    let mut result = EndpointAccessResult::default();
+    while let Some(task) = tasks.join_next().await {
+        let (candidate, route) = task.map_err(|error| {
+            sqlx::Error::Protocol(format!("walking router task failed: {error}"))
+        })?;
+        let (from_stop_id, to_stop_id) = if access_to_origin {
+            (candidate.selected_id, candidate.candidate_id)
+        } else {
+            (candidate.candidate_id, candidate.selected_id)
+        };
+        match route? {
+            Ok(route) => result.transfers.push(Transfer {
+                from_stop_id,
+                to_stop_id,
+                min_transfer_seconds: walking_route_seconds(
+                    route.distance_meters,
+                    walking_speed_mps,
+                ),
+                distance_meters: Some(route.distance_meters),
+                walking_geometry: Some(route.geometry),
+                confidence: CoordinateConfidence::High,
+                accessibility_level: None,
+                source: format!("pedestrian_graph_{source}"),
+            }),
+            Err(reason) => result.diagnostics.push(format!(
+                "walking_candidate_rejected:{}:{}->{}",
+                reason.diagnostic_code(),
+                from_stop_id,
+                to_stop_id
+            )),
+        }
+        if let Some(candidate) = candidates.pop_front() {
+            spawn_verified_walking_candidate(
+                &mut tasks,
+                pool.clone(),
+                pedestrian_router.clone(),
+                candidate,
+                access_to_origin,
+                max_distance_meters,
+            );
+        }
+    }
+    result
+        .transfers
+        .sort_by_key(|transfer| transfer.distance_meters.unwrap_or(u32::MAX));
+    if let Some(limit) = limit {
+        result.transfers.truncate(limit);
+    }
+    Ok(result)
+}
+
+type WalkingCandidateTaskResult = (
+    WalkingCandidate,
+    Result<Result<WalkingRoute, WalkingRouteRejection>, sqlx::Error>,
+);
+
+fn spawn_verified_walking_candidate(
+    tasks: &mut tokio::task::JoinSet<WalkingCandidateTaskResult>,
+    pool: PgPool,
+    router: PedestrianRouter,
+    candidate: WalkingCandidate,
+    access_to_origin: bool,
+    max_distance_meters: u32,
+) {
+    tasks.spawn(async move {
+        let _permit = router
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("pedestrian router semaphore is open");
+        let (from, to) = if access_to_origin {
+            (candidate.selected, candidate.candidate)
+        } else {
+            (candidate.candidate, candidate.selected)
+        };
+        let route = walking_route_cached_db(&pool, &router, from, to, max_distance_meters).await;
+        (candidate, route)
+    });
+}
+
+async fn walking_route_cached_db(
+    pool: &PgPool,
+    router: &PedestrianRouter,
+    from: (f64, f64),
+    to: (f64, f64),
+    max_distance_meters: u32,
+) -> Result<Result<WalkingRoute, WalkingRouteRejection>, sqlx::Error> {
+    let key = walking_cache_key(from, to);
+    if let Some(row) = sqlx::query(
+        r#"
+        SELECT status, distance_meters, duration_seconds, geometry
+        FROM pedestrian_route_cache
+        WHERE from_lat_e5 = $1 AND from_lon_e5 = $2
+          AND to_lat_e5 = $3 AND to_lon_e5 = $4
+          AND router_revision = $5 AND expires_at > now()
+        "#,
+    )
+    .bind(key.0)
+    .bind(key.1)
+    .bind(key.2)
+    .bind(key.3)
+    .bind(&router.revision)
+    .fetch_optional(pool)
+    .await?
+    {
+        let status = row.get::<String, _>("status");
+        if status == "ok" {
+            let route = WalkingRoute {
+                distance_meters: row.get::<i32, _>("distance_meters").max(0) as u32,
+                duration_seconds: row.get::<i32, _>("duration_seconds").max(0) as u32,
+                geometry: row.get("geometry"),
+            };
+            return Ok(if route.distance_meters <= max_distance_meters {
+                Ok(route)
+            } else {
+                Err(WalkingRouteRejection::ExceededDistance)
+            });
+        }
+        return Ok(Err(match status.as_str() {
+            "non_walking_segment" => WalkingRouteRejection::NonWalkingSegment,
+            "invalid_geometry" => WalkingRouteRejection::InvalidGeometry,
+            _ => WalkingRouteRejection::NoRoute,
+        }));
+    }
+
+    if router.base_url.is_empty() {
+        return Ok(Err(WalkingRouteRejection::RouterUnavailable));
+    }
+    let payload = match pedestrian_router_payload(router, from, to).await {
+        Ok(payload) => payload,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let decision = match router.engine {
+        PedestrianRouterEngine::Osrm => walking_route_from_osrm_payload(&payload, from, to),
+        PedestrianRouterEngine::Valhalla => walking_route_from_valhalla_payload(&payload, from, to),
+    };
+    let (status, route, detail, ttl_seconds) = match &decision {
+        Ok(route) => ("ok", Some(route.clone()), None, 30 * 24 * 3600),
+        Err(WalkingRouteRejection::NonWalkingSegment) => (
+            "non_walking_segment",
+            None,
+            Some("route contains ferry or another non-walking mode"),
+            24 * 3600,
+        ),
+        Err(WalkingRouteRejection::InvalidGeometry) => (
+            "invalid_geometry",
+            None,
+            Some("router geometry or endpoint snap is invalid"),
+            6 * 3600,
+        ),
+        Err(_) => ("no_route", None, Some("no pedestrian route"), 6 * 3600),
+    };
+    sqlx::query(
+        r#"
+        INSERT INTO pedestrian_route_cache (
+          from_lat_e5, from_lon_e5, to_lat_e5, to_lon_e5, router_revision,
+          status, distance_meters, duration_seconds, geometry, failure_detail, expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                now() + ($11::bigint * interval '1 second'))
+        ON CONFLICT (from_lat_e5, from_lon_e5, to_lat_e5, to_lon_e5, router_revision)
+        DO UPDATE SET status = EXCLUDED.status,
+          distance_meters = EXCLUDED.distance_meters,
+          duration_seconds = EXCLUDED.duration_seconds,
+          geometry = EXCLUDED.geometry,
+          failure_detail = EXCLUDED.failure_detail,
+          checked_at = now(), expires_at = EXCLUDED.expires_at
+        "#,
+    )
+    .bind(key.0)
+    .bind(key.1)
+    .bind(key.2)
+    .bind(key.3)
+    .bind(&router.revision)
+    .bind(status)
+    .bind(route.as_ref().map(|route| route.distance_meters as i32))
+    .bind(route.as_ref().map(|route| route.duration_seconds as i32))
+    .bind(route.as_ref().map(|route| route.geometry.clone()))
+    .bind(detail)
+    .bind(ttl_seconds)
+    .execute(pool)
+    .await?;
+
+    Ok(match decision {
+        Ok(route) if route.distance_meters <= max_distance_meters => Ok(route),
+        Ok(_) => Err(WalkingRouteRejection::ExceededDistance),
+        Err(reason) => Err(reason),
+    })
+}
+
+async fn pedestrian_router_payload(
+    router: &PedestrianRouter,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> Result<Value, WalkingRouteRejection> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let request = match router.engine {
+            PedestrianRouterEngine::Osrm => {
+                let url = format!(
+                    "{}/{},{};{},{}",
+                    router.base_url, from.1, from.0, to.1, to.0
+                );
+                router.client.get(url).query(&[
+                    ("overview", "full"),
+                    ("geometries", "geojson"),
+                    ("steps", "true"),
+                ])
+            }
+            PedestrianRouterEngine::Valhalla => router.client.post(&router.base_url).json(&json!({
+                "locations": [
+                    {"lat": from.0, "lon": from.1},
+                    {"lat": to.0, "lon": to.1}
+                ],
+                "costing": "pedestrian",
+                "costing_options": {"pedestrian": {"use_ferry": 0}},
+                "units": "kilometers"
+            })),
+        };
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                return response.json::<Value>().await.map_err(|error| {
+                    tracing::warn!(%error, "pedestrian router returned invalid JSON");
+                    WalkingRouteRejection::RouterUnavailable
+                });
+            }
+            Ok(response)
+                if (response.status().as_u16() == 429 || response.status().is_server_error())
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (1_u64 << attempt)))
+                    .await;
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    engine = ?router.engine,
+                    "pedestrian router returned an HTTP error"
+                );
+                return Err(WalkingRouteRejection::RouterUnavailable);
+            }
+            Err(error) if attempt + 1 < MAX_ATTEMPTS => {
+                tracing::warn!(attempt = attempt + 1, %error, "pedestrian router request failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (1_u64 << attempt)))
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, engine = ?router.engine, "pedestrian router request failed");
+                return Err(WalkingRouteRejection::RouterUnavailable);
+            }
+        }
+    }
+    Err(WalkingRouteRejection::RouterUnavailable)
+}
+
+fn walking_cache_key(from: (f64, f64), to: (f64, f64)) -> (i32, i32, i32, i32) {
+    (
+        (from.0 * 100_000.0).round() as i32,
+        (from.1 * 100_000.0).round() as i32,
+        (to.0 * 100_000.0).round() as i32,
+        (to.1 * 100_000.0).round() as i32,
+    )
+}
+
+fn walking_route_from_osrm_payload(
+    payload: &Value,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> Result<WalkingRoute, WalkingRouteRejection> {
+    if payload["code"].as_str() != Some("Ok") {
+        return Err(WalkingRouteRejection::NoRoute);
+    }
+    let route = payload["routes"]
+        .as_array()
+        .and_then(|routes| routes.first())
+        .ok_or(WalkingRouteRejection::NoRoute)?;
+    let step_modes = route["legs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|leg| leg["steps"].as_array().into_iter().flatten())
+        .map(|step| step["mode"].as_str())
+        .collect::<Vec<_>>();
+    if step_modes.is_empty() || step_modes.iter().any(|mode| *mode != Some("walking")) {
+        return Err(WalkingRouteRejection::NonWalkingSegment);
+    }
+    let geometry = route["geometry"].clone();
+    let coordinates = geometry["coordinates"]
+        .as_array()
+        .filter(|coordinates| coordinates.len() >= 2)
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+    let first = geojson_position(coordinates.first().unwrap())
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+    let last = geojson_position(coordinates.last().unwrap())
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+    if geometry["type"].as_str() != Some("LineString")
+        || haversine_m(from.0, from.1, first.1, first.0) > MAX_WALKING_SNAP_DISTANCE_M
+        || haversine_m(to.0, to.1, last.1, last.0) > MAX_WALKING_SNAP_DISTANCE_M
+    {
+        return Err(WalkingRouteRejection::InvalidGeometry);
+    }
+    let distance_meters = route["distance"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?
+        .ceil() as u32;
+    let duration_seconds = route["duration"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(distance_meters as f64 / 1.25)
+        .ceil() as u32;
+    Ok(WalkingRoute {
+        distance_meters,
+        duration_seconds,
+        geometry,
+    })
+}
+
+fn walking_route_from_valhalla_payload(
+    payload: &Value,
+    from: (f64, f64),
+    to: (f64, f64),
+) -> Result<WalkingRoute, WalkingRouteRejection> {
+    let trip = payload
+        .get("trip")
+        .filter(|trip| trip["status"].as_i64() == Some(0))
+        .ok_or(WalkingRouteRejection::NoRoute)?;
+    let legs = trip["legs"]
+        .as_array()
+        .filter(|legs| !legs.is_empty())
+        .ok_or(WalkingRouteRejection::NoRoute)?;
+    if trip["summary"]["has_ferry"].as_bool() == Some(true)
+        || legs
+            .iter()
+            .any(|leg| leg["summary"]["has_ferry"].as_bool() == Some(true))
+    {
+        return Err(WalkingRouteRejection::NonWalkingSegment);
+    }
+    let maneuver_modes = legs
+        .iter()
+        .flat_map(|leg| leg["maneuvers"].as_array().into_iter().flatten())
+        .map(|maneuver| maneuver["travel_mode"].as_str())
+        .collect::<Vec<_>>();
+    if maneuver_modes.is_empty()
+        || maneuver_modes
+            .iter()
+            .any(|mode| *mode != Some("pedestrian"))
+    {
+        return Err(WalkingRouteRejection::NonWalkingSegment);
+    }
+
+    let mut coordinates = Vec::new();
+    for leg in legs {
+        let encoded = leg["shape"]
+            .as_str()
+            .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+        for position in decode_polyline6(encoded)? {
+            if coordinates.last() != Some(&position) {
+                coordinates.push(position);
+            }
+        }
+    }
+    if coordinates.len() < 2 {
+        return Err(WalkingRouteRejection::InvalidGeometry);
+    }
+    let first = geojson_position(coordinates.first().unwrap())
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+    let last = geojson_position(coordinates.last().unwrap())
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+    if haversine_m(from.0, from.1, first.1, first.0) > MAX_WALKING_SNAP_DISTANCE_M
+        || haversine_m(to.0, to.1, last.1, last.0) > MAX_WALKING_SNAP_DISTANCE_M
+    {
+        return Err(WalkingRouteRejection::InvalidGeometry);
+    }
+
+    let distance_meters = (trip["summary"]["length"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(WalkingRouteRejection::InvalidGeometry)?
+        * 1000.0)
+        .ceil() as u32;
+    let duration_seconds = trip["summary"]["time"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(distance_meters as f64 / 1.25)
+        .ceil() as u32;
+    Ok(WalkingRoute {
+        distance_meters,
+        duration_seconds,
+        geometry: json!({"type": "LineString", "coordinates": coordinates}),
+    })
+}
+
+fn decode_polyline6(encoded: &str) -> Result<Vec<Value>, WalkingRouteRejection> {
+    let bytes = encoded.as_bytes();
+    let mut index = 0_usize;
+    let mut latitude = 0_i64;
+    let mut longitude = 0_i64;
+    let mut coordinates = Vec::new();
+    while index < bytes.len() {
+        let latitude_delta = decode_polyline_value(bytes, &mut index)?;
+        let longitude_delta = decode_polyline_value(bytes, &mut index)?;
+        latitude = latitude
+            .checked_add(latitude_delta)
+            .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+        longitude = longitude
+            .checked_add(longitude_delta)
+            .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+        coordinates.push(json!([
+            longitude as f64 / 1_000_000.0,
+            latitude as f64 / 1_000_000.0
+        ]));
+    }
+    Ok(coordinates)
+}
+
+fn decode_polyline_value(bytes: &[u8], index: &mut usize) -> Result<i64, WalkingRouteRejection> {
+    let mut result = 0_i64;
+    let mut shift = 0_u32;
+    loop {
+        let byte = bytes
+            .get(*index)
+            .copied()
+            .filter(|byte| *byte >= 63)
+            .ok_or(WalkingRouteRejection::InvalidGeometry)?
+            - 63;
+        *index += 1;
+        result |= i64::from(byte & 0x1f)
+            .checked_shl(shift)
+            .ok_or(WalkingRouteRejection::InvalidGeometry)?;
+        if byte < 0x20 {
+            break;
+        }
+        shift += 5;
+        if shift > 60 {
+            return Err(WalkingRouteRejection::InvalidGeometry);
+        }
+    }
+    Ok(if result & 1 == 0 {
+        result >> 1
+    } else {
+        -(result >> 1) - 1
+    })
+}
+
+fn geojson_position(value: &Value) -> Option<(f64, f64)> {
+    let values = value.as_array()?;
+    let lon = values.first()?.as_f64()?;
+    let lat = values.get(1)?.as_f64()?;
+    (lon.is_finite() && lat.is_finite()).then_some((lon, lat))
 }
 
 fn walking_speed_meters_per_second(value: &str) -> f64 {
@@ -4765,9 +5619,9 @@ fn walking_speed_meters_per_second(value: &str) -> f64 {
     }
 }
 
-fn walking_transfer_seconds(distance_meters: u32, walking_speed_mps: f64) -> u32 {
+fn walking_route_seconds(distance_meters: u32, walking_speed_mps: f64) -> u32 {
     let speed = walking_speed_mps.clamp(0.5, 2.5);
-    ((distance_meters as f64 * 1.2) / speed).ceil().max(30.0) as u32
+    (distance_meters as f64 / speed).ceil().max(30.0) as u32
 }
 
 fn append_transfer_search_warning(
@@ -4796,6 +5650,7 @@ fn append_transfer_search_warning(
 async fn service_day_journeys_db(
     pool: &PgPool,
     raptor_cache: &RaptorCache,
+    pedestrian_router: &PedestrianRouter,
     routing_snapshot_dir: &FsPath,
     revision: &RoutingDataRevision,
     from_stop_ids: &[String],
@@ -4806,11 +5661,13 @@ async fn service_day_journeys_db(
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
+    realtime: Arc<RaptorRealtimeData>,
 ) -> Result<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming), sqlx::Error> {
     let timetable_started = time::Instant::now();
     let (timetable, memory_cache_hit) = raptor_timetable_cached_for_revision_db(
         pool,
         raptor_cache,
+        pedestrian_router,
         routing_snapshot_dir,
         service_date,
         revision,
@@ -4829,6 +5686,7 @@ async fn service_day_journeys_db(
         service_date,
         routing_config,
         extra_transfers,
+        realtime,
     )
     .await
 }
@@ -4845,6 +5703,7 @@ async fn cached_service_day_journeys_db(
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
+    realtime: Arc<RaptorRealtimeData>,
 ) -> Result<Option<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming)>, sqlx::Error> {
     let timetable_started = time::Instant::now();
     let Some(timetable) =
@@ -4865,6 +5724,7 @@ async fn cached_service_day_journeys_db(
         service_date,
         routing_config,
         extra_transfers,
+        realtime,
     )
     .await
     .map(Some)
@@ -4883,6 +5743,7 @@ async fn service_day_journeys_for_timetable(
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
+    realtime: Arc<RaptorRealtimeData>,
 ) -> Result<(Vec<Journey>, TransferSearchStatus, ServiceDaySearchTiming), sqlx::Error> {
     let modes = mode_filters
         .iter()
@@ -4900,6 +5761,7 @@ async fn service_day_journeys_for_timetable(
         &modes,
         false,
         routing_config,
+        realtime.clone(),
     )
     .await?;
     let legacy_search_attempted =
@@ -4916,6 +5778,7 @@ async fn service_day_journeys_for_timetable(
             &modes,
             true,
             routing_config,
+            realtime,
         )
         .await?;
     }
@@ -4971,6 +5834,7 @@ async fn run_adaptive_raptor_searches(
     modes: &[TransportMode],
     allow_unverified_services: bool,
     routing_config: &RoutingAlgorithmConfig,
+    realtime: Arc<RaptorRealtimeData>,
 ) -> Result<AdaptiveRaptorSearchResult, sqlx::Error> {
     let max_departures = routing_config.max_range_departures.max(1) as usize;
     let initial_departures = timetable.departure_times_from_stops(
@@ -4991,6 +5855,8 @@ async fn run_adaptive_raptor_searches(
         min_transfer_seconds,
         modes,
         allow_unverified_services,
+        realtime.clone(),
+        &HashSet::new(),
     )
     .await?;
     let mut searched_departures = initial_departures.iter().copied().collect::<HashSet<_>>();
@@ -5024,6 +5890,8 @@ async fn run_adaptive_raptor_searches(
                 min_transfer_seconds,
                 modes,
                 allow_unverified_services,
+                realtime.clone(),
+                &HashSet::new(),
             )
             .await?;
             journeys.append(&mut extra_journeys);
@@ -5041,6 +5909,60 @@ async fn run_adaptive_raptor_searches(
         }
     }
 
+    if should_expand_raptor_range(distinct_raptor_candidate_count(&journeys), routing_config) {
+        let mut excluded_route_ids = journeys
+            .iter()
+            .min_by_key(|journey| (journey.arrival_time, journey.transfer_count))
+            .into_iter()
+            .flat_map(|journey| journey.legs.iter())
+            .filter_map(|leg| leg.route_id.clone())
+            .collect::<HashSet<_>>();
+        if !excluded_route_ids.is_empty() {
+            let mut alternative_departures = searched_departures.into_iter().collect::<Vec<_>>();
+            alternative_departures.sort_unstable();
+            for _ in 0..RAPTOR_ALTERNATIVE_ROUTE_PASSES {
+                let (mut alternatives, alternative_stats) = run_raptor_searches(
+                    timetable.clone(),
+                    from_stop_ids,
+                    to_stop_ids,
+                    extra_transfers,
+                    &alternative_departures,
+                    max_transfers,
+                    min_transfer_seconds,
+                    modes,
+                    allow_unverified_services,
+                    realtime.clone(),
+                    &excluded_route_ids,
+                )
+                .await?;
+                let next_route_to_exclude = alternatives
+                    .iter()
+                    .min_by_key(|journey| (journey.arrival_time, journey.transfer_count))
+                    .into_iter()
+                    .flat_map(|journey| journey.legs.iter())
+                    .filter_map(|leg| leg.route_id.as_ref())
+                    .find(|route_id| !excluded_route_ids.contains(*route_id))
+                    .cloned();
+                journeys.append(&mut alternatives);
+                stats.rounds += alternative_stats.rounds;
+                stats.routes_scanned += alternative_stats.routes_scanned;
+                stats.marked_stops += alternative_stats.marked_stops;
+                departure_count += alternative_departures.len();
+                expanded = true;
+                if !should_expand_raptor_range(
+                    distinct_raptor_candidate_count(&journeys),
+                    routing_config,
+                ) {
+                    break;
+                }
+                let Some(route_id) = next_route_to_exclude else {
+                    break;
+                };
+                excluded_route_ids.insert(route_id);
+            }
+        }
+    }
+
     Ok(AdaptiveRaptorSearchResult {
         journeys,
         stats,
@@ -5050,15 +5972,21 @@ async fn run_adaptive_raptor_searches(
 }
 
 fn distinct_raptor_candidate_count(journeys: &[Journey]) -> usize {
+    let Some(best) = journeys
+        .iter()
+        .min_by_key(|journey| (journey.arrival_time, journey.transfer_count))
+    else {
+        return 0;
+    };
+    let best_route = journey_route_signature(best);
     journeys
         .iter()
-        .map(|journey| {
-            (
-                journey.departure_time,
-                journey.arrival_time,
-                journey.transfer_count,
-            )
+        .filter(|journey| {
+            let route = journey_route_signature(journey);
+            route == best_route
+                || reasonable_distinct_route_alternative(journey, best, &route, &best_route)
         })
+        .map(journey_route_signature)
         .collect::<HashSet<_>>()
         .len()
 }
@@ -5078,9 +6006,7 @@ fn should_search_next_service_day_for_candidates(
 }
 
 fn range_expansion_candidate_floor(routing_config: &RoutingAlgorithmConfig) -> usize {
-    (routing_config.max_results as usize)
-        .min(RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES)
-        .max(1)
+    (routing_config.max_results as usize).clamp(1, RAPTOR_RANGE_EXPANSION_MIN_CANDIDATES)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5094,6 +6020,8 @@ async fn run_raptor_searches(
     min_transfer_seconds: u32,
     modes: &[TransportMode],
     allow_unverified_services: bool,
+    realtime: Arc<RaptorRealtimeData>,
+    excluded_route_ids: &HashSet<String>,
 ) -> Result<(Vec<Journey>, RaptorSearchStats), sqlx::Error> {
     let mut journeys = Vec::new();
     let mut stats = RaptorSearchStats::default();
@@ -5114,9 +6042,13 @@ async fn run_raptor_searches(
                 min_transfer_seconds,
                 modes: modes.to_vec(),
                 allow_unverified_services,
+                realtime: realtime.clone(),
             };
             let timetable = timetable.clone();
-            join_set.spawn_blocking(move || raptor_with_stats(timetable.as_ref(), request));
+            let excluded_route_ids = excluded_route_ids.clone();
+            join_set.spawn_blocking(move || {
+                raptor_with_stats_excluding_routes(timetable.as_ref(), request, &excluded_route_ids)
+            });
         }
 
         let Some(result) = join_set.join_next().await else {
@@ -5151,6 +6083,7 @@ struct ServiceDaySearchTiming {
 async fn raptor_timetable_cached_db(
     pool: &PgPool,
     cache: &RaptorCache,
+    pedestrian_router: &PedestrianRouter,
     routing_snapshot_dir: &FsPath,
     service_date: chrono::NaiveDate,
 ) -> Result<Arc<RaptorTimetable>, sqlx::Error> {
@@ -5158,6 +6091,7 @@ async fn raptor_timetable_cached_db(
     let (timetable, _) = raptor_timetable_cached_for_revision_db(
         pool,
         cache,
+        pedestrian_router,
         routing_snapshot_dir,
         service_date,
         &revision,
@@ -5178,6 +6112,7 @@ async fn raptor_timetable_cached_db(
 async fn raptor_timetable_cached_for_revision_db(
     pool: &PgPool,
     cache: &RaptorCache,
+    pedestrian_router: &PedestrianRouter,
     routing_snapshot_dir: &FsPath,
     service_date: chrono::NaiveDate,
     revision: &RoutingDataRevision,
@@ -5194,12 +6129,12 @@ async fn raptor_timetable_cached_for_revision_db(
         (cell, hit)
     };
     let snapshot_path =
-        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, &revision);
+        raptor_timetable_snapshot_path(routing_snapshot_dir, service_date, revision);
     let timetable = cell
         .get_or_try_init(|| async {
             let started_at = time::Instant::now();
             if let Some(timetable) =
-                load_raptor_timetable_snapshot(&snapshot_path, service_date, &revision).await
+                load_raptor_timetable_snapshot(&snapshot_path, service_date, revision).await
             {
                 tracing::info!(
                     elapsed_ms = started_at.elapsed().as_millis(),
@@ -5212,7 +6147,7 @@ async fn raptor_timetable_cached_for_revision_db(
             }
 
             let db_started_at = time::Instant::now();
-            let timetable = raptor_timetable_db(pool, service_date).await?;
+            let timetable = raptor_timetable_db(pool, pedestrian_router, service_date).await?;
             tracing::info!(
                 elapsed_ms = db_started_at.elapsed().as_millis(),
                 trips = timetable.trip_count(),
@@ -5220,7 +6155,7 @@ async fn raptor_timetable_cached_for_revision_db(
                 "built RAPTOR timetable from database"
             );
             if let Err(error) =
-                write_raptor_timetable_snapshot(&snapshot_path, service_date, &revision, &timetable)
+                write_raptor_timetable_snapshot(&snapshot_path, service_date, revision, &timetable)
                     .await
             {
                 tracing::warn!(
@@ -5256,9 +6191,12 @@ async fn warm_raptor_timetables(
     routing_snapshot_dir: PathBuf,
     routing_snapshot_files_to_keep: usize,
     warmup_status: RoutingWarmupStatus,
+    pedestrian_router: PedestrianRouter,
 ) {
     loop {
-        let service_date = chrono::Local::now().date_naive();
+        let service_date = Utc::now()
+            .with_timezone(&chrono_tz::Europe::Prague)
+            .date_naive();
         let pass_started_at = Utc::now();
         let mut last_error = None;
         for offset_days in 0..=1 {
@@ -5278,8 +6216,14 @@ async fn warm_raptor_timetables(
                     error: None,
                 };
             }
-            if let Err(error) =
-                raptor_timetable_cached_db(&pool, &cache, &routing_snapshot_dir, warmup_date).await
+            if let Err(error) = raptor_timetable_cached_db(
+                &pool,
+                &cache,
+                &pedestrian_router,
+                &routing_snapshot_dir,
+                warmup_date,
+            )
+            .await
             {
                 last_error = Some(error.to_string());
                 tracing::warn!(%error, service_date = %warmup_date, "background RAPTOR timetable warmup failed");
@@ -5319,6 +6263,52 @@ async fn warm_raptor_timetables(
         }
         tokio::time::sleep(std::time::Duration::from_secs(
             RAPTOR_WARMUP_INTERVAL_SECONDS,
+        ))
+        .await;
+    }
+}
+
+async fn refresh_routing_realtime(pool: &PgPool, cache: &RoutingRealtimeCache) -> bool {
+    let service_date = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Prague)
+        .date_naive();
+    match journey_routing_realtime_db(pool, service_date).await {
+        Ok(data) => {
+            let trip_count = data.trip_count();
+            *cache.write().await = Some(RoutingRealtimeCacheEntry {
+                service_date,
+                loaded_at: time::Instant::now(),
+                data,
+            });
+            tracing::debug!(
+                %service_date,
+                trip_count,
+                "refreshed background routing realtime cache"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %service_date,
+                "background routing realtime refresh failed; retaining previous cache"
+            );
+            false
+        }
+    }
+}
+
+async fn warm_routing_realtime(pool: PgPool, cache: RoutingRealtimeCache, initially_ready: bool) {
+    if initially_ready {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            ROUTING_REALTIME_REFRESH_INTERVAL_SECONDS,
+        ))
+        .await;
+    }
+    loop {
+        refresh_routing_realtime(&pool, &cache).await;
+        tokio::time::sleep(std::time::Duration::from_secs(
+            ROUTING_REALTIME_REFRESH_INTERVAL_SECONDS,
         ))
         .await;
     }
@@ -5595,7 +6585,11 @@ async fn ensure_raptor_timetable_snapshot(
     match tokio::fs::metadata(path).await {
         Ok(metadata) if metadata.is_file() && metadata.len() > 0 => return Ok(false),
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
         Err(error) => {
             return Err(anyhow::anyhow!(
                 "failed to inspect snapshot '{}': {error}",
@@ -5609,6 +6603,7 @@ async fn ensure_raptor_timetable_snapshot(
 
 async fn raptor_timetable_db(
     pool: &PgPool,
+    pedestrian_router: &PedestrianRouter,
     service_date: chrono::NaiveDate,
 ) -> Result<RaptorTimetable, sqlx::Error> {
     let rows = sqlx::query(
@@ -5691,8 +6686,10 @@ async fn raptor_timetable_db(
             stop_id: row.get("stop_id"),
             arrival_time: row.get::<i32, _>("arrival_time") as u32,
             departure_time: row.get::<i32, _>("departure_time") as u32,
-            pickup_allowed: row.get::<Option<i16>, _>("pickup_type").unwrap_or(0) == 0,
-            drop_off_allowed: row.get::<Option<i16>, _>("drop_off_type").unwrap_or(0) == 0,
+            // GTFS values 2 and 3 still permit boarding/alighting (with advance
+            // coordination). PID uses value 3 for most regional stop calls.
+            pickup_allowed: gtfs_stop_action_allowed(row.get::<Option<i16>, _>("pickup_type")),
+            drop_off_allowed: gtfs_stop_action_allowed(row.get::<Option<i16>, _>("drop_off_type")),
         });
     }
 
@@ -5721,19 +6718,25 @@ async fn raptor_timetable_db(
         source: row.get("source"),
     })
     .collect();
-    let timetable_stop_ids = trips
-        .iter()
-        .flat_map(|trip| {
-            trip.stop_times
-                .iter()
-                .map(|stop_time| stop_time.stop_id.clone())
-        })
-        .collect::<HashSet<_>>();
-    transfers.extend(implicit_station_transfers_db(pool, &timetable_stop_ids).await?);
+    let mut route_ids_by_stop = HashMap::<String, HashSet<String>>::new();
+    for trip in &trips {
+        for stop_time in &trip.stop_times {
+            route_ids_by_stop
+                .entry(stop_time.stop_id.clone())
+                .or_default()
+                .insert(trip.route_id.clone());
+        }
+    }
+    transfers
+        .extend(implicit_station_transfers_db(pool, pedestrian_router, &route_ids_by_stop).await?);
     transfers.sort_by(|left, right| {
         left.from_stop_id
             .cmp(&right.from_stop_id)
             .then_with(|| left.to_stop_id.cmp(&right.to_stop_id))
+            .then_with(|| {
+                (left.source == "implicit_station_interchange")
+                    .cmp(&(right.source == "implicit_station_interchange"))
+            })
             .then_with(|| left.min_transfer_seconds.cmp(&right.min_transfer_seconds))
     });
     transfers.dedup_by(|left, right| {
@@ -5742,17 +6745,23 @@ async fn raptor_timetable_db(
     Ok(RaptorTimetable::new(trips, transfers))
 }
 
+fn gtfs_stop_action_allowed(value: Option<i16>) -> bool {
+    matches!(value.unwrap_or(0), 0 | 2 | 3)
+}
+
 async fn implicit_station_transfers_db(
     pool: &PgPool,
-    stop_ids: &HashSet<String>,
+    pedestrian_router: &PedestrianRouter,
+    route_ids_by_stop: &HashMap<String, HashSet<String>>,
 ) -> Result<Vec<Transfer>, sqlx::Error> {
-    if stop_ids.is_empty() {
+    if route_ids_by_stop.is_empty() {
         return Ok(Vec::new());
     }
-    let stop_ids = stop_ids.iter().cloned().collect::<Vec<_>>();
+    let stop_ids = route_ids_by_stop.keys().cloned().collect::<Vec<_>>();
     let rows = sqlx::query(
         r#"
-        SELECT id, name, municipality, lat, lon, stop_area_id, platform_code, modes
+        SELECT id, name, municipality, lat, lon, stop_area_id, parent_station_id,
+               platform_code, modes
         FROM enabled_source_stops
         WHERE is_active = true AND id = ANY($1)
         "#,
@@ -5761,9 +6770,11 @@ async fn implicit_station_transfers_db(
     .fetch_all(pool)
     .await?;
 
-    let mut stops_by_signature = HashMap::<String, Vec<String>>::new();
+    let mut stops_by_signature =
+        HashMap::<String, Vec<(String, (f64, f64), Vec<String>, HashSet<String>)>>::new();
     for row in rows {
         let id = row.get::<String, _>("id");
+        let modes = row.get::<Vec<String>, _>("modes");
         let signature = implicit_station_transfer_signature(
             &id,
             &row.get::<String, _>("name"),
@@ -5771,40 +6782,122 @@ async fn implicit_station_transfers_db(
             row.get::<Option<f64>, _>("lat"),
             row.get::<Option<f64>, _>("lon"),
             row.get::<Option<String>, _>("stop_area_id").as_deref(),
+            row.get::<Option<String>, _>("parent_station_id").as_deref(),
             row.get::<Option<String>, _>("platform_code").as_deref(),
-            &row.get::<Vec<String>, _>("modes"),
+            &modes,
         );
-        if let Some(signature) = signature {
-            stops_by_signature.entry(signature).or_default().push(id);
+        if let (Some(signature), Some(lat), Some(lon)) = (
+            signature,
+            row.get::<Option<f64>, _>("lat"),
+            row.get::<Option<f64>, _>("lon"),
+        ) {
+            stops_by_signature.entry(signature).or_default().push((
+                id.clone(),
+                (lat, lon),
+                modes,
+                route_ids_by_stop.get(&id).cloned().unwrap_or_default(),
+            ));
         }
     }
 
-    let mut transfers = Vec::new();
+    let mut candidates = Vec::new();
+    let mut internal_transfers = Vec::new();
     for mut group in stops_by_signature.into_values() {
-        group.sort();
-        group.dedup();
+        group.sort_by(|left, right| left.0.cmp(&right.0));
+        group.dedup_by(|left, right| left.0 == right.0);
         if group.len() < 2 || group.len() > 80 {
             continue;
         }
-        for from_stop_id in &group {
-            for to_stop_id in &group {
-                if from_stop_id == to_stop_id {
+        for (from_stop_id, from_coordinate, from_modes, from_route_ids) in &group {
+            for (to_stop_id, to_coordinate, to_modes, to_route_ids) in &group {
+                if from_stop_id == to_stop_id
+                    || !station_interchange_needs_connector(
+                        from_modes,
+                        from_route_ids,
+                        to_modes,
+                        to_route_ids,
+                    )
+                {
                     continue;
                 }
-                transfers.push(Transfer {
-                    from_stop_id: from_stop_id.clone(),
-                    to_stop_id: to_stop_id.clone(),
-                    min_transfer_seconds: MIN_TRANSFER_SECONDS,
-                    distance_meters: None,
-                    walking_geometry: None,
-                    confidence: CoordinateConfidence::Medium,
-                    accessibility_level: None,
-                    source: "implicit_station_interchange".to_string(),
+                if from_modes == to_modes {
+                    let distance_meters = haversine_m(
+                        from_coordinate.0,
+                        from_coordinate.1,
+                        to_coordinate.0,
+                        to_coordinate.1,
+                    )
+                    .round()
+                    .max(0.0) as u32;
+                    internal_transfers.push(Transfer {
+                        from_stop_id: from_stop_id.clone(),
+                        to_stop_id: to_stop_id.clone(),
+                        min_transfer_seconds: MIN_STATION_INTERCHANGE_SECONDS,
+                        distance_meters: Some(distance_meters),
+                        walking_geometry: Some(json!({
+                            "type": "LineString",
+                            "coordinates": [
+                                [from_coordinate.1, from_coordinate.0],
+                                [to_coordinate.1, to_coordinate.0]
+                            ]
+                        })),
+                        confidence: CoordinateConfidence::High,
+                        accessibility_level: None,
+                        source: "implicit_station_internal".to_string(),
+                    });
+                    continue;
+                }
+                candidates.push(WalkingCandidate {
+                    selected_id: from_stop_id.clone(),
+                    candidate_id: to_stop_id.clone(),
+                    selected: *from_coordinate,
+                    candidate: *to_coordinate,
                 });
             }
         }
     }
-    Ok(transfers)
+    let mut result = verified_walking_transfers(
+        pool,
+        pedestrian_router,
+        candidates,
+        true,
+        1.25,
+        MAX_INTERCHANGE_WALKING_DISTANCE_M,
+        "station_interchange",
+        None,
+    )
+    .await?;
+    if result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.contains("walking_router_unavailable"))
+    {
+        return Err(sqlx::Error::Protocol(
+            "pedestrian router unavailable while verifying station transfer graph".to_string(),
+        ));
+    }
+    for transfer in &mut result.transfers {
+        transfer.min_transfer_seconds = transfer
+            .min_transfer_seconds
+            .max(MIN_STATION_INTERCHANGE_SECONDS);
+    }
+    result.transfers.extend(internal_transfers);
+    for diagnostic in result.diagnostics {
+        tracing::info!(
+            reason = %diagnostic,
+            "unconnected_complex: station interchange candidate rejected"
+        );
+    }
+    Ok(result.transfers)
+}
+
+fn station_interchange_needs_connector(
+    from_modes: &[String],
+    from_route_ids: &HashSet<String>,
+    to_modes: &[String],
+    to_route_ids: &HashSet<String>,
+) -> bool {
+    from_modes != to_modes || from_route_ids != to_route_ids
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5815,13 +6908,22 @@ fn implicit_station_transfer_signature(
     lat: Option<f64>,
     lon: Option<f64>,
     stop_area_id: Option<&str>,
+    parent_station_id: Option<&str>,
     platform_code: Option<&str>,
     modes: &[String],
 ) -> Option<String> {
+    if let Some(source_complex_id) = pid_stop_complex_id(stop_id) {
+        return Some(format!(
+            "source:{source_complex_id}:{}",
+            canonical_stop_name_parts(name, municipality)
+        ));
+    }
     if let Some(stop_area_id) = stop_area_id.filter(|value| !value.trim().is_empty()) {
         return Some(format!("area:{stop_area_id}"));
     }
-
+    if let Some(parent_station_id) = parent_station_id.filter(|value| !value.trim().is_empty()) {
+        return Some(format!("parent:{parent_station_id}"));
+    }
     let station_like = platform_code.is_some()
         || railway_station_stop_base(stop_id).is_some()
         || modes.iter().any(|mode| {
@@ -6067,7 +7169,17 @@ fn journey_is_relevant(
                 if wait > max_wait {
                     return false;
                 }
-            } else if !(min_wait..=max_wait).contains(&wait) {
+            } else if wait > max_wait
+                || (wait < min_wait
+                    && !next_leg
+                        .warnings
+                        .iter()
+                        .chain(leg.warnings.iter())
+                        .any(|warning| {
+                            warning == "official_minimum_change_time"
+                                || warning == "realtime_routing_applied"
+                        }))
+            {
                 return false;
             }
         }
@@ -6268,6 +7380,37 @@ fn ranked_journey_results_with_carriers(
         }
     }
 
+    let fastest = candidates
+        .iter()
+        .min_by_key(|journey| (journey.arrival_time, journey.transfer_count))
+        .expect("non-empty candidates checked above");
+    let fastest_route = journey_route_signature(fastest);
+    let mut best_by_route = HashMap::<String, &Journey>::new();
+    for journey in &candidates {
+        let signature = journey_route_signature(journey);
+        if signature != fastest_route
+            && !reasonable_distinct_route_alternative(journey, fastest, &signature, &fastest_route)
+        {
+            continue;
+        }
+        let replace = best_by_route.get(&signature).is_none_or(|known| {
+            journey_rank(journey, configuration) < journey_rank(known, configuration)
+        });
+        if replace {
+            best_by_route.insert(signature, journey);
+        }
+    }
+    let mut route_candidates = best_by_route.into_values().collect::<Vec<_>>();
+    route_candidates.sort_by_key(|journey| journey_rank(journey, configuration));
+    for best_for_route in route_candidates {
+        push_ranked_journey(
+            &mut selected,
+            &mut selected_keys,
+            best_for_route,
+            configuration.max_results as usize,
+        );
+    }
+
     for journey in &candidates {
         push_ranked_journey(
             &mut selected,
@@ -6324,8 +7467,8 @@ fn ranked_journey_results_with_carriers(
 
 fn remove_dominated_journeys(
     journeys: Vec<Journey>,
-    carrier_keys: &HashMap<String, String>,
-    configuration: &RoutingAlgorithmConfig,
+    _carrier_keys: &HashMap<String, String>,
+    _configuration: &RoutingAlgorithmConfig,
 ) -> Vec<Journey> {
     journeys
         .iter()
@@ -6333,9 +7476,6 @@ fn remove_dominated_journeys(
         .filter(|(candidate_index, candidate)| {
             !journeys.iter().enumerate().any(|(other_index, other)| {
                 other_index != *candidate_index
-                    && (!configuration.dominate_only_same_carrier
-                        || journey_carrier_signature(other, carrier_keys)
-                            == journey_carrier_signature(candidate, carrier_keys))
                     && other.departure_time >= candidate.departure_time
                     && other.arrival_time <= candidate.arrival_time
                     && other.transfer_count <= candidate.transfer_count
@@ -6346,6 +7486,24 @@ fn remove_dominated_journeys(
         })
         .map(|(_, journey)| journey.clone())
         .collect()
+}
+
+fn reasonable_distinct_route_alternative(
+    candidate: &Journey,
+    better: &Journey,
+    candidate_route: &str,
+    better_route: &str,
+) -> bool {
+    candidate_route != better_route
+        && candidate.arrival_time
+            <= better
+                .arrival_time
+                .saturating_add(REASONABLE_ALTERNATIVE_SLACK_SECONDS)
+        && candidate.duration_seconds
+            <= better
+                .duration_seconds
+                .saturating_add(REASONABLE_ALTERNATIVE_SLACK_SECONDS)
+        && candidate.transfer_count <= better.transfer_count.saturating_add(2)
 }
 
 fn journey_carrier_signature(
@@ -6408,6 +7566,20 @@ fn journey_identity_key(journey: &Journey) -> String {
                 canonical_journey_stop_id(&leg.to_stop_id),
                 leg.departure_time,
                 leg.arrival_time
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn journey_route_signature(journey: &Journey) -> String {
+    journey
+        .legs
+        .iter()
+        .map(|leg| {
+            leg.route_id.as_deref().map_or_else(
+                || "walk".to_string(),
+                |route_id| format!("route:{}", public_route_key(Some(route_id))),
             )
         })
         .collect::<Vec<_>>()
@@ -6477,6 +7649,13 @@ async fn resolve_journey_point_db(
     pool: &PgPool,
     point: &JourneyPoint,
 ) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
+    if point.point_type == "coordinate" {
+        let (lat, lon) = point
+            .lat
+            .zip(point.lon)
+            .expect("coordinate point was validated");
+        return Ok((vec![coordinate_stop_id(lat, lon)], Vec::new()));
+    }
     let candidate = point
         .id
         .as_deref()
@@ -6497,8 +7676,16 @@ async fn resolve_journey_point_db(
         return Ok((stop_ids, warnings));
     }
 
-    if let Some(stop) = get_stop_db(pool, candidate).await? {
-        return Ok((equivalent_stop_ids_db(pool, &stop).await?, warnings));
+    if let Some(stop) = get_routing_stop_db(pool, candidate).await? {
+        let stop_ids = equivalent_stop_ids_db(pool, &stop).await?;
+        if stop_ids.len() > 1 {
+            warnings.push(format!(
+                "expanded stop '{}' to {} boardable complex members",
+                stop.name,
+                stop_ids.len()
+            ));
+        }
+        return Ok((stop_ids, warnings));
     }
 
     let normalized = normalize_search_text(candidate);
@@ -6512,7 +7699,15 @@ async fn resolve_journey_point_db(
                 "resolved stop query '{candidate}' to '{}'",
                 stop.name
             ));
-            return Ok((equivalent_stop_ids_db(pool, &stop).await?, warnings));
+            let stop_ids = equivalent_stop_ids_db(pool, &stop).await?;
+            if stop_ids.len() > 1 {
+                warnings.push(format!(
+                    "expanded stop '{}' to {} boardable complex members",
+                    stop.name,
+                    stop_ids.len()
+                ));
+            }
+            return Ok((stop_ids, warnings));
         }
     }
 
@@ -6522,7 +7717,7 @@ async fn resolve_journey_point_db(
 
 async fn validate_journey_point_db(pool: &PgPool, point: &JourneyPoint) -> Result<(), ApiError> {
     match point.point_type.as_str() {
-        "stop" => Ok(()),
+        "stop" => validate_required_journey_point_id(point),
         "city" => {
             let city_id = point
                 .id
@@ -6541,11 +7736,55 @@ async fn validate_journey_point_db(pool: &PgPool, point: &JourneyPoint) -> Resul
                 Err(invalid_city_id(Some(city_id)))
             }
         }
+        "coordinate" => validate_coordinate_journey_point(point),
         other => Err(ApiError {
             code: "invalid_journey_point_type".to_string(),
-            message: format!("journey point type '{other}' is not supported; use 'stop' or 'city'"),
+            message: format!(
+                "journey point type '{other}' is not supported; use 'stop', 'city' or 'coordinate'"
+            ),
         }),
     }
+}
+
+fn validate_required_journey_point_id(point: &JourneyPoint) -> Result<(), ApiError> {
+    if point.id.as_deref().is_some_and(|id| !id.trim().is_empty()) {
+        Ok(())
+    } else {
+        Err(ApiError {
+            code: "invalid_journey_point_id".to_string(),
+            message: format!(
+                "journey point type '{}' requires a non-empty id",
+                point.point_type
+            ),
+        })
+    }
+}
+
+fn validate_coordinate_journey_point(point: &JourneyPoint) -> Result<(), ApiError> {
+    let (lat, lon) = point.lat.zip(point.lon).ok_or_else(|| ApiError {
+        code: "invalid_coordinate".to_string(),
+        message: "coordinate journey points require numeric lat and lon".to_string(),
+    })?;
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+    {
+        return Err(ApiError {
+            code: "invalid_coordinate".to_string(),
+            message: "lat must be between -90 and 90 and lon between -180 and 180".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn coordinate_stop_id(lat: f64, lon: f64) -> String {
+    format!("coordinate:{lat:.6},{lon:.6}")
+}
+
+fn coordinate_from_stop_id(stop_id: &str) -> Option<(f64, f64)> {
+    let (lat, lon) = stop_id.strip_prefix("coordinate:")?.split_once(',')?;
+    Some((lat.parse().ok()?, lon.parse().ok()?))
 }
 
 fn invalid_city_id(city_id: Option<&str>) -> ApiError {
@@ -6561,9 +7800,64 @@ fn invalid_city_id(city_id: Option<&str>) -> ApiError {
 async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String>, sqlx::Error> {
     let mut ids = vec![stop.id.clone()];
 
+    if stop.parent_station_id.is_some() || stop.location_type == StopLocationType::Station {
+        let parent_station_id = stop.parent_station_id.as_deref().unwrap_or(&stop.id);
+        let mut station_ids = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT stop.id
+            FROM stops AS stop
+            WHERE stop.is_active = true
+              AND (stop.id = $1 OR stop.parent_station_id = $1)
+              AND (
+                stop.source_feed_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM source_feeds AS direct_feed
+                  WHERE direct_feed.id = stop.source_feed_id
+                    AND direct_feed.enabled = true
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM stop_source_ids AS source_id
+                  JOIN source_feeds AS source_feed
+                    ON source_feed.id = source_id.source_feed_id
+                   AND source_feed.enabled = true
+                  WHERE source_id.stop_id = stop.id
+                )
+              )
+            LIMIT 250
+            "#,
+        )
+        .bind(parent_station_id)
+        .fetch_all(pool)
+        .await?;
+        ids.append(&mut station_ids);
+    }
+
     if let Some(stop_area_id) = &stop.stop_area_id {
         let mut area_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM enabled_source_stops WHERE is_active = true AND stop_area_id = $1 LIMIT 250",
+            r#"
+            SELECT stop.id
+            FROM stops AS stop
+            WHERE stop.is_active = true
+              AND stop.stop_area_id = $1
+              AND (
+                stop.source_feed_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM source_feeds AS direct_feed
+                  WHERE direct_feed.id = stop.source_feed_id
+                    AND direct_feed.enabled = true
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM stop_source_ids AS source_id
+                  JOIN source_feeds AS source_feed
+                    ON source_feed.id = source_id.source_feed_id
+                   AND source_feed.enabled = true
+                  WHERE source_id.stop_id = stop.id
+                )
+              )
+            LIMIT 250
+            "#,
         )
         .bind(stop_area_id)
         .fetch_all(pool)
@@ -6575,10 +7869,26 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         let station_prefix = escaped_like_prefix(&format!("{station_base}-"));
         let station_ids = sqlx::query_scalar::<_, String>(
             r#"
-            SELECT id
-            FROM enabled_source_stops
-            WHERE is_active = true
-              AND (id = $1 OR id LIKE $2 ESCAPE '\')
+            SELECT stop.id
+            FROM stops AS stop
+            WHERE stop.is_active = true
+              AND (stop.id = $1 OR stop.id LIKE $2 ESCAPE '\')
+              AND (
+                stop.source_feed_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM source_feeds AS direct_feed
+                  WHERE direct_feed.id = stop.source_feed_id
+                    AND direct_feed.enabled = true
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM stop_source_ids AS source_id
+                  JOIN source_feeds AS source_feed
+                    ON source_feed.id = source_id.source_feed_id
+                   AND source_feed.enabled = true
+                  WHERE source_id.stop_id = stop.id
+                )
+              )
             LIMIT 250
             "#,
         )
@@ -6593,24 +7903,46 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         );
     }
 
-    if let Some((lat, lon)) = stop.lat.zip(stop.lon) {
+    if let Some(complex_id) = pid_stop_complex_id(&stop.id) {
+        let complex_members = pid_stop_complex_members_db(pool, &[complex_id]).await?;
+        ids.extend(
+            pid_interchange_alias_members(stop, &complex_members)
+                .into_iter()
+                .map(|member| member.id.clone()),
+        );
+    }
+
+    if stop.lat.is_some() && stop.lon.is_some() {
         let sibling_rows = sqlx::query(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
                    platform_code, location_type, parent_station_id, wheelchair_boarding,
                    modes, source_priority, is_active
-            FROM enabled_source_stops
+            FROM stops
             WHERE is_active = true
-              AND lat IS NOT NULL
-              AND lon IS NOT NULL
-              AND abs(lat - $1) < 0.003
-              AND abs(lon - $2) < 0.005
+              AND normalized_name = $1
+              AND (
+                source_feed_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM source_feeds direct_feed
+                  WHERE direct_feed.id = stops.source_feed_id
+                    AND direct_feed.enabled = true
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM stop_source_ids source_id
+                  JOIN source_feeds source_feed
+                    ON source_feed.id = source_id.source_feed_id
+                   AND source_feed.enabled = true
+                  WHERE source_id.stop_id = stops.id
+                )
+              )
+            ORDER BY source_priority ASC, platform_code ASC NULLS FIRST, id ASC
             LIMIT 250
             "#,
         )
-        .bind(lat)
-        .bind(lon)
+        .bind(&stop.normalized_name)
         .fetch_all(pool)
         .await?;
         for sibling in sibling_rows {
@@ -6718,8 +8050,8 @@ async fn direct_journeys_db(
                 WHERE latest_for_feed.source_feed_id = t.source_feed_id
               )
             )
-            AND COALESCE(st_from.pickup_type, 0) = 0
-            AND COALESCE(st_to.drop_off_type, 0) = 0
+            AND COALESCE(st_from.pickup_type, 0) IN (0, 2, 3)
+            AND COALESCE(st_to.drop_off_type, 0) IN (0, 2, 3)
         )
         SELECT
           trip_id,
@@ -6765,6 +8097,7 @@ async fn direct_journeys_db(
                     arrival_time,
                     mode: db_mode_to_model(&row.get::<String, _>("mode")),
                     warnings: Vec::new(),
+                    geometry: None,
                 }],
                 departure_time,
                 arrival_time,
@@ -6840,7 +8173,7 @@ async fn one_transfer_journeys_db(
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
           WHERE stop_time.stop_id = ANY($1)
             AND stop_time.departure_time >= $3
-            AND COALESCE(stop_time.pickup_type, 0) = 0
+            AND COALESCE(stop_time.pickup_type, 0) IN (0, 2, 3)
             AND (
               endpoint_trip.service_id IN (SELECT service_id FROM active_services)
               OR NOT EXISTS (
@@ -6874,7 +8207,7 @@ async fn one_transfer_journeys_db(
            AND endpoint_import.import_run_id = endpoint_trip.import_run_id
           WHERE stop_time.stop_id = ANY($2)
             AND stop_time.arrival_time >= $3 + $6
-            AND COALESCE(stop_time.drop_off_type, 0) = 0
+            AND COALESCE(stop_time.drop_off_type, 0) IN (0, 2, 3)
             AND (
               endpoint_trip.service_id IN (SELECT service_id FROM active_services)
               OR NOT EXISTS (
@@ -6907,6 +8240,7 @@ async fn one_transfer_journeys_db(
             t.service_id IN (SELECT service_id FROM active_services) AS first_service_verified,
             CASE
               WHEN s_mid.stop_area_id IS NOT NULL THEN 'area:' || s_mid.stop_area_id
+              WHEN s_mid.parent_station_id IS NOT NULL THEN 'parent:' || s_mid.parent_station_id
               WHEN s_mid.lat IS NOT NULL AND s_mid.lon IS NOT NULL
                 THEN 'geo:' || s_mid.normalized_name || ':' || round(s_mid.lat::numeric, 2)::text || ':' || round(s_mid.lon::numeric, 2)::text
               WHEN s_mid.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
@@ -6948,7 +8282,7 @@ async fn one_transfer_journeys_db(
                 WHERE latest_for_feed.source_feed_id = t.source_feed_id
               )
             )
-            AND COALESCE(st_mid.drop_off_type, 0) = 0
+            AND COALESCE(st_mid.drop_off_type, 0) IN (0, 2, 3)
         ),
         filtered_first_legs AS MATERIALIZED (
           SELECT *
@@ -6970,6 +8304,7 @@ async fn one_transfer_journeys_db(
             t2.service_id IN (SELECT service_id FROM active_services) AS second_service_verified,
             CASE
               WHEN s_transfer.stop_area_id IS NOT NULL THEN 'area:' || s_transfer.stop_area_id
+              WHEN s_transfer.parent_station_id IS NOT NULL THEN 'parent:' || s_transfer.parent_station_id
               WHEN s_transfer.lat IS NOT NULL AND s_transfer.lon IS NOT NULL
                 THEN 'geo:' || s_transfer.normalized_name || ':' || round(s_transfer.lat::numeric, 2)::text || ':' || round(s_transfer.lon::numeric, 2)::text
               WHEN s_transfer.id ~ 'SR70S-CZ-[0-9]+-[0-9][[:alnum:]]{0,3}$'
@@ -7012,7 +8347,7 @@ async fn one_transfer_journeys_db(
                 WHERE latest_for_feed.source_feed_id = t2.source_feed_id
               )
             )
-            AND COALESCE(st_transfer.pickup_type, 0) = 0
+            AND COALESCE(st_transfer.pickup_type, 0) IN (0, 2, 3)
         ),
         filtered_second_legs AS MATERIALIZED (
           SELECT *
@@ -7090,6 +8425,7 @@ async fn one_transfer_journeys_db(
                         arrival_time: first_arrival_time,
                         mode: db_mode_to_model(&row.get::<String, _>("first_mode")),
                         warnings: Vec::new(),
+                        geometry: None,
                     },
                     JourneyLeg {
                         from_stop_id: row.get("transfer_departure_stop_id"),
@@ -7100,6 +8436,7 @@ async fn one_transfer_journeys_db(
                         arrival_time,
                         mode: db_mode_to_model(&row.get::<String, _>("second_mode")),
                         warnings: Vec::new(),
+                        geometry: None,
                     },
                 ],
                 departure_time,
@@ -7115,9 +8452,245 @@ async fn one_transfer_journeys_db(
         .collect())
 }
 
+async fn attach_journey_geometries_db(
+    pool: &PgPool,
+    pedestrian_router: &PedestrianRouter,
+    journeys: &mut Vec<Journey>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let trip_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .filter_map(|leg| leg.trip_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let stop_ids = journeys
+        .iter()
+        .flat_map(|journey| journey.legs.iter())
+        .flat_map(|leg| [&leg.from_stop_id, &leg.to_stop_id])
+        .filter(|stop_id| coordinate_from_stop_id(stop_id).is_none())
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let shape_rows = if trip_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query(
+            r#"
+            SELECT trip.id AS trip_id, shape.shape_pt_sequence,
+                   ST_Y(shape.geom::geometry) AS lat,
+                   ST_X(shape.geom::geometry) AS lon
+            FROM trips trip
+            JOIN shapes shape ON shape.shape_id = trip.shape_id
+            WHERE trip.id = ANY($1)
+            ORDER BY trip.id, shape.shape_pt_sequence
+            "#,
+        )
+        .bind(&trip_ids)
+        .fetch_all(pool)
+        .await?
+    };
+    let mut shapes_by_trip = HashMap::<String, Vec<(f64, f64)>>::new();
+    for row in shape_rows {
+        shapes_by_trip
+            .entry(row.get("trip_id"))
+            .or_default()
+            .push((row.get("lat"), row.get("lon")));
+    }
+
+    let stop_rows = if stop_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query("SELECT id, lat, lon FROM stops WHERE id = ANY($1)")
+            .bind(&stop_ids)
+            .fetch_all(pool)
+            .await?
+    };
+    let mut coordinates = stop_rows
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.get::<String, _>("id"),
+                (
+                    row.get::<Option<f64>, _>("lat")?,
+                    row.get::<Option<f64>, _>("lon")?,
+                ),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    for journey in journeys.iter() {
+        for leg in &journey.legs {
+            for stop_id in [&leg.from_stop_id, &leg.to_stop_id] {
+                if let Some(coordinate) = coordinate_from_stop_id(stop_id) {
+                    coordinates.insert(stop_id.clone(), coordinate);
+                }
+            }
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut complete = Vec::with_capacity(journeys.len());
+    for mut journey in journeys.drain(..) {
+        let mut valid = true;
+        for leg in &mut journey.legs {
+            let Some(&from) = coordinates.get(&leg.from_stop_id) else {
+                diagnostics.push(format!(
+                    "candidate_rejected:geometry_endpoint_missing:{}",
+                    leg.from_stop_id
+                ));
+                valid = false;
+                break;
+            };
+            let Some(&to) = coordinates.get(&leg.to_stop_id) else {
+                diagnostics.push(format!(
+                    "candidate_rejected:geometry_endpoint_missing:{}",
+                    leg.to_stop_id
+                ));
+                valid = false;
+                break;
+            };
+            if is_walking_leg(leg) {
+                if leg.geometry.as_ref().is_some_and(|geometry| {
+                    geometry_matches_endpoints(geometry, from, to, MAX_WALKING_SNAP_DISTANCE_M)
+                }) {
+                    continue;
+                }
+                let _permit = pedestrian_router
+                    .permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("pedestrian router semaphore is open");
+                match walking_route_cached_db(
+                    pool,
+                    pedestrian_router,
+                    from,
+                    to,
+                    MAX_ENDPOINT_WALKING_DISTANCE_M,
+                )
+                .await?
+                {
+                    Ok(route) => {
+                        leg.geometry = Some(route.geometry);
+                        if !leg
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.starts_with("walking_source:"))
+                        {
+                            leg.warnings.push(
+                                "walking_source:pedestrian_graph_geometry_repair".to_string(),
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        diagnostics.push(format!(
+                            "candidate_rejected:{}:{}->{}",
+                            reason.diagnostic_code(),
+                            leg.from_stop_id,
+                            leg.to_stop_id
+                        ));
+                        valid = false;
+                        break;
+                    }
+                }
+            } else {
+                let Some(trip_id) = leg.trip_id.as_deref() else {
+                    diagnostics.push("candidate_rejected:transit_leg_without_trip".to_string());
+                    valid = false;
+                    break;
+                };
+                let Some(shape) = shapes_by_trip.get(trip_id) else {
+                    diagnostics.push(format!("candidate_rejected:missing_gtfs_shape:{trip_id}"));
+                    valid = false;
+                    break;
+                };
+                let Some(geometry) = clip_gtfs_shape(shape, from, to) else {
+                    diagnostics.push(format!(
+                        "candidate_rejected:unclippable_gtfs_shape:{trip_id}:{}->{}",
+                        leg.from_stop_id, leg.to_stop_id
+                    ));
+                    valid = false;
+                    break;
+                };
+                leg.geometry = Some(geometry);
+            }
+        }
+        if valid && journey.legs.iter().all(|leg| leg.geometry.is_some()) {
+            complete.push(journey);
+        }
+    }
+    *journeys = complete;
+    Ok(diagnostics)
+}
+
+fn clip_gtfs_shape(shape: &[(f64, f64)], from: (f64, f64), to: (f64, f64)) -> Option<Value> {
+    if shape.len() < 2 {
+        return None;
+    }
+    let mut best_from = (f64::INFINITY, 0usize);
+    let mut best_pair = (f64::INFINITY, 0usize, 0usize, f64::INFINITY, f64::INFINITY);
+    for to_index in 1..shape.len() {
+        let from_index = to_index - 1;
+        let from_distance = haversine_m(from.0, from.1, shape[from_index].0, shape[from_index].1);
+        if from_distance < best_from.0 {
+            best_from = (from_distance, from_index);
+        }
+        let to_distance = haversine_m(to.0, to.1, shape[to_index].0, shape[to_index].1);
+        let score = best_from.0 + to_distance;
+        if score < best_pair.0 {
+            best_pair = (score, best_from.1, to_index, best_from.0, to_distance);
+        }
+    }
+    if best_pair.3 > MAX_TRANSIT_SHAPE_SNAP_DISTANCE_M
+        || best_pair.4 > MAX_TRANSIT_SHAPE_SNAP_DISTANCE_M
+        || best_pair.1 >= best_pair.2
+    {
+        return None;
+    }
+    let mut coordinates = shape[best_pair.1..=best_pair.2]
+        .iter()
+        .map(|(lat, lon)| json!([lon, lat]))
+        .collect::<Vec<_>>();
+    *coordinates.first_mut()? = json!([from.1, from.0]);
+    *coordinates.last_mut()? = json!([to.1, to.0]);
+    Some(json!({"type": "LineString", "coordinates": coordinates}))
+}
+
+fn geometry_matches_endpoints(
+    geometry: &Value,
+    from: (f64, f64),
+    to: (f64, f64),
+    tolerance_meters: f64,
+) -> bool {
+    let endpoints = match geometry["type"].as_str() {
+        Some("LineString") => geometry["coordinates"].as_array().and_then(|coordinates| {
+            Some((
+                geojson_position(coordinates.first()?)?,
+                geojson_position(coordinates.last()?)?,
+            ))
+        }),
+        Some("MultiLineString") => geometry["coordinates"].as_array().and_then(|lines| {
+            let first_line = lines.first()?.as_array()?;
+            let last_line = lines.last()?.as_array()?;
+            Some((
+                geojson_position(first_line.first()?)?,
+                geojson_position(last_line.last()?)?,
+            ))
+        }),
+        _ => None,
+    };
+    endpoints.is_some_and(|(first, last)| {
+        haversine_m(from.0, from.1, first.1, first.0) <= tolerance_meters
+            && haversine_m(to.0, to.1, last.1, last.0) <= tolerance_meters
+    })
+}
+
 async fn journey_related_data_db(
     pool: &PgPool,
     journeys: &[Journey],
+    include_route_geometries: bool,
 ) -> Result<Value, sqlx::Error> {
     let mut stop_ids = HashSet::new();
     let mut route_ids = HashSet::new();
@@ -7216,7 +8789,7 @@ async fn journey_related_data_db(
         .await
     };
     let route_geometries_future = async {
-        if route_ids.is_empty() {
+        if route_ids.is_empty() || !include_route_geometries {
             return Ok::<_, sqlx::Error>(Vec::new());
         }
         sqlx::query(
@@ -7312,6 +8885,49 @@ async fn journey_related_data_db(
         "agencies": agencies,
         "source_feeds": source_feeds
     }))
+}
+
+async fn journey_routing_realtime_db(
+    pool: &PgPool,
+    service_date: chrono::NaiveDate,
+) -> Result<Arc<RaptorRealtimeData>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{ROUTING_REALTIME_STATEMENT_TIMEOUT_MILLIS}ms'"
+    ))
+    .execute(&mut *transaction)
+    .await?;
+    let rows = sqlx::query(JOURNEY_ROUTING_REALTIME_QUERY)
+        .bind(service_date)
+        .fetch_all(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    Ok(Arc::new(RaptorRealtimeData::from_updates(
+        rows.into_iter().map(|row| RaptorRealtimeUpdate {
+            trip_id: row.get("trip_id"),
+            stop_id: row.get("stop_id"),
+            delay_seconds: row.get("delay_seconds"),
+        }),
+    )))
+}
+
+async fn journey_routing_realtime_cached(
+    cache: &RoutingRealtimeCache,
+    service_date: chrono::NaiveDate,
+) -> Option<RoutingRealtimeSnapshot> {
+    let cached = cache.read().await;
+    if let Some(entry) = cached.as_ref()
+        && entry.service_date == service_date
+        && entry.loaded_at.elapsed()
+            < std::time::Duration::from_secs(ROUTING_REALTIME_CACHE_TTL_SECONDS)
+    {
+        return Some(RoutingRealtimeSnapshot {
+            data: entry.data.clone(),
+            cache_hit: true,
+        });
+    }
+    None
 }
 
 async fn journey_realtime_updates_db(
@@ -7677,6 +9293,106 @@ fn journeys_with_realtime(journeys: &[Journey], updates: &[Value]) -> Vec<Value>
         .collect()
 }
 
+fn attach_journey_display_metadata(journeys: &mut [Value], related: &Value) {
+    let routes = related["routes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|route| Some((route["id"].as_str()?.to_string(), route)))
+        .collect::<HashMap<_, _>>();
+    let trips = related["trips"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|trip| Some((trip["id"].as_str()?.to_string(), trip)))
+        .collect::<HashMap<_, _>>();
+    let stops = related["stops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|stop| Some((stop["id"].as_str()?.to_string(), stop)))
+        .collect::<HashMap<_, _>>();
+
+    for journey in journeys {
+        let Some(legs) = journey["legs"].as_array_mut() else {
+            continue;
+        };
+        for leg in legs {
+            let from_name = leg["from_stop_id"]
+                .as_str()
+                .and_then(|id| stops.get(id))
+                .and_then(|stop| nonempty_json_string(&stop["name"]));
+            let to_name = leg["to_stop_id"]
+                .as_str()
+                .and_then(|id| stops.get(id))
+                .and_then(|stop| nonempty_json_string(&stop["name"]));
+            let route = leg["route_id"].as_str().and_then(|id| routes.get(id));
+            let trip = leg["trip_id"].as_str().and_then(|id| trips.get(id));
+            let line = route
+                .and_then(|route| nonempty_json_string(&route["short_name"]))
+                .or_else(|| route.and_then(|route| nonempty_json_string(&route["long_name"])))
+                .or_else(|| route.and_then(|route| nonempty_json_string(&route["source_id"])))
+                .map(humanize_line_identifier);
+            let route_name = route
+                .and_then(|route| nonempty_json_string(&route["long_name"]))
+                .map(str::to_string)
+                .or_else(|| line.clone());
+            let destination = trip
+                .and_then(|trip| nonempty_json_string(&trip["headsign"]))
+                .map(str::to_string)
+                .or_else(|| to_name.map(str::to_string));
+            let mode_name = leg["mode"].as_str().and_then(human_transport_mode_name);
+            let display_name = match (mode_name, line.as_deref(), destination.as_deref()) {
+                (Some(mode), Some(line), Some(destination)) => {
+                    format!("{mode} {line} směr {destination}")
+                }
+                (Some(mode), Some(line), None) => format!("{mode} {line}"),
+                (Some(mode), None, Some(destination)) => format!("{mode} směr {destination}"),
+                (Some(mode), None, None) => mode.to_string(),
+                (None, _, Some(destination)) => format!("Pěšky do {destination}"),
+                (None, _, None) => "Pěšky".to_string(),
+            };
+
+            leg["line"] = line.map_or(Value::Null, Value::String);
+            leg["mode_name"] = mode_name.map_or(Value::Null, |name| json!(name));
+            leg["route_name"] = route_name.map_or(Value::Null, Value::String);
+            leg["destination"] = destination.map_or(Value::Null, Value::String);
+            leg["display_name"] = Value::String(display_name);
+            leg["from_stop_name"] = from_name.map_or(Value::Null, |name| json!(name));
+            leg["to_stop_name"] = to_name.map_or(Value::Null, |name| json!(name));
+        }
+    }
+}
+
+fn nonempty_json_string(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn humanize_line_identifier(value: &str) -> String {
+    let source_id = value.rsplit(':').next().unwrap_or(value).trim();
+    source_id
+        .strip_prefix('L')
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|character| character.is_ascii_digit()))
+        .unwrap_or(source_id)
+        .to_string()
+}
+
+fn human_transport_mode_name(mode: &str) -> Option<&'static str> {
+    match mode {
+        "train" => Some("Vlak"),
+        "tram" => Some("Tramvaj"),
+        "bus" => Some("Autobus"),
+        "metro" => Some("Metro"),
+        "trolleybus" => Some("Trolejbus"),
+        "ferry" => Some("Přívoz"),
+        "cable_car" => Some("Lanovka"),
+        _ => None,
+    }
+}
+
 fn journeys_realtime_status(journeys: &[Value]) -> &'static str {
     if journeys
         .iter()
@@ -7829,26 +9545,186 @@ async fn search_stops_db(
 ) -> Result<Vec<Stop>, sqlx::Error> {
     let normalized = normalize_czech_name(raw_query);
     let candidate_limit = stop_search_candidate_limit(limit);
+    let raw_candidate_limit = (candidate_limit * 4).min(400);
     if normalized.is_empty() {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
-                   lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, location_type, parent_station_id, wheelchair_boarding,
-                   modes, source_priority, is_active
-            FROM enabled_source_stops
-            WHERE is_active = true
-              AND btrim(name) <> ''
-              AND btrim(normalized_name) <> ''
-              AND location_type IN ('stop', 'station')
-            ORDER BY source_priority ASC, name ASC, platform_code ASC NULLS FIRST, id ASC
-            LIMIT $1
+            WITH candidates AS MATERIALIZED (
+                SELECT stop.id, stop.source_priority, stop.name, stop.platform_code
+                FROM stops AS stop
+                WHERE stop.is_active = true
+                  AND btrim(stop.name) <> ''
+                  AND btrim(stop.normalized_name) <> ''
+                  AND stop.location_type IN ('stop', 'station')
+                ORDER BY stop.source_priority ASC, stop.name ASC,
+                         stop.platform_code ASC NULLS FIRST, stop.id ASC
+                LIMIT $1
+            )
+            SELECT stop.id,
+                   COALESCE(preferred.source_feed_id, stop.source_feed_id) AS source_feed_id,
+                   stop.name, stop.normalized_name,
+                   stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+                   stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+                   stop.platform_code, stop.location_type, stop.parent_station_id,
+                   stop.wheelchair_boarding, stop.modes,
+                   COALESCE(preferred.priority, stop.source_priority) AS source_priority,
+                   stop.is_active
+            FROM candidates AS candidate
+            JOIN stops AS stop ON stop.id = candidate.id
+            LEFT JOIN source_feeds AS direct_feed
+              ON direct_feed.id = stop.source_feed_id
+             AND direct_feed.enabled = true
+            LEFT JOIN LATERAL (
+                SELECT source_id.source_feed_id, source_id.priority
+                FROM stop_source_ids AS source_id
+                JOIN source_feeds AS source_feed
+                  ON source_feed.id = source_id.source_feed_id
+                 AND source_feed.enabled = true
+                WHERE source_id.stop_id = stop.id
+                  AND direct_feed.id IS NULL
+                  AND stop.source_feed_id IS NOT NULL
+                ORDER BY source_id.priority ASC, source_id.source_feed_id ASC
+                LIMIT 1
+            ) AS preferred ON true
+            WHERE preferred.source_feed_id IS NOT NULL
+               OR stop.source_feed_id IS NULL
+               OR direct_feed.id IS NOT NULL
+            ORDER BY candidate.source_priority ASC, candidate.name ASC,
+                     candidate.platform_code ASC NULLS FIRST, candidate.id ASC
+            LIMIT $2
             "#,
         )
+        .bind(raw_candidate_limit)
         .bind(candidate_limit)
         .fetch_all(pool)
         .await?;
-        return rows.into_iter().map(stop_from_row).collect();
+        let stops = rows
+            .into_iter()
+            .map(stop_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        return ranked_stop_suggestions_db(pool, stops, normalized_query, limit).await;
+    }
+
+    let prefix = format!("{normalized}%");
+    let direct_prefix_rows = sqlx::query(
+        r#"
+        SELECT stop.id, stop.source_feed_id, stop.name, stop.normalized_name,
+               stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+               stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+               stop.platform_code, stop.location_type, stop.parent_station_id,
+               stop.wheelchair_boarding, stop.modes, stop.source_priority, stop.is_active
+        FROM stops AS stop
+        LEFT JOIN source_feeds AS direct_feed
+          ON direct_feed.id = stop.source_feed_id
+         AND direct_feed.enabled = true
+        WHERE stop.is_active = true
+          AND stop.name <> ''
+          AND stop.normalized_name <> ''
+          AND stop.location_type IN ('stop', 'station')
+          AND stop.normalized_name LIKE $1
+          AND (stop.source_feed_id IS NULL OR direct_feed.id IS NOT NULL)
+        LIMIT $2
+        "#,
+    )
+    .bind(&prefix)
+    .bind(candidate_limit)
+    .fetch_all(pool)
+    .await?;
+    if !direct_prefix_rows.is_empty() {
+        let stops = direct_prefix_rows
+            .into_iter()
+            .map(stop_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        return ranked_stop_suggestions_db(pool, stops, normalized_query, limit).await;
+    }
+
+    let prefix_rows = sqlx::query(
+        r#"
+        WITH candidates AS MATERIALIZED (
+            (
+                SELECT stop.id, stop.normalized_name, stop.source_priority,
+                       stop.name, stop.platform_code
+                FROM stops AS stop
+                WHERE stop.id = $2
+                  AND stop.is_active = true
+                  AND stop.name <> ''
+                  AND stop.normalized_name <> ''
+                  AND stop.location_type IN ('stop', 'station')
+                LIMIT 1
+            )
+            UNION ALL
+            (
+                SELECT stop.id, stop.normalized_name, stop.source_priority,
+                       stop.name, stop.platform_code
+                FROM stops AS stop
+                WHERE stop.is_active = true
+                  AND stop.name <> ''
+                  AND stop.normalized_name = $1
+                  AND stop.location_type IN ('stop', 'station')
+                LIMIT $5
+            )
+            UNION ALL
+            (
+                SELECT stop.id, stop.normalized_name, stop.source_priority,
+                       stop.name, stop.platform_code
+                FROM stops AS stop
+                WHERE stop.is_active = true
+                  AND stop.name <> ''
+                  AND stop.normalized_name <> ''
+                  AND stop.location_type IN ('stop', 'station')
+                  AND stop.normalized_name LIKE $3
+                LIMIT $4
+            )
+        )
+        SELECT stop.id,
+               COALESCE(preferred.source_feed_id, stop.source_feed_id) AS source_feed_id,
+               stop.name, stop.normalized_name,
+               stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+               stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+               stop.platform_code, stop.location_type, stop.parent_station_id,
+               stop.wheelchair_boarding, stop.modes,
+               COALESCE(preferred.priority, stop.source_priority) AS source_priority,
+               stop.is_active
+        FROM candidates AS candidate
+        JOIN stops AS stop ON stop.id = candidate.id
+        LEFT JOIN source_feeds AS direct_feed
+          ON direct_feed.id = stop.source_feed_id
+         AND direct_feed.enabled = true
+        LEFT JOIN LATERAL (
+            SELECT source_id.source_feed_id, source_id.priority
+            FROM stop_source_ids AS source_id
+            JOIN source_feeds AS source_feed
+              ON source_feed.id = source_id.source_feed_id
+             AND source_feed.enabled = true
+            WHERE source_id.stop_id = stop.id
+              AND direct_feed.id IS NULL
+              AND stop.source_feed_id IS NOT NULL
+            ORDER BY source_id.priority ASC, source_id.source_feed_id ASC
+            LIMIT 1
+        ) AS preferred ON true
+        WHERE preferred.source_feed_id IS NOT NULL
+           OR stop.source_feed_id IS NULL
+           OR direct_feed.id IS NOT NULL
+        ORDER BY (candidate.id = $2) DESC, (candidate.normalized_name = $1) DESC,
+                 candidate.normalized_name ASC,
+                 candidate.source_priority ASC, candidate.name ASC,
+                 candidate.platform_code ASC NULLS FIRST, candidate.id ASC
+        LIMIT $5
+        "#,
+    )
+    .bind(&normalized)
+    .bind(raw_query.trim())
+    .bind(&prefix)
+    .bind(candidate_limit)
+    .bind(candidate_limit)
+    .fetch_all(pool)
+    .await?;
+    if !prefix_rows.is_empty() {
+        let stops = prefix_rows
+            .into_iter()
+            .map(stop_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        return ranked_stop_suggestions_db(pool, stops, normalized_query, limit).await;
     }
 
     let like = format!("%{normalized}%");
@@ -7860,33 +9736,64 @@ async fn search_stops_db(
     let first_token_like = format!("%{first_token}%");
     let rows = sqlx::query(
         r#"
-        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
-               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
-               modes, source_priority, is_active
-        FROM enabled_source_stops
-        WHERE is_active = true
-          AND btrim(name) <> ''
-          AND btrim(normalized_name) <> ''
-          AND location_type IN ('stop', 'station')
-          AND (
-            $1 = ''
-            OR id = $4
-            OR normalized_name LIKE $2
-            OR name ILIKE $3
-            OR normalized_name LIKE $5
-            OR name ILIKE $5
-            OR normalized_name % $1
-            OR name % $6
-          )
-        ORDER BY
-          CASE WHEN id = $4 THEN 0 WHEN normalized_name = $1 THEN 1 ELSE 2 END,
-          similarity(normalized_name, $1) DESC,
-          similarity(name, $6) DESC,
-          platform_code IS NULL DESC,
-          source_priority ASC,
-          name ASC
-        LIMIT $7
+        WITH candidates AS MATERIALIZED (
+            SELECT stop.id,
+                   CASE WHEN stop.id = $4 THEN 0
+                        WHEN stop.normalized_name = $1 THEN 1 ELSE 2 END AS match_rank,
+                   similarity(stop.normalized_name, $1) AS normalized_similarity,
+                   similarity(stop.name, $6) AS name_similarity,
+                   stop.platform_code, stop.source_priority, stop.name
+            FROM stops AS stop
+            WHERE stop.is_active = true
+              AND btrim(stop.name) <> ''
+              AND btrim(stop.normalized_name) <> ''
+              AND stop.location_type IN ('stop', 'station')
+              AND (
+                stop.id = $4
+                OR stop.normalized_name LIKE $2
+                OR stop.name ILIKE $3
+                OR stop.normalized_name LIKE $5
+                OR stop.name ILIKE $5
+                OR stop.normalized_name % $1
+                OR stop.name % $6
+              )
+            ORDER BY match_rank, normalized_similarity DESC, name_similarity DESC,
+                     stop.platform_code IS NULL DESC, stop.source_priority ASC, stop.name ASC
+            LIMIT $7
+        )
+        SELECT stop.id,
+               COALESCE(preferred.source_feed_id, stop.source_feed_id) AS source_feed_id,
+               stop.name, stop.normalized_name,
+               stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+               stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+               stop.platform_code, stop.location_type, stop.parent_station_id,
+               stop.wheelchair_boarding, stop.modes,
+               COALESCE(preferred.priority, stop.source_priority) AS source_priority,
+               stop.is_active
+        FROM candidates AS candidate
+        JOIN stops AS stop ON stop.id = candidate.id
+        LEFT JOIN source_feeds AS direct_feed
+          ON direct_feed.id = stop.source_feed_id
+         AND direct_feed.enabled = true
+        LEFT JOIN LATERAL (
+            SELECT source_id.source_feed_id, source_id.priority
+            FROM stop_source_ids AS source_id
+            JOIN source_feeds AS source_feed
+              ON source_feed.id = source_id.source_feed_id
+             AND source_feed.enabled = true
+            WHERE source_id.stop_id = stop.id
+              AND direct_feed.id IS NULL
+              AND stop.source_feed_id IS NOT NULL
+            ORDER BY source_id.priority ASC, source_id.source_feed_id ASC
+            LIMIT 1
+        ) AS preferred ON true
+        WHERE preferred.source_feed_id IS NOT NULL
+           OR stop.source_feed_id IS NULL
+           OR direct_feed.id IS NOT NULL
+        ORDER BY candidate.match_rank, candidate.normalized_similarity DESC,
+                 candidate.name_similarity DESC, candidate.platform_code IS NULL DESC,
+                 candidate.source_priority ASC, candidate.name ASC
+        LIMIT $8
         "#,
     )
     .bind(&normalized)
@@ -7895,6 +9802,7 @@ async fn search_stops_db(
     .bind(raw_query.trim())
     .bind(&first_token_like)
     .bind(raw_query.trim())
+    .bind(raw_candidate_limit)
     .bind(candidate_limit)
     .fetch_all(pool)
     .await?;
@@ -7903,6 +9811,52 @@ async fn search_stops_db(
         .into_iter()
         .map(stop_from_row)
         .collect::<Result<Vec<_>, _>>()?;
+    ranked_stop_suggestions_db(pool, stops, normalized_query, limit).await
+}
+
+fn stop_search_candidate_limit(limit: usize) -> i64 {
+    (limit.max(1) * 6).clamp(20, 100) as i64
+}
+
+async fn ranked_stop_suggestions_db(
+    pool: &PgPool,
+    stops: Vec<Stop>,
+    normalized_query: &str,
+    limit: usize,
+) -> Result<Vec<Stop>, sqlx::Error> {
+    let mut complex_ids = stops
+        .iter()
+        .filter_map(|stop| pid_stop_complex_id(&stop.id))
+        .collect::<Vec<_>>();
+    complex_ids.sort();
+    complex_ids.dedup();
+    if complex_ids.is_empty() {
+        return Ok(ranked_stop_suggestions(
+            stops.iter(),
+            normalized_query,
+            limit,
+        ));
+    }
+
+    let complex_members = pid_stop_complex_members_db(pool, &complex_ids).await?;
+    let mut members_by_complex = HashMap::<String, Vec<Stop>>::new();
+    for member in complex_members {
+        if let Some(complex_id) = pid_stop_complex_id(&member.id) {
+            members_by_complex
+                .entry(complex_id)
+                .or_default()
+                .push(member);
+        }
+    }
+    let stops = stops
+        .into_iter()
+        .map(|stop| {
+            pid_stop_complex_id(&stop.id)
+                .and_then(|complex_id| members_by_complex.get(&complex_id))
+                .and_then(|members| pid_interchange_alias_suggestion(&stop, members))
+                .unwrap_or(stop)
+        })
+        .collect::<Vec<_>>();
     Ok(ranked_stop_suggestions(
         stops.iter(),
         normalized_query,
@@ -7910,8 +9864,41 @@ async fn search_stops_db(
     ))
 }
 
-fn stop_search_candidate_limit(limit: usize) -> i64 {
-    (limit.max(1) * 6).clamp(20, 100) as i64
+async fn pid_stop_complex_members_db(
+    pool: &PgPool,
+    complex_ids: &[String],
+) -> Result<Vec<Stop>, sqlx::Error> {
+    if complex_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let patterns = complex_ids
+        .iter()
+        .flat_map(|complex_id| [format!("{complex_id}S%"), format!("{complex_id}Z%")])
+        .collect::<Vec<_>>();
+    sqlx::query(
+        r#"
+        SELECT stop.id, stop.source_feed_id, stop.name, stop.normalized_name,
+               stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+               stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+               stop.platform_code, stop.location_type, stop.parent_station_id,
+               stop.wheelchair_boarding, stop.modes, stop.source_priority, stop.is_active
+        FROM stops AS stop
+        JOIN source_feeds AS source_feed
+          ON source_feed.id = stop.source_feed_id
+         AND source_feed.enabled = true
+        WHERE stop.is_active = true
+          AND stop.location_type IN ('stop', 'station')
+          AND stop.id LIKE ANY($1)
+        ORDER BY stop.source_priority ASC, stop.platform_code ASC NULLS FIRST, stop.id ASC
+        LIMIT 1000
+        "#,
+    )
+    .bind(patterns)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(stop_from_row)
+    .collect()
 }
 
 async fn search_cities_db(
@@ -8055,6 +10042,39 @@ async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Erro
     row.map(stop_from_row).transpose()
 }
 
+async fn get_routing_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
+               lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
+               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               modes, source_priority, is_active
+        FROM stops
+        WHERE id = $1
+          AND is_active = true
+          AND (
+            source_feed_id IS NULL
+            OR EXISTS (
+              SELECT 1 FROM source_feeds direct_feed
+              WHERE direct_feed.id = stops.source_feed_id AND direct_feed.enabled = true
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM stop_source_ids source_id
+              JOIN source_feeds source_feed
+                ON source_feed.id = source_id.source_feed_id AND source_feed.enabled = true
+              WHERE source_id.stop_id = stops.id
+            )
+          )
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(stop_from_row).transpose()
+}
+
 async fn departures_db(
     pool: &PgPool,
     stop_id: &str,
@@ -8097,7 +10117,7 @@ async fn departures_db(
         ) realtime ON true
         WHERE st.stop_id = $1
           AND st.departure_time >= $2
-          AND COALESCE(st.pickup_type, 0) = 0
+          AND COALESCE(st.pickup_type, 0) IN (0, 2, 3)
         ORDER BY st.departure_time ASC
         LIMIT $3
         "#,
@@ -8357,6 +10377,18 @@ fn resolve_journey_point_fixture(
     cities: &[City],
     point: &JourneyPoint,
 ) -> Option<String> {
+    if point.point_type == "coordinate" {
+        let (lat, lon) = point.lat.zip(point.lon)?;
+        return stops
+            .iter()
+            .filter_map(|stop| {
+                stop.lat.zip(stop.lon).map(|(stop_lat, stop_lon)| {
+                    (haversine_m(lat, lon, stop_lat, stop_lon), stop.id.clone())
+                })
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, id)| id);
+    }
     let candidate = point
         .id
         .as_deref()
@@ -8378,7 +10410,7 @@ fn resolve_journey_point_fixture(
 
 fn validate_journey_point_fixture(cities: &[City], point: &JourneyPoint) -> Result<(), ApiError> {
     match point.point_type.as_str() {
-        "stop" => Ok(()),
+        "stop" => validate_required_journey_point_id(point),
         "city" => {
             let city_id = point
                 .id
@@ -8391,9 +10423,12 @@ fn validate_journey_point_fixture(cities: &[City], point: &JourneyPoint) -> Resu
                 Err(invalid_city_id(Some(city_id)))
             }
         }
+        "coordinate" => validate_coordinate_journey_point(point),
         other => Err(ApiError {
             code: "invalid_journey_point_type".to_string(),
-            message: format!("journey point type '{other}' is not supported; use 'stop' or 'city'"),
+            message: format!(
+                "journey point type '{other}' is not supported; use 'stop', 'city' or 'coordinate'"
+            ),
         }),
     }
 }
@@ -8665,8 +10700,22 @@ fn city_search_json(city: &City) -> Value {
 fn stop_search_json(stop: &Stop) -> Value {
     let mut value = serde_json::to_value(stop).unwrap_or_else(|_| json!({}));
     let place_type = stop_place_type(stop);
+    let aliases = stop
+        .name
+        .split(" / ")
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     value["place_type"] = json!(place_type);
     value["marker_type"] = json!(place_type);
+    value["canonical_name"] = json!(aliases.first().unwrap_or(&stop.name));
+    value["aliases"] = json!(aliases);
+    value["parent_stop_area_id"] = json!(
+        stop.stop_area_id
+            .as_ref()
+            .or(stop.parent_station_id.as_ref())
+    );
     value["map_visible"] = json!(!matches!(
         stop.location_type,
         StopLocationType::GenericNode | StopLocationType::BoardingArea
@@ -8727,6 +10776,9 @@ fn canonical_stop_name_parts(name: &str, municipality: Option<&str>) -> String {
 }
 
 fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
+    if left.id == right.id {
+        return true;
+    }
     if left.stop_area_id.is_some() && left.stop_area_id == right.stop_area_id {
         return true;
     }
@@ -8753,6 +10805,180 @@ fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
             haversine_m(left_lat, left_lon, right_lat, right_lon) <= 300.0
         }
         _ => left_municipality.is_some() && left_municipality == right_municipality,
+    }
+}
+
+fn merge_stop_suggestion(canonical: &mut Stop, sibling: &Stop) {
+    for mode in &sibling.modes {
+        if !canonical.modes.contains(mode) {
+            canonical.modes.push(mode.clone());
+        }
+    }
+    if canonical.modes.len() > 1 {
+        canonical
+            .modes
+            .retain(|mode| !matches!(mode, TransportMode::Unknown));
+    }
+    canonical.modes.sort_by_key(stop_search_mode_rank);
+}
+
+fn pid_stop_complex_id(stop_id: &str) -> Option<String> {
+    let remainder = stop_id.strip_prefix("pid_gtfs:U")?;
+    let digit_count = remainder
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 || !matches!(remainder.as_bytes().get(digit_count), Some(b'S' | b'Z')) {
+        return None;
+    }
+    Some(format!("pid_gtfs:U{}", &remainder[..digit_count]))
+}
+
+fn pid_interchange_alias_suggestion(anchor: &Stop, members: &[Stop]) -> Option<Stop> {
+    let alias_members = pid_interchange_alias_members(anchor, members);
+    if alias_members.is_empty() {
+        return None;
+    }
+
+    let canonical = alias_members
+        .iter()
+        .copied()
+        .filter(|member| member.location_type == StopLocationType::Station)
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .or_else(|| {
+            alias_members
+                .iter()
+                .copied()
+                .filter(|member| member.platform_code.is_none())
+                .min_by(|left, right| left.id.cmp(&right.id))
+        })
+        .unwrap_or(anchor);
+    let mut suggestion = canonical.clone();
+    for member in &alias_members {
+        merge_stop_suggestion(&mut suggestion, member);
+    }
+
+    let anchor_name_key = canonical_stop_name(anchor);
+    let canonical_name_key = canonical_stop_name(canonical);
+    let mut names_by_key = HashMap::<String, String>::new();
+    for member in alias_members {
+        names_by_key
+            .entry(canonical_stop_name(member))
+            .or_insert_with(|| member.name.clone());
+    }
+    let mut names = Vec::new();
+    if let Some(name) = names_by_key.remove(&anchor_name_key) {
+        names.push(name);
+    }
+    if canonical_name_key != anchor_name_key
+        && let Some(name) = names_by_key.remove(&canonical_name_key)
+    {
+        names.push(name);
+    }
+    let mut other_names = names_by_key.into_iter().collect::<Vec<_>>();
+    other_names.sort_by(|(left, _), (right, _)| left.cmp(right));
+    names.extend(other_names.into_iter().map(|(_, name)| name));
+    suggestion.name = names.join(" / ");
+    suggestion.normalized_name = normalize_czech_name(&suggestion.name);
+    Some(suggestion)
+}
+
+fn pid_interchange_alias_members<'a>(anchor: &Stop, members: &'a [Stop]) -> Vec<&'a Stop> {
+    let Some(complex_id) = pid_stop_complex_id(&anchor.id) else {
+        return Vec::new();
+    };
+    let complex_members = members
+        .iter()
+        .filter(|member| pid_stop_complex_id(&member.id).as_deref() == Some(complex_id.as_str()))
+        .collect::<Vec<_>>();
+    let mut members_by_name = HashMap::<String, Vec<&Stop>>::new();
+    for member in &complex_members {
+        members_by_name
+            .entry(canonical_stop_name(member))
+            .or_default()
+            .push(*member);
+    }
+    let anchor_name = canonical_stop_name(anchor);
+    if !members_by_name
+        .get(&anchor_name)
+        .is_some_and(|name_members| pid_name_group_is_interchange(name_members))
+    {
+        return Vec::new();
+    }
+
+    let center = complex_members
+        .iter()
+        .copied()
+        .filter(|member| member.location_type == StopLocationType::Station)
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .and_then(|station| station.lat.zip(station.lon))
+        .or_else(|| anchor.lat.zip(anchor.lon));
+    let eligible_names = members_by_name
+        .iter()
+        .filter(|(_, name_members)| pid_name_group_is_interchange(name_members))
+        .filter(|(name, name_members)| {
+            *name == &anchor_name
+                || center.is_some_and(|(center_lat, center_lon)| {
+                    name_members.iter().any(|member| {
+                        member.lat.zip(member.lon).is_some_and(|(lat, lon)| {
+                            haversine_m(center_lat, center_lon, lat, lon)
+                                <= PID_INTERCHANGE_ALIAS_RADIUS_M
+                        })
+                    })
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    if eligible_names.len() < 2 {
+        return Vec::new();
+    }
+    complex_members
+        .into_iter()
+        .filter(|member| eligible_names.contains(&canonical_stop_name(member)))
+        .collect()
+}
+
+fn pid_name_group_is_interchange(members: &[&Stop]) -> bool {
+    if members
+        .iter()
+        .any(|member| member.location_type == StopLocationType::Station)
+        || members
+            .iter()
+            .any(|member| member.modes.contains(&TransportMode::Train))
+    {
+        return true;
+    }
+    members
+        .iter()
+        .flat_map(|member| member.modes.iter())
+        .filter_map(pid_mode_family)
+        .collect::<HashSet<_>>()
+        .len()
+        >= 2
+}
+
+fn pid_mode_family(mode: &TransportMode) -> Option<u8> {
+    match mode {
+        TransportMode::Train => Some(0),
+        TransportMode::Metro => Some(1),
+        TransportMode::Tram => Some(2),
+        TransportMode::Bus | TransportMode::Trolleybus => Some(3),
+        TransportMode::Ferry => Some(4),
+        TransportMode::CableCar => Some(5),
+        TransportMode::Unknown => None,
+    }
+}
+
+fn stop_search_mode_rank(mode: &TransportMode) -> u8 {
+    match mode {
+        TransportMode::Train => 0,
+        TransportMode::Metro => 1,
+        TransportMode::Tram => 2,
+        TransportMode::Trolleybus => 3,
+        TransportMode::Bus => 4,
+        TransportMode::Ferry => 5,
+        TransportMode::CableCar => 6,
+        TransportMode::Unknown => 7,
     }
 }
 
@@ -9164,6 +11390,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routing_realtime_query_uses_the_validity_indexable_path() {
+        let query = JOURNEY_ROUTING_REALTIME_QUERY.to_ascii_lowercase();
+
+        assert!(query.contains("and valid_until >= now()"));
+        assert!(!query.contains("valid_until is null"));
+    }
+
+    #[test]
     fn raptor_snapshot_path_includes_format_and_data_revision() {
         let revision = RoutingDataRevision {
             latest_import: DateTime::from_timestamp_millis(1_783_479_136_328),
@@ -9177,7 +11411,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v8-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v12-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -9193,8 +11427,9 @@ mod tests {
             "raptor-v5-2026-07-08-old.json",
             "raptor-v6-2026-07-08-old.json",
             "raptor-v7-2026-07-08-old.json",
-            "raptor-v8-2026-07-08-current.json",
-            "raptor-v9-2026-07-08-newer.json",
+            "raptor-v8-2026-07-08-old.json",
+            "raptor-v9-2026-07-08-current.json",
+            "raptor-v12-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -9202,7 +11437,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 7);
+        assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 9);
         assert!(!directory.join("raptor-v1-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v2-2026-07-08-old.json.tmp").exists());
         assert!(!directory.join("raptor-v3-2026-07-08-old.json").exists());
@@ -9210,8 +11445,9 @@ mod tests {
         assert!(!directory.join("raptor-v5-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v6-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v7-2026-07-08-old.json").exists());
-        assert!(directory.join("raptor-v8-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v9-2026-07-08-newer.json").exists());
+        assert!(!directory.join("raptor-v8-2026-07-08-old.json").exists());
+        assert!(!directory.join("raptor-v9-2026-07-08-current.json").exists());
+        assert!(directory.join("raptor-v12-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -9285,12 +11521,12 @@ mod tests {
             std::env::temp_dir().join(format!("cesta-raptor-retention-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         for file_name in [
-            "raptor-v8-2026-06-01-import-old.json",
-            "raptor-v8-2026-06-01-import-new.json",
-            "raptor-v8-2026-06-02-import.json",
-            "raptor-v8-2026-06-03-import.json",
-            "raptor-v8-2026-06-04-import.json",
-            "raptor-v8-2026-06-05-import.json",
+            "raptor-v12-2026-06-01-import-old.json",
+            "raptor-v12-2026-06-01-import-new.json",
+            "raptor-v12-2026-06-02-import.json",
+            "raptor-v12-2026-06-03-import.json",
+            "raptor-v12-2026-06-04-import.json",
+            "raptor-v12-2026-06-05-import.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
                 .await
@@ -9303,10 +11539,10 @@ mod tests {
         assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 1);
         assert_ne!(
             directory
-                .join("raptor-v8-2026-06-01-import-old.json")
+                .join("raptor-v12-2026-06-01-import-old.json")
                 .exists(),
             directory
-                .join("raptor-v8-2026-06-01-import-new.json")
+                .join("raptor-v12-2026-06-01-import-new.json")
                 .exists()
         );
         assert_eq!(prune_raptor_snapshots(&directory, 2).await.unwrap(), 3);
@@ -9316,7 +11552,7 @@ mod tests {
             if entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("raptor-v8-"))
+                .is_some_and(|name| name.starts_with("raptor-v12-"))
             {
                 retained_count += 1;
             }
@@ -9342,6 +11578,13 @@ mod tests {
         assert!(response.headers().contains_key("x-request-id"));
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(response.headers()["x-frame-options"], "DENY");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["routing_schedule_ready"], false);
+        assert_eq!(payload["routing_realtime_ready"], false);
+        assert_eq!(payload["routing"]["schedule_ready"], false);
+        assert_eq!(payload["routing"]["realtime_ready"], false);
     }
 
     #[tokio::test]
@@ -9375,7 +11618,11 @@ mod tests {
         );
         assert_eq!(
             payload["components"]["schemas"]["JourneyPoint"]["properties"]["type"]["enum"],
-            json!(["stop", "city"])
+            json!(["stop", "city", "coordinate"])
+        );
+        assert_eq!(
+            payload["components"]["schemas"]["JourneyPoint"]["required"],
+            json!(["type"])
         );
         assert!(
             payload["components"]["schemas"]["PlaceType"]["enum"]
@@ -9393,6 +11640,14 @@ mod tests {
         assert!(payload["paths"]["/stops/in-bounds"]["get"].is_object());
         assert!(payload["components"]["schemas"]["StopsInBoundsResponse"].is_object());
         assert!(payload["components"]["schemas"]["JourneyLegRealtime"].is_object());
+        assert!(
+            payload["components"]["schemas"]["JourneyLeg"]["properties"]["display_name"]
+                .is_object()
+        );
+        assert_eq!(
+            payload["components"]["schemas"]["JourneyLeg"]["properties"]["geometry"]["$ref"],
+            "#/components/schemas/JourneyLegGeometry"
+        );
         assert_eq!(
             payload["paths"]["/journeys/search"]["post"]["requestBody"]["content"]["application/json"]
                 ["schema"]["properties"]["include_intermediate_stops"]["default"],
@@ -9852,6 +12107,196 @@ mod tests {
     }
 
     #[test]
+    fn stop_search_exposes_canonical_name_and_aliases() {
+        let stop = fixture_stop(
+            "pid_gtfs:U462S1",
+            "Nádraží Veleslavín / Praha-Veleslavín",
+            50.095955,
+            14.348551,
+            TransportMode::Metro,
+        );
+
+        let payload = stop_search_json(&stop);
+
+        assert_eq!(payload["canonical_name"], "Nádraží Veleslavín");
+        assert_eq!(
+            payload["aliases"],
+            json!(["Nádraží Veleslavín", "Praha-Veleslavín"])
+        );
+    }
+
+    #[test]
+    fn stop_search_merges_modes_from_nearby_same_name_stops_at_limit_one() {
+        let mut station = fixture_stop(
+            "central-station",
+            "Central",
+            50.0,
+            14.0,
+            TransportMode::Unknown,
+        );
+        station.location_type = StopLocationType::Station;
+        station.modes.clear();
+
+        let mut metro = fixture_stop(
+            "central-metro",
+            "Central",
+            50.0001,
+            14.0,
+            TransportMode::Metro,
+        );
+        metro.platform_code = Some("M1".to_string());
+        let mut bus = fixture_stop("central-bus", "Central", 50.0002, 14.0, TransportMode::Bus);
+        bus.platform_code = Some("B".to_string());
+        let mut train = fixture_stop(
+            "central-train",
+            "Central",
+            50.0003,
+            14.0,
+            TransportMode::Train,
+        );
+        train.platform_code = Some("1".to_string());
+        let stops = [station, metro, bus, train];
+
+        let suggestions = ranked_stop_suggestions(stops.iter(), "central", 1);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id, "central-station");
+        assert_eq!(
+            suggestions[0].modes,
+            vec![
+                TransportMode::Train,
+                TransportMode::Metro,
+                TransportMode::Bus,
+            ]
+        );
+    }
+
+    #[test]
+    fn pid_interchange_alias_merges_karlovo_and_palackeho_but_not_moran() {
+        let mut station = fixture_stop(
+            "pid_gtfs:U237S1",
+            "Karlovo náměstí",
+            50.074590,
+            14.416980,
+            TransportMode::Unknown,
+        );
+        station.location_type = StopLocationType::Station;
+        station.modes.clear();
+        let metro = fixture_stop(
+            "pid_gtfs:U237Z101P",
+            "Karlovo náměstí",
+            50.074664,
+            14.416855,
+            TransportMode::Metro,
+        );
+        let mut palackeho = fixture_stop(
+            "pid_gtfs:U237Z6P",
+            "Palackého náměstí",
+            50.073265,
+            14.414462,
+            TransportMode::Tram,
+        );
+        palackeho.modes = vec![
+            TransportMode::Tram,
+            TransportMode::Trolleybus,
+            TransportMode::Bus,
+        ];
+        let moran = fixture_stop(
+            "pid_gtfs:U237Z4P",
+            "Moráň",
+            50.074024,
+            14.418731,
+            TransportMode::Tram,
+        );
+        let members = [station, metro, palackeho.clone(), moran];
+
+        let suggestion = pid_interchange_alias_suggestion(&palackeho, &members).unwrap();
+
+        assert_eq!(suggestion.id, "pid_gtfs:U237S1");
+        assert_eq!(suggestion.name, "Palackého náměstí / Karlovo náměstí");
+        assert_eq!(
+            suggestion.modes,
+            vec![
+                TransportMode::Metro,
+                TransportMode::Tram,
+                TransportMode::Trolleybus,
+                TransportMode::Bus,
+            ]
+        );
+        assert!(!suggestion.name.contains("Moráň"));
+    }
+
+    #[test]
+    fn pid_interchange_alias_includes_connected_rail_name() {
+        let mut station = fixture_stop(
+            "pid_gtfs:U480S1",
+            "Náměstí Republiky",
+            50.088804,
+            14.430556,
+            TransportMode::Unknown,
+        );
+        station.location_type = StopLocationType::Station;
+        station.modes.clear();
+        let metro = fixture_stop(
+            "pid_gtfs:U480Z101P",
+            "Náměstí Republiky",
+            50.088880,
+            14.430477,
+            TransportMode::Metro,
+        );
+        let mut surface = fixture_stop(
+            "pid_gtfs:U480Z3P",
+            "Masarykovo nádraží",
+            50.087685,
+            14.432513,
+            TransportMode::Tram,
+        );
+        surface.modes.push(TransportMode::Bus);
+        let train = fixture_stop(
+            "pid_gtfs:U480Z301",
+            "Praha Masarykovo nádraží",
+            50.087936,
+            14.433740,
+            TransportMode::Train,
+        );
+        let members = [station, metro, surface, train.clone()];
+
+        let suggestion = pid_interchange_alias_suggestion(&train, &members).unwrap();
+
+        assert_eq!(suggestion.id, "pid_gtfs:U480S1");
+        for alias in [
+            "Praha Masarykovo nádraží",
+            "Náměstí Republiky",
+            "Masarykovo nádraží",
+        ] {
+            assert!(suggestion.name.contains(alias));
+        }
+        assert_eq!(
+            suggestion.modes,
+            vec![
+                TransportMode::Train,
+                TransportMode::Metro,
+                TransportMode::Tram,
+                TransportMode::Bus,
+            ]
+        );
+    }
+
+    #[test]
+    fn pid_stop_complex_id_requires_a_pid_station_or_platform_marker() {
+        assert_eq!(
+            pid_stop_complex_id("pid_gtfs:U237Z6P").as_deref(),
+            Some("pid_gtfs:U237")
+        );
+        assert_eq!(
+            pid_stop_complex_id("pid_gtfs:U237S1E7").as_deref(),
+            Some("pid_gtfs:U237")
+        );
+        assert_eq!(pid_stop_complex_id("pid_gtfs:U237"), None);
+        assert_eq!(pid_stop_complex_id("other:U237Z6P"), None);
+    }
+
+    #[test]
     fn stop_search_collapses_municipality_prefixed_source_aliases() {
         let mut short_name = fixture_stop(
             "pid-belarie",
@@ -10292,6 +12737,7 @@ mod tests {
                 Some(17.277),
                 None,
                 None,
+                None,
                 &["train".to_string()],
             ),
             implicit_station_transfer_signature(
@@ -10300,6 +12746,7 @@ mod tests {
                 Some("Olomouc"),
                 Some(49.593),
                 Some(17.278),
+                None,
                 None,
                 Some("5"),
                 &["train".to_string()],
@@ -10314,10 +12761,63 @@ mod tests {
                 Some(17.278),
                 None,
                 None,
+                None,
                 &["bus".to_string()],
             ),
             None
         );
+    }
+
+    #[test]
+    fn implicit_station_transfer_signature_prefers_source_station_relationship() {
+        let first = implicit_station_transfer_signature(
+            "pid_gtfs:U142Z101P",
+            "Kačerov",
+            Some("Praha"),
+            Some(50.041),
+            Some(14.460),
+            None,
+            Some("pid_gtfs:U142S1"),
+            Some("1"),
+            &["bus".to_string()],
+        );
+        let second = implicit_station_transfer_signature(
+            "pid_gtfs:U142Z301",
+            "Kačerov",
+            Some("Praha"),
+            Some(50.042),
+            Some(14.461),
+            None,
+            Some("pid_gtfs:U142S1"),
+            Some("metro"),
+            &["metro".to_string()],
+        );
+        assert_eq!(first.as_deref(), Some("source:pid_gtfs:U142:kacerov"));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn station_interchange_connects_different_lines_of_the_same_mode() {
+        let metro = vec!["metro".to_string()];
+        let line_a = HashSet::from(["pid_gtfs:L991".to_string()]);
+        let line_b = HashSet::from(["pid_gtfs:L992".to_string()]);
+
+        assert!(station_interchange_needs_connector(
+            &metro, &line_a, &metro, &line_b
+        ));
+        assert!(!station_interchange_needs_connector(
+            &metro, &line_a, &metro, &line_a
+        ));
+    }
+
+    #[test]
+    fn pid_coordinated_stop_actions_remain_routable() {
+        assert!(gtfs_stop_action_allowed(None));
+        assert!(gtfs_stop_action_allowed(Some(0)));
+        assert!(!gtfs_stop_action_allowed(Some(1)));
+        assert!(gtfs_stop_action_allowed(Some(2)));
+        assert!(gtfs_stop_action_allowed(Some(3)));
+        assert!(!gtfs_stop_action_allowed(Some(9)));
     }
 
     #[test]
@@ -10464,6 +12964,7 @@ mod tests {
                 arrival_time,
                 mode: TransportMode::Train,
                 warnings: Vec::new(),
+                geometry: None,
             }]
         } else {
             vec![
@@ -10476,6 +12977,7 @@ mod tests {
                     arrival_time: departure_time + 3600,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: format!("transfer-{id}"),
@@ -10486,6 +12988,7 @@ mod tests {
                     arrival_time,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
             ]
         };
@@ -10546,6 +13049,7 @@ mod tests {
                 arrival_time: 9 * 3600,
                 mode: TransportMode::Train,
                 warnings: Vec::new(),
+                geometry: None,
             }],
             departure_time: 4 * 3600,
             arrival_time: 9 * 3600,
@@ -10568,6 +13072,7 @@ mod tests {
                     arrival_time: 6 * 3600,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: "b".to_string(),
@@ -10578,6 +13083,7 @@ mod tests {
                     arrival_time: 8 * 3600,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
             ],
             departure_time: 5 * 3600,
@@ -10613,7 +13119,7 @@ mod tests {
     }
 
     #[test]
-    fn ranked_journeys_preserve_a_different_carrier_option() {
+    fn carrier_diversity_does_not_restore_an_objectively_dominated_option() {
         let mut journeys = (0..6)
             .map(|index| {
                 test_journey(
@@ -10647,12 +13153,46 @@ mod tests {
         );
 
         assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
-        assert!(ranked.iter().any(|journey| {
+        assert!(!ranked.iter().any(|journey| {
             journey
                 .legs
                 .iter()
                 .any(|leg| leg.route_id.as_deref() == Some("route-carrier-b"))
         }));
+    }
+
+    #[test]
+    fn route_diversity_does_not_restore_objectively_dominated_detours() {
+        let mut journeys = (0..5)
+            .map(|index| {
+                let mut journey = test_journey(
+                    &format!("direct-{index}"),
+                    0,
+                    8 * 3600 + 55 * 60 + index * 60,
+                    9 * 3600 + index * 60,
+                );
+                journey.legs[0].route_id = Some("route-direct".to_string());
+                journey
+            })
+            .collect::<Vec<_>>();
+        let mut tram_transfer = test_journey("tram-15-8", 1, 8 * 3600 + 54 * 60, 9 * 3600 + 5 * 60);
+        tram_transfer.legs[0].route_id = Some("route-15".to_string());
+        tram_transfer.legs[1].route_id = Some("route-8".to_string());
+        let mut metro_transfer =
+            test_journey("metro-c-tram-34", 1, 8 * 3600 + 56 * 60, 9 * 3600 + 6 * 60);
+        metro_transfer.legs[0].route_id = Some("route-c".to_string());
+        metro_transfer.legs[1].route_id = Some("route-34".to_string());
+        journeys.extend([tram_transfer, metro_transfer]);
+
+        let ranked = ranked_journey_results(journeys);
+        let signatures = ranked
+            .iter()
+            .map(journey_route_signature)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
+        assert!(!signatures.contains("route:route-15|route:route-8"));
+        assert!(!signatures.contains("route:route-c|route:route-34"));
     }
 
     #[test]
@@ -10834,10 +13374,15 @@ mod tests {
         let first = test_journey("first", 0, 10_000, 11_000);
         let mut duplicate = first.clone();
         duplicate.id = "duplicate-id".to_string();
-        let different = test_journey("different", 0, 12_000, 13_000);
+        duplicate.departure_time += 600;
+        duplicate.arrival_time += 600;
+        duplicate.legs[0].departure_time += 600;
+        duplicate.legs[0].arrival_time += 600;
+        let different = test_journey("different", 0, 10_200, 11_200);
+        let unreasonable = test_journey("unreasonable", 0, 20_000, 21_000);
 
         assert_eq!(
-            distinct_raptor_candidate_count(&[first, duplicate, different]),
+            distinct_raptor_candidate_count(&[first, duplicate, different, unreasonable]),
             2
         );
     }
@@ -10888,6 +13433,7 @@ mod tests {
             &[TransportMode::Train],
             false,
             &RoutingAlgorithmConfig::default(),
+            Arc::new(RaptorRealtimeData::default()),
         )
         .await
         .unwrap();
@@ -10948,6 +13494,7 @@ mod tests {
                     arrival_time: 18 * 3600 + 60,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: "ggu_czptt_gtfs_latest:-SR70S-CZ-33722-2".to_string(),
@@ -10958,6 +13505,7 @@ mod tests {
                     arrival_time: 20 * 3600 + 19 * 60,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
             ],
             departure_time: 16 * 3600 + 52 * 60,
@@ -10995,6 +13543,7 @@ mod tests {
                 arrival_time: 4200,
                 mode: TransportMode::Metro,
                 warnings: Vec::new(),
+                geometry: None,
             }],
             departure_time: 3600,
             arrival_time: 4200,
@@ -11030,6 +13579,42 @@ mod tests {
             enriched[0]["legs"][0]["realtime"]["vehicle_id"],
             "vehicle-1"
         );
+    }
+
+    #[test]
+    fn journey_legs_include_human_readable_connection_metadata() {
+        let mut journeys = vec![json!({
+            "legs": [{
+                "from_stop_id": "pid_gtfs:U1Z1P",
+                "to_stop_id": "pid_gtfs:U2Z1P",
+                "route_id": "pid_gtfs:L991",
+                "trip_id": "pid_gtfs:trip-1",
+                "mode": "bus"
+            }]
+        })];
+        let related = json!({
+            "stops": [
+                {"id": "pid_gtfs:U1Z1P", "name": "Muzeum"},
+                {"id": "pid_gtfs:U2Z1P", "name": "Nádraží Hostivař"}
+            ],
+            "routes": [{
+                "id": "pid_gtfs:L991",
+                "source_id": "L991",
+                "short_name": "991",
+                "long_name": "Praha – Nádraží Hostivař"
+            }],
+            "trips": [{"id": "pid_gtfs:trip-1", "headsign": "Nádraží Hostivař"}]
+        });
+
+        attach_journey_display_metadata(&mut journeys, &related);
+
+        let leg = &journeys[0]["legs"][0];
+        assert_eq!(leg["line"], "991");
+        assert_eq!(leg["mode_name"], "Autobus");
+        assert_eq!(leg["destination"], "Nádraží Hostivař");
+        assert_eq!(leg["display_name"], "Autobus 991 směr Nádraží Hostivař");
+        assert_eq!(leg["from_stop_name"], "Muzeum");
+        assert_eq!(leg["to_stop_name"], "Nádraží Hostivař");
     }
 
     #[test]
@@ -11076,6 +13661,7 @@ mod tests {
                     arrival_time: walk_departure + 120,
                     mode: TransportMode::Unknown,
                     warnings: vec!["walking_transfer:150".to_string()],
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: "nearby-stop".to_string(),
@@ -11086,6 +13672,7 @@ mod tests {
                     arrival_time: 5_000,
                     mode: TransportMode::Bus,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
             ],
             departure_time: walk_departure,
@@ -11112,7 +13699,7 @@ mod tests {
 
     #[test]
     fn relevance_filter_rejects_impossible_transfer() {
-        let mut journey = test_journey("bad-transfer", 1, 3_600, 7_200);
+        let mut journey = test_journey("bad-transfer", 1, 3_600, 10_800);
         journey.legs[1].departure_time = journey.legs[0].arrival_time + 60;
         let signatures = HashMap::from([
             ("praha".to_string(), "praha".to_string()),
@@ -11121,6 +13708,15 @@ mod tests {
         ]);
 
         assert!(!journey_is_relevant(
+            &journey,
+            &signatures,
+            &RoutingAlgorithmConfig::default()
+        ));
+
+        journey.legs[1]
+            .warnings
+            .push("official_minimum_change_time".to_string());
+        assert!(journey_is_relevant(
             &journey,
             &signatures,
             &RoutingAlgorithmConfig::default()
@@ -11141,6 +13737,7 @@ mod tests {
                     arrival_time: 4_200,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: "b".to_string(),
@@ -11151,6 +13748,7 @@ mod tests {
                     arrival_time: 4_320,
                     mode: TransportMode::Unknown,
                     warnings: vec!["walking_transfer:120".to_string()],
+                    geometry: None,
                 },
                 JourneyLeg {
                     from_stop_id: "c".to_string(),
@@ -11161,6 +13759,7 @@ mod tests {
                     arrival_time: 5_400,
                     mode: TransportMode::Train,
                     warnings: Vec::new(),
+                    geometry: None,
                 },
             ],
             departure_time: 3_600,
@@ -11228,5 +13827,164 @@ mod tests {
             values[0]["legs"][0]["stop_calls"][1]["is_intermediate"],
             true
         );
+    }
+
+    #[test]
+    fn coordinate_journey_point_does_not_require_id_and_validates_wgs84_bounds() {
+        let valid = JourneyPoint {
+            point_type: "coordinate".to_string(),
+            id: None,
+            lat: Some(50.089458),
+            lon: Some(14.428683),
+        };
+        assert!(validate_coordinate_journey_point(&valid).is_ok());
+        assert_eq!(
+            coordinate_stop_id(valid.lat.unwrap(), valid.lon.unwrap()),
+            "coordinate:50.089458,14.428683"
+        );
+
+        let invalid = JourneyPoint {
+            point_type: "coordinate".to_string(),
+            id: None,
+            lat: Some(91.0),
+            lon: Some(14.0),
+        };
+        assert_eq!(
+            validate_coordinate_journey_point(&invalid)
+                .unwrap_err()
+                .code,
+            "invalid_coordinate"
+        );
+    }
+
+    #[test]
+    fn belarie_dostihova_ferry_is_not_a_walking_edge() {
+        let payload = json!({
+            "code": "Ok",
+            "routes": [{
+                "distance": 464.1,
+                "duration": 371.4,
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[14.397527, 50.013126], [14.396679, 50.012320], [14.393909, 50.012527]]
+                },
+                "legs": [{"steps": [
+                    {"mode": "walking"},
+                    {"mode": "ferry", "name": "Přívoz"},
+                    {"mode": "walking"}
+                ]}]
+            }]
+        });
+
+        assert_eq!(
+            walking_route_from_osrm_payload(
+                &payload,
+                (50.013126, 14.397527),
+                (50.012527, 14.393909)
+            )
+            .unwrap_err(),
+            WalkingRouteRejection::NonWalkingSegment
+        );
+    }
+
+    #[test]
+    fn valhalla_pedestrian_shape_is_decoded_to_geojson() {
+        let payload = json!({
+            "trip": {
+                "status": 0,
+                "summary": {"has_ferry": false, "length": 0.294, "time": 215.355},
+                "legs": [{
+                    "summary": {"has_ferry": false},
+                    "shape": r"esdp~AgtvoZlIjUz@bGtJlS}@lAs@v@u@jAx@|BqGzNnB\d@oApCEJp@tD?rBAg@_KAwDCqI_A{D_Rol@oHmYeBxA",
+                    "maneuvers": [{"travel_mode": "pedestrian"}]
+                }]
+            }
+        });
+
+        let route = walking_route_from_valhalla_payload(
+            &payload,
+            (50.088783, 14.430023),
+            (50.088880, 14.430477),
+        )
+        .unwrap();
+        assert_eq!(route.distance_meters, 294);
+        assert_eq!(route.duration_seconds, 216);
+        assert_eq!(route.geometry["type"], "LineString");
+        assert!(route.geometry["coordinates"].as_array().unwrap().len() > 2);
+    }
+
+    #[test]
+    fn valhalla_ferry_summary_is_not_a_walking_edge() {
+        let payload = json!({
+            "trip": {
+                "status": 0,
+                "summary": {"has_ferry": true, "length": 0.4, "time": 300.0},
+                "legs": [{"summary": {"has_ferry": true}}]
+            }
+        });
+        assert_eq!(
+            walking_route_from_valhalla_payload(
+                &payload,
+                (50.013126, 14.397527),
+                (50.012527, 14.393909),
+            )
+            .unwrap_err(),
+            WalkingRouteRejection::NonWalkingSegment
+        );
+    }
+
+    #[test]
+    fn namesti_republiky_source_relation_groups_surface_and_metro_nodes() {
+        let surface = implicit_station_transfer_signature(
+            "pid_gtfs:U480Z1P",
+            "Náměstí Republiky",
+            Some("Praha"),
+            Some(50.088783),
+            Some(14.430023),
+            None,
+            None,
+            Some("1"),
+            &["tram".to_string()],
+        );
+        let metro = implicit_station_transfer_signature(
+            "pid_gtfs:U480Z101P",
+            "Náměstí Republiky",
+            Some("Praha"),
+            Some(50.088880),
+            Some(14.430477),
+            None,
+            Some("pid_gtfs:U480S1"),
+            Some("101"),
+            &["metro".to_string()],
+        );
+        let other_name = implicit_station_transfer_signature(
+            "pid_gtfs:U480Z3P",
+            "Masarykovo nádraží",
+            Some("Praha"),
+            Some(50.087685),
+            Some(14.432513),
+            None,
+            None,
+            Some("3"),
+            &["tram".to_string()],
+        );
+
+        assert_eq!(surface, metro);
+        assert_ne!(surface, other_name);
+    }
+
+    #[test]
+    fn gtfs_shape_is_clipped_between_stops_in_trip_direction() {
+        let shape = vec![
+            (50.0, 14.0),
+            (50.001, 14.001),
+            (50.002, 14.002),
+            (50.003, 14.003),
+        ];
+        let geometry = clip_gtfs_shape(&shape, (50.001, 14.001), (50.003, 14.003)).unwrap();
+        assert_eq!(geometry["type"], "LineString");
+        assert_eq!(geometry["coordinates"][0], json!([14.001, 50.001]));
+        assert_eq!(geometry["coordinates"][2], json!([14.003, 50.003]));
+        assert!(clip_gtfs_shape(&shape, (50.003, 14.003), (50.001, 14.001)).is_none());
     }
 }

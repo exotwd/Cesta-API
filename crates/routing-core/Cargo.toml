@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 transit-model = { path = "../transit-model" }
-

@@ -35,9 +35,3 @@ CREATE INDEX IF NOT EXISTS stops_pid_active_geom_gist
   WHERE source_feed_id = 'pid_gtfs'
     AND is_active = true
     AND geom IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS realtime_updates_pid_vehicle_latest_idx
-  ON realtime_updates (source_feed_id, vehicle_id, fetched_at DESC)
-  WHERE source_feed_id = 'pid_realtime'
-    AND vehicle_id IS NOT NULL
-    AND vehicle_position IS NOT NULL;

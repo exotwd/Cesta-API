@@ -14,12 +14,47 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<Value> {
         },
         None => json!({"status": "not_configured", "data_mode": "development_fixtures"}),
     };
-    let status = if database["status"] == "down" {
+    let service_date = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Prague)
+        .date_naive();
+    let routing_schedule_ready =
+        state
+            .raptor_cache
+            .read()
+            .await
+            .iter()
+            .any(|((cached_service_date, _), cell)| {
+                *cached_service_date == service_date && cell.get().is_some()
+            });
+    let realtime = state.routing_realtime_cache.read().await;
+    let realtime_entry = realtime.as_ref().filter(|entry| {
+        entry.service_date == service_date
+            && entry.loaded_at.elapsed()
+                < std::time::Duration::from_secs(ROUTING_REALTIME_CACHE_TTL_SECONDS)
+    });
+    let routing_realtime_ready = realtime_entry.is_some();
+    let routing = json!({
+        "service_date": service_date,
+        "schedule_ready": routing_schedule_ready,
+        "realtime_ready": routing_realtime_ready,
+        "realtime_trip_count": realtime_entry.map(|entry| entry.data.trip_count()).unwrap_or(0),
+        "realtime_cache_age_seconds": realtime_entry.map(|entry| entry.loaded_at.elapsed().as_secs())
+    });
+    let production_routing_not_ready =
+        state.db.is_some() && (!routing_schedule_ready || !routing_realtime_ready);
+    let status = if database["status"] == "down" || production_routing_not_ready {
         "degraded"
     } else {
         "ok"
     };
-    Json(json!({"status": status, "service": "cesta-api", "database": database}))
+    Json(json!({
+        "status": status,
+        "service": "cesta-api",
+        "database": database,
+        "routing_schedule_ready": routing_schedule_ready,
+        "routing_realtime_ready": routing_realtime_ready,
+        "routing": routing
+    }))
 }
 
 pub(crate) async fn openapi() -> Json<Value> {
@@ -29,17 +64,20 @@ pub(crate) async fn openapi() -> Json<Value> {
         "paths": {
             "/health": {"get": {
                 "summary": "Health check",
-                "description": "Reports API and database availability. Development fixture mode reports the database as not configured.",
+                "description": "Reports API, database, scheduled-routing and realtime-routing readiness. Production status remains degraded until both routing caches are ready. Development fixture mode reports the database as not configured.",
                 "responses": {"200": {
                     "description": "Current service health",
                     "headers": {"X-Request-Id": {"schema": {"type": "string", "format": "uuid"}}},
                     "content": {"application/json": {"schema": {
                         "type": "object",
-                        "required": ["status", "service", "database"],
+                        "required": ["status", "service", "database", "routing_schedule_ready", "routing_realtime_ready", "routing"],
                         "properties": {
                             "status": {"type": "string", "enum": ["ok", "degraded"]},
                             "service": {"type": "string", "const": "cesta-api"},
-                            "database": {"type": "object"}
+                            "database": {"type": "object"},
+                            "routing_schedule_ready": {"type": "boolean"},
+                            "routing_realtime_ready": {"type": "boolean"},
+                            "routing": {"type": "object"}
                         }
                     }}}
                 }}
@@ -48,7 +86,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             "/auth/login": {"post": {"summary": "Login user"}},
             "/stops/search": {"get": {
                 "summary": "Search stops and cities",
-                "description": "Returns ranked stop suggestions. Common railway suffixes such as 'hl. n.', 'hlavni nadrazi' and 'zel. st.' are accepted even when an upstream rail feed omits the suffix from the station name. The canonical search parameter is q; query, text and term are accepted as compatibility aliases. When includeCities (or include_cities) is true, cities and stops are returned together in results and separately for backwards compatibility. Related source, stop-area and route enrichment is omitted by default for autocomplete latency; request includeRelated=true when needed.",
+                "description": "Returns ranked stop suggestions with canonical_name, aliases and parent_stop_area_id metadata. Common railway suffixes such as 'hl. n.', 'hlavni nadrazi' and 'zel. st.' are accepted even when an upstream rail feed omits the suffix from the station name. The canonical search parameter is q; query, text and term are accepted as compatibility aliases. When includeCities (or include_cities) is true, cities and stops are returned together in results and separately for backwards compatibility. Related source, stop-area and route enrichment is omitted by default for autocomplete latency; request includeRelated=true when needed.",
                 "parameters": [
                     {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}},
                     {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}},
@@ -90,7 +128,7 @@ pub(crate) async fn openapi() -> Json<Value> {
             }},
             "/journeys/search": {"post": {
                 "summary": "Search journeys",
-                "description": "Returns ranked journey candidates. City points expand to active physical stops. Each leg may include PID realtime delay, estimates, cancellation, vehicle position, source and freshness metadata.",
+                "description": "Returns ranked journey candidates. City points expand to active physical stops and coordinate points are connected to several reachable stops through the configured pedestrian graph. Realtime delays are used when checking transfers and ranking expected arrival. Every returned leg has real GeoJSON geometry: GTFS shapes for transit and pedestrian-router geometry for walking.",
                 "requestBody": {
                     "required": true,
                     "content": {"application/json": {"schema": {
@@ -115,6 +153,17 @@ pub(crate) async fn openapi() -> Json<Value> {
                                 "description": "When true, every journey leg contains ordered stop_calls including its origin, all intermediate stops and its destination. The camelCase alias includeIntermediateStops is also accepted."
                             }
                         }
+                    }, "example": {
+                        "from": {"type": "coordinate", "lat": 50.089458, "lon": 14.428683},
+                        "to": {"type": "stop", "id": "pid_gtfs:U897S1"},
+                        "datetime": "2026-09-01T05:35:00+02:00",
+                        "mode": "depart_at",
+                        "transport_modes": ["metro", "tram", "bus", "train", "trolleybus", "ferry"],
+                        "max_transfers": 4,
+                        "walking_speed": "normal",
+                        "prefer_reliable_transfers": true,
+                        "offline_compatible": false,
+                        "include_intermediate_stops": true
                     }}}
                 }
             }},
@@ -135,6 +184,20 @@ pub(crate) async fn openapi() -> Json<Value> {
             "/data-sources/status": {"get": {
                 "summary": "Automatic data-source synchronization status",
                 "responses": {"200": {"description": "Freshness, record counts and latest errors for every automatic source"}}
+            }},
+            "/realtime/status": {"get": {
+                "summary": "Current realtime synchronization status",
+                "description": "Returns enabled realtime sources with current, syncing or stale freshness state. PID trip summaries and vehicle positions are reported independently from the full stop-level import.",
+                "responses": {"200": {"description": "Current realtime source state"}}
+            }},
+            "/realtime/trip/{trip_id}": {"get": {
+                "summary": "Current realtime updates for a trip",
+                "parameters": [{
+                    "name": "trip_id", "in": "path", "required": true,
+                    "schema": {"type": "string"},
+                    "description": "Source-scoped static trip ID, for example pid_gtfs:58_3600_260629"
+                }],
+                "responses": {"200": {"description": "Fresh stop-level and trip-summary updates"}}
             }},
             "/admin": {"get": {
                 "summary": "Cesta data administration interface",
@@ -255,10 +318,13 @@ pub(crate) async fn openapi() -> Json<Value> {
                 },
                 "StopSearchResult": {
                     "type": "object",
-                    "required": ["id", "name", "place_type", "modes"],
+                    "required": ["id", "name", "canonical_name", "aliases", "place_type", "modes"],
                     "properties": {
                         "id": {"type": "string"},
                         "name": {"type": "string"},
+                        "canonical_name": {"type": "string"},
+                        "aliases": {"type": "array", "items": {"type": "string"}},
+                        "parent_stop_area_id": {"type": ["string", "null"]},
                         "place_type": {"$ref": "#/components/schemas/PlaceType"},
                         "municipality": {"type": ["string", "null"]},
                         "region": {"type": ["string", "null"]},
@@ -293,11 +359,14 @@ pub(crate) async fn openapi() -> Json<Value> {
                 },
                 "Stop": {
                     "type": "object",
-                    "required": ["id", "source_ids", "name", "normalized_name", "location_type", "wheelchair_boarding", "modes", "coordinate_confidence", "is_active", "place_type", "marker_type", "map_visible"],
+                    "required": ["id", "source_ids", "name", "canonical_name", "aliases", "normalized_name", "location_type", "wheelchair_boarding", "modes", "coordinate_confidence", "is_active", "place_type", "marker_type", "map_visible"],
                     "properties": {
                         "id": {"type": "string"},
                         "source_ids": {"type": "array", "items": {"$ref": "#/components/schemas/StopSourceRef"}},
                         "name": {"type": "string"},
+                        "canonical_name": {"type": "string"},
+                        "aliases": {"type": "array", "items": {"type": "string"}},
+                        "parent_stop_area_id": {"type": ["string", "null"]},
                         "normalized_name": {"type": "string"},
                         "municipality": {"type": ["string", "null"]},
                         "district": {"type": ["string", "null"]},
@@ -399,18 +468,50 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "preserve_each_transfer_count": {"type": "boolean", "default": true},
                         "preserve_carrier_diversity": {"type": "boolean", "default": true},
                         "remove_dominated": {"type": "boolean", "default": true},
-                        "dominate_only_same_carrier": {"type": "boolean", "default": true}
+                        "dominate_only_same_carrier": {"type": "boolean", "default": false, "deprecated": true, "description": "Retained for configuration compatibility; objective Pareto dominance is always evaluated across carriers."}
                     }
                 },
                 "JourneyPoint": {
                     "type": "object",
-                    "required": ["type", "id"],
+                    "required": ["type"],
                     "properties": {
-                        "type": {"type": "string", "enum": ["stop", "city"]},
+                        "type": {"type": "string", "enum": ["stop", "city", "coordinate"]},
                         "id": {"type": "string"},
-                        "lat": {"type": ["number", "null"]},
-                        "lon": {"type": ["number", "null"]}
+                        "lat": {"type": ["number", "null"], "minimum": -90, "maximum": 90},
+                        "lon": {"type": ["number", "null"], "minimum": -180, "maximum": 180}
+                    },
+                    "oneOf": [
+                        {"title": "Stop point", "required": ["type", "id"], "properties": {"type": {"const": "stop"}}},
+                        {"title": "City point", "required": ["type", "id"], "properties": {"type": {"const": "city"}}},
+                        {"title": "Coordinate point", "required": ["type", "lat", "lon"], "properties": {"type": {"const": "coordinate"}}}
+                    ],
+                    "examples": [
+                        {"type": "stop", "id": "pid_gtfs:U480S1"},
+                        {"type": "city", "id": "city:CZ:554782"},
+                        {"type": "coordinate", "lat": 50.089458, "lon": 14.428683}
+                    ]
+                },
+                "GeoJsonLineString": {
+                    "type": "object",
+                    "required": ["type", "coordinates"],
+                    "properties": {
+                        "type": {"const": "LineString"},
+                        "coordinates": {"type": "array", "minItems": 2, "items": {"type": "array", "prefixItems": [{"type": "number", "minimum": -180, "maximum": 180}, {"type": "number", "minimum": -90, "maximum": 90}], "minItems": 2, "maxItems": 2}}
                     }
+                },
+                "GeoJsonMultiLineString": {
+                    "type": "object",
+                    "required": ["type", "coordinates"],
+                    "properties": {
+                        "type": {"const": "MultiLineString"},
+                        "coordinates": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 2, "items": {"type": "array", "prefixItems": [{"type": "number", "minimum": -180, "maximum": 180}, {"type": "number", "minimum": -90, "maximum": 90}], "minItems": 2, "maxItems": 2}}}
+                    }
+                },
+                "JourneyLegGeometry": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/GeoJsonLineString"},
+                        {"$ref": "#/components/schemas/GeoJsonMultiLineString"}
+                    ]
                 },
                 "JourneyLegRealtime": {
                     "type": "object",
@@ -425,6 +526,29 @@ pub(crate) async fn openapi() -> Json<Value> {
                         "source": {"type": "string"},
                         "fetched_at": {"type": "string", "format": "date-time"},
                         "valid_until": {"type": ["string", "null"], "format": "date-time"}
+                    }
+                },
+                "JourneyLeg": {
+                    "type": "object",
+                    "required": ["from_stop_id", "to_stop_id", "departure_time", "arrival_time", "mode", "warnings", "display_name", "geometry"],
+                    "properties": {
+                        "from_stop_id": {"type": "string"},
+                        "to_stop_id": {"type": "string"},
+                        "from_stop_name": {"type": ["string", "null"]},
+                        "to_stop_name": {"type": ["string", "null"]},
+                        "route_id": {"type": ["string", "null"]},
+                        "trip_id": {"type": ["string", "null"]},
+                        "line": {"type": ["string", "null"], "description": "Public short line name, with source prefixes removed only as a fallback."},
+                        "mode_name": {"type": ["string", "null"], "description": "Human-readable Czech transport type such as Tramvaj, Autobus or Vlak."},
+                        "route_name": {"type": ["string", "null"]},
+                        "destination": {"type": ["string", "null"], "description": "Public trip headsign, falling back to the destination stop name."},
+                        "display_name": {"type": "string", "description": "Ready-to-display connection label such as 'Autobus 991 směr Nádraží Hostivař'."},
+                        "departure_time": {"type": "integer", "minimum": 0, "description": "Scheduled service-day seconds."},
+                        "arrival_time": {"type": "integer", "minimum": 0, "description": "Scheduled service-day seconds."},
+                        "mode": {"type": "string"},
+                        "warnings": {"type": "array", "items": {"type": "string"}},
+                        "geometry": {"$ref": "#/components/schemas/JourneyLegGeometry", "description": "GTFS shape clipped in travel direction for transit, or verified pedestrian-router geometry for walking. Never a stop-to-stop fallback line."},
+                        "realtime": {"$ref": "#/components/schemas/JourneyLegRealtime"}
                     }
                 },
                 "JourneyStopCall": {

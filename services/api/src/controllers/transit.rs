@@ -13,17 +13,38 @@ pub(crate) async fn search_stops(
         } else {
             limit
         };
-        let (stops_result, cities) = if query.include_cities {
-            let (stops, cities) = tokio::join!(
-                search_stops_db(pool, &q, &normalized, stop_limit),
-                search_cities_db(pool, &q, &normalized, limit)
-            );
-            (stops, cities.unwrap_or_default())
-        } else {
-            (
-                search_stops_db(pool, &q, &normalized, stop_limit).await,
-                Vec::new(),
-            )
+        let database_search = time::timeout(
+            std::time::Duration::from_secs(STOP_SEARCH_TIMEOUT_SECONDS),
+            async {
+                if query.include_cities {
+                    let (stops, cities) = tokio::join!(
+                        search_stops_db(pool, &q, &normalized, stop_limit),
+                        search_cities_db(pool, &q, &normalized, limit)
+                    );
+                    (stops, cities.unwrap_or_default())
+                } else {
+                    (
+                        search_stops_db(pool, &q, &normalized, stop_limit).await,
+                        Vec::new(),
+                    )
+                }
+            },
+        )
+        .await;
+        let (stops_result, cities) = match database_search {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = STOP_SEARCH_TIMEOUT_SECONDS,
+                    "database stop search timed out"
+                );
+                return stop_search_failure_response(
+                    query.include_cities,
+                    format!(
+                        "database stop search timed out after {STOP_SEARCH_TIMEOUT_SECONDS} seconds"
+                    ),
+                );
+            }
         };
         return match stops_result {
             Ok(stops) => {
@@ -62,24 +83,10 @@ pub(crate) async fn search_stops(
                     Json(response)
                 }
             }
-            Err(error) => {
-                let data_status = json!({
-                    "source": "database",
-                    "schedule": "unknown",
-                    "realtime": "unavailable",
-                    "warnings": [format!("database stop search failed: {error}")]
-                });
-                if query.include_cities {
-                    Json(json!({
-                        "results": [],
-                        "cities": [],
-                        "stops": [],
-                        "data_status": data_status
-                    }))
-                } else {
-                    Json(json!({"stops": [], "data_status": data_status}))
-                }
-            }
+            Err(error) => stop_search_failure_response(
+                query.include_cities,
+                format!("database stop search failed: {error}"),
+            ),
         };
     }
 
@@ -99,6 +106,25 @@ pub(crate) async fn search_stops(
             "stops": stops.iter().map(stop_search_json).collect::<Vec<_>>(),
             "data_status": mock_status(state.use_mock_data)
         }))
+    }
+}
+
+fn stop_search_failure_response(include_cities: bool, warning: String) -> Json<Value> {
+    let data_status = json!({
+        "source": "database",
+        "schedule": "unknown",
+        "realtime": "unavailable",
+        "warnings": [warning]
+    });
+    if include_cities {
+        Json(json!({
+            "results": [],
+            "cities": [],
+            "stops": [],
+            "data_status": data_status
+        }))
+    } else {
+        Json(json!({"stops": [], "data_status": data_status}))
     }
 }
 
@@ -153,6 +179,10 @@ pub(crate) fn ranked_stop_suggestions<'a>(
     normalized_query: &str,
     limit: usize,
 ) -> Vec<Stop> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
     let mut scored_stops = stops
         .enumerate()
         .filter_map(|(index, stop)| {
@@ -177,17 +207,16 @@ pub(crate) fn ranked_stop_suggestions<'a>(
         .filter(|(score, _, _)| score_floor.is_none_or(|floor| *score >= floor))
         .map(|(_, _, stop)| stop)
     {
-        if suggestions
-            .iter()
-            .any(|existing| stops_are_same_suggestion(existing, &stop))
+        if let Some(existing) = suggestions
+            .iter_mut()
+            .find(|existing| stops_are_same_suggestion(existing, &stop))
         {
-            continue;
-        }
-        suggestions.push(stop);
-        if suggestions.len() == limit {
-            break;
+            merge_stop_suggestion(existing, &stop);
+        } else {
+            suggestions.push(stop);
         }
     }
+    suggestions.truncate(limit);
     suggestions
 }
 
@@ -580,6 +609,8 @@ pub(crate) async fn journey_search(
             pool,
             &state.raptor_cache,
             &state.endpoint_access_cache,
+            &state.pedestrian_router,
+            &state.routing_realtime_cache,
             &state.config.routing_snapshot_dir,
             &state.route_search_diagnostics,
             &body,
@@ -791,16 +822,163 @@ pub(crate) fn seconds_since_midnight(time: NaiveTime) -> u32 {
     time.num_seconds_from_midnight()
 }
 
-pub(crate) async fn realtime_trip(Path(trip_id): Path<String>) -> Json<Value> {
-    Json(
-        json!({"trip_id": trip_id, "updates": [], "realtime_status": "unavailable", "mock": false}),
+pub(crate) async fn realtime_trip(
+    State(state): State<AppState>,
+    Path(trip_id): Path<String>,
+) -> Json<Value> {
+    let Some(pool) = &state.db else {
+        return Json(json!({
+            "trip_id": trip_id,
+            "updates": [],
+            "realtime_status": "unavailable",
+            "mock": state.use_mock_data
+        }));
+    };
+
+    let query = sqlx::query(
+        r#"
+        SELECT realtime.source, realtime.source_feed_id, realtime.source_entity_id,
+               realtime.trip_id, realtime.route_id, realtime.stop_id,
+               realtime.delay_seconds, realtime.estimated_arrival,
+               realtime.estimated_departure, realtime.cancellation_status,
+               realtime.vehicle_id, realtime.fetched_at, realtime.valid_until,
+               realtime.confidence
+        FROM realtime_updates realtime
+        JOIN source_feeds feed
+          ON feed.id = realtime.source_feed_id
+         AND feed.enabled = true
+        WHERE realtime.trip_id = $1
+          AND (realtime.valid_until IS NULL OR realtime.valid_until >= now())
+        ORDER BY
+          (realtime.raw_payload->>'stop_sequence')::integer ASC NULLS LAST,
+          realtime.fetched_at DESC
+        LIMIT 500
+        "#,
     )
+    .bind(&trip_id)
+    .fetch_all(pool)
+    .await;
+
+    match query {
+        Ok(rows) => {
+            let updates = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "source": row.get::<String, _>("source"),
+                        "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
+                        "source_entity_id": row.get::<Option<String>, _>("source_entity_id"),
+                        "trip_id": row.get::<Option<String>, _>("trip_id"),
+                        "route_id": row.get::<Option<String>, _>("route_id"),
+                        "stop_id": row.get::<Option<String>, _>("stop_id"),
+                        "delay_seconds": row.get::<Option<i32>, _>("delay_seconds"),
+                        "estimated_arrival": row.get::<Option<DateTime<Utc>>, _>("estimated_arrival"),
+                        "estimated_departure": row.get::<Option<DateTime<Utc>>, _>("estimated_departure"),
+                        "cancellation_status": row.get::<Option<String>, _>("cancellation_status"),
+                        "vehicle_id": row.get::<Option<String>, _>("vehicle_id"),
+                        "fetched_at": row.get::<DateTime<Utc>, _>("fetched_at"),
+                        "valid_until": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
+                        "confidence": row.get::<String, _>("confidence")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let realtime_status = if updates.is_empty() {
+                "unavailable"
+            } else {
+                "realtime"
+            };
+            Json(json!({
+                "trip_id": trip_id,
+                "updates": updates,
+                "realtime_status": realtime_status,
+                "mock": false
+            }))
+        }
+        Err(error) => Json(json!({
+            "trip_id": trip_id,
+            "updates": [],
+            "realtime_status": "unavailable",
+            "mock": false,
+            "warnings": [format!("database realtime trip query failed: {error}")]
+        })),
+    }
 }
 
-pub(crate) async fn realtime_status() -> Json<Value> {
-    Json(
-        json!({"status":"unavailable","sources":[],"mock_worker_available":true,"warning":"real realtime feeds are not connected yet"}),
+pub(crate) async fn realtime_status(State(state): State<AppState>) -> Json<Value> {
+    let Some(pool) = &state.db else {
+        return Json(json!({
+            "status": "unavailable",
+            "sources": [],
+            "mock": state.use_mock_data,
+            "warnings": ["database is unavailable"]
+        }));
+    };
+
+    let query = sqlx::query(
+        r#"
+        SELECT sync.source_id, sync.source_url, sync.status AS sync_status,
+               sync.last_attempt_at, sync.last_success_at, sync.source_timestamp,
+               sync.records_received, sync.records_written, sync.error_message
+        FROM data_source_syncs sync
+        JOIN source_feeds feed
+          ON feed.id = CASE sync.source_id
+            WHEN 'pid_gtfs_rt' THEN 'pid_realtime'
+            WHEN 'pid_trip_summaries' THEN 'pid_realtime'
+            WHEN 'pid_vehicle_positions' THEN 'pid_realtime'
+            WHEN 'ids_jmk_positions' THEN 'ids_jmk_realtime'
+            WHEN 'duk_positions' THEN 'duk_realtime'
+            ELSE sync.source_id
+          END
+         AND feed.enabled = true
+        WHERE sync.data_kind IN ('gtfs_realtime', 'json_realtime')
+        ORDER BY sync.source_id
+        "#,
     )
+    .fetch_all(pool)
+    .await;
+
+    match query {
+        Ok(rows) => {
+            let mut any_fresh = false;
+            let mut any_known = false;
+            let mut any_syncing = false;
+            let sources = rows
+                .into_iter()
+                .map(|row| {
+                    any_known = true;
+                    let source_timestamp = row.get::<Option<DateTime<Utc>>, _>("source_timestamp");
+                    let sync_status = row.get::<String, _>("sync_status");
+                    let current = source_timestamp
+                        .is_some_and(|timestamp| timestamp > Utc::now() - Duration::minutes(5));
+                    any_fresh |= current;
+                    any_syncing |= sync_status == "syncing";
+                    json!({
+                        "source_id": row.get::<String, _>("source_id"),
+                        "source_url": row.get::<String, _>("source_url"),
+                        "status": if sync_status == "syncing" { "syncing" } else if current { "current" } else { "stale" },
+                        "sync_status": sync_status,
+                        "last_attempt_at": row.get::<DateTime<Utc>, _>("last_attempt_at"),
+                        "last_success_at": row.get::<Option<DateTime<Utc>>, _>("last_success_at"),
+                        "source_timestamp": source_timestamp,
+                        "records_received": row.get::<i32, _>("records_received"),
+                        "records_written": row.get::<i32, _>("records_written"),
+                        "error_message": row.get::<Option<String>, _>("error_message")
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({
+                "status": if any_fresh { "current" } else if any_syncing { "syncing" } else if any_known { "stale" } else { "unavailable" },
+                "sources": sources,
+                "mock": false
+            }))
+        }
+        Err(error) => Json(json!({
+            "status": "unavailable",
+            "sources": [],
+            "mock": false,
+            "warnings": [format!("database realtime status query failed: {error}")]
+        })),
+    }
 }
 
 pub(crate) async fn offline_packages() -> Json<Value> {

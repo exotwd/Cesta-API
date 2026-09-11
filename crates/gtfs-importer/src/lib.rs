@@ -28,8 +28,10 @@ pub struct GtfsDataset {
     pub routes: Vec<Route>,
     pub trips: Vec<GtfsTrip>,
     pub stop_times: Vec<StopTime>,
+    pub shapes: Vec<GtfsShapePoint>,
     pub calendars: Vec<Calendar>,
     pub calendar_dates: Vec<CalendarDate>,
+    pub transfers: Vec<GtfsTransfer>,
     pub validation_issues: Vec<ValidationIssue>,
 }
 
@@ -39,6 +41,28 @@ pub struct GtfsTrip {
     pub service_id: String,
     pub trip_id: String,
     pub trip_headsign: Option<String>,
+    pub direction_id: Option<i16>,
+    pub shape_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GtfsShapePoint {
+    pub shape_id: String,
+    pub sequence: u32,
+    pub lat: f64,
+    pub lon: f64,
+    pub distance_traveled: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GtfsTransfer {
+    pub from_stop_id: String,
+    pub to_stop_id: String,
+    pub transfer_type: i16,
+    pub min_transfer_time: Option<u32>,
+    pub from_trip_id: Option<String>,
+    pub to_trip_id: Option<String>,
+    pub max_waiting_time: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,11 +152,18 @@ fn parse_archive<R: Read + Seek>(
         dataset.stop_times =
             parse_stop_times(archive, options.limit_rows, &mut dataset.validation_issues)?;
     }
+    if names.iter().any(|name| name == "shapes.txt") {
+        dataset.shapes = parse_shapes(archive, options.limit_rows, &mut dataset.validation_issues)?;
+    }
     if names.iter().any(|name| name == "calendar.txt") {
         dataset.calendars = parse_calendars(archive, options.limit_rows)?;
     }
     if names.iter().any(|name| name == "calendar_dates.txt") {
         dataset.calendar_dates = parse_calendar_dates(archive, options.limit_rows)?;
+    }
+    if names.iter().any(|name| name == "transfers.txt") {
+        dataset.transfers =
+            parse_transfers(archive, options.limit_rows, &mut dataset.validation_issues)?;
     }
     if dataset.calendars.is_empty() && dataset.calendar_dates.is_empty() {
         dataset.validation_issues.push(ValidationIssue {
@@ -340,6 +371,8 @@ struct TripRow {
     service_id: String,
     trip_id: String,
     trip_headsign: Option<String>,
+    direction_id: Option<i16>,
+    shape_id: Option<String>,
 }
 
 fn parse_trips<R: Read + Seek>(
@@ -357,9 +390,69 @@ fn parse_trips<R: Read + Seek>(
                 service_id: row.service_id,
                 trip_id: row.trip_id,
                 trip_headsign: row.trip_headsign,
+                direction_id: row.direction_id,
+                shape_id: row.shape_id.filter(|value| !value.trim().is_empty()),
             })
         })
         .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct ShapeRow {
+    shape_id: String,
+    shape_pt_lat: f64,
+    shape_pt_lon: f64,
+    shape_pt_sequence: u32,
+    shape_dist_traveled: Option<f64>,
+}
+
+fn parse_shapes<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Vec<GtfsShapePoint>> {
+    let file = archive.by_name("shapes.txt")?;
+    let mut shapes = Vec::new();
+    for row in csv_reader(file)
+        .deserialize::<ShapeRow>()
+        .take(limit.unwrap_or(usize::MAX))
+    {
+        match row {
+            Ok(row)
+                if (-90.0..=90.0).contains(&row.shape_pt_lat)
+                    && (-180.0..=180.0).contains(&row.shape_pt_lon) =>
+            {
+                shapes.push(GtfsShapePoint {
+                    shape_id: row.shape_id,
+                    sequence: row.shape_pt_sequence,
+                    lat: row.shape_pt_lat,
+                    lon: row.shape_pt_lon,
+                    distance_traveled: row.shape_dist_traveled,
+                });
+            }
+            Ok(row) => issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                code: "invalid_shape_coordinate".to_string(),
+                message: "Shape point has coordinates outside WGS84 bounds".to_string(),
+                source_file: Some("shapes.txt".to_string()),
+                affected_entity: Some(row.shape_id),
+                raw_payload: Some(serde_json::json!({
+                    "sequence": row.shape_pt_sequence,
+                    "lat": row.shape_pt_lat,
+                    "lon": row.shape_pt_lon
+                })),
+            }),
+            Err(error) => issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                code: "malformed_shape".to_string(),
+                message: error.to_string(),
+                source_file: Some("shapes.txt".to_string()),
+                affected_entity: None,
+                raw_payload: None,
+            }),
+        }
+    }
+    Ok(shapes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -554,6 +647,71 @@ fn parse_calendar_dates<R: Read + Seek>(
         .collect()
 }
 
+#[derive(Debug, Deserialize)]
+struct TransferRow {
+    from_stop_id: String,
+    to_stop_id: String,
+    transfer_type: Option<i16>,
+    min_transfer_time: Option<u32>,
+    from_trip_id: Option<String>,
+    to_trip_id: Option<String>,
+    max_waiting_time: Option<u32>,
+}
+
+fn parse_transfers<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: Option<usize>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<Vec<GtfsTransfer>> {
+    let file = archive.by_name("transfers.txt")?;
+    let mut transfers = Vec::new();
+    for row in csv_reader(file)
+        .deserialize::<TransferRow>()
+        .take(limit.unwrap_or(usize::MAX))
+    {
+        match row {
+            Ok(row) => {
+                let transfer_type = row.transfer_type.unwrap_or(0);
+                if !(0..=5).contains(&transfer_type) {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        code: "invalid_transfer_type".to_string(),
+                        message: format!(
+                            "Unsupported GTFS transfer_type {transfer_type}; transfer ignored"
+                        ),
+                        source_file: Some("transfers.txt".to_string()),
+                        affected_entity: Some(format!("{}:{}", row.from_stop_id, row.to_stop_id)),
+                        raw_payload: Some(serde_json::json!({"transfer_type": transfer_type})),
+                    });
+                    continue;
+                }
+                transfers.push(GtfsTransfer {
+                    from_stop_id: row.from_stop_id,
+                    to_stop_id: row.to_stop_id,
+                    transfer_type,
+                    min_transfer_time: row.min_transfer_time,
+                    from_trip_id: non_empty(row.from_trip_id),
+                    to_trip_id: non_empty(row.to_trip_id),
+                    max_waiting_time: row.max_waiting_time,
+                });
+            }
+            Err(error) => issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                code: "malformed_transfer_row".to_string(),
+                message: error.to_string(),
+                source_file: Some("transfers.txt".to_string()),
+                affected_entity: None,
+                raw_payload: None,
+            }),
+        }
+    }
+    Ok(transfers)
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 fn parse_gtfs_date(value: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y%m%d")
         .with_context(|| format!("invalid GTFS date {value}"))
@@ -581,14 +739,19 @@ mod tests {
             zip.start_file("routes.txt", options).unwrap();
             zip.write_all(b"route_id,agency_id,route_short_name,route_long_name,route_type\nr1,pid,R9,Praha - Brno,2\n").unwrap();
             zip.start_file("trips.txt", options).unwrap();
-            zip.write_all(b"route_id,service_id,trip_id,trip_headsign\nr1,wd,t1,Brno\n")
+            zip.write_all(b"route_id,service_id,trip_id,trip_headsign,direction_id,shape_id\nr1,wd,t1,Brno,1,shape-1\n")
                 .unwrap();
             zip.start_file("stop_times.txt", options).unwrap();
             zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,10:35:00,10:35:00,s2,2\n").unwrap();
+            zip.start_file("shapes.txt", options).unwrap();
+            zip.write_all(b"shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled\nshape-1,50.083,14.435,1,0\nshape-1,49.191,16.612,2,210000\n").unwrap();
             zip.start_file("calendar.txt", options).unwrap();
             zip.write_all(b"service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\nwd,1,1,1,1,1,0,0,20260701,20260731\n").unwrap();
             zip.start_file("calendar_dates.txt", options).unwrap();
             zip.write_all(b"service_id,date,exception_type\nwd,20260706,2\n")
+                .unwrap();
+            zip.start_file("transfers.txt", options).unwrap();
+            zip.write_all(b"from_stop_id,to_stop_id,transfer_type,min_transfer_time,from_trip_id,to_trip_id,max_waiting_time\ns1,s2,2,180,,,\ns2,s2,1,,t1,t1,300\n")
                 .unwrap();
             zip.finish().unwrap();
         }
@@ -614,10 +777,19 @@ mod tests {
         );
         assert_eq!(dataset.stops[1].parent_station_id.as_deref(), Some("s1"));
         assert_eq!(dataset.stop_times.len(), 2);
+        assert_eq!(dataset.trips[0].direction_id, Some(1));
+        assert_eq!(dataset.trips[0].shape_id.as_deref(), Some("shape-1"));
+        assert_eq!(dataset.shapes.len(), 2);
+        assert_eq!(dataset.shapes[1].sequence, 2);
         assert_eq!(dataset.calendars.len(), 1);
         assert!(dataset.calendars[0].monday);
         assert_eq!(dataset.calendar_dates.len(), 1);
         assert_eq!(dataset.calendar_dates[0].exception_type, 2);
+        assert_eq!(dataset.transfers.len(), 2);
+        assert_eq!(dataset.transfers[0].transfer_type, 2);
+        assert_eq!(dataset.transfers[0].min_transfer_time, Some(180));
+        assert_eq!(dataset.transfers[1].from_trip_id.as_deref(), Some("t1"));
+        assert_eq!(dataset.transfers[1].max_waiting_time, Some(300));
     }
 
     #[test]

@@ -8,6 +8,10 @@ use crate::config::DatabasePoolConfig;
 const PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION: &str =
     include_str!("../../../../infra/postgres/migrations/0021_pid_public_query_performance.sql");
 
+#[cfg(test)]
+const PID_REALTIME_VEHICLE_INDEX_MIGRATION: &str =
+    include_str!("../../../../infra/postgres/migrations/0028_pid_realtime_vehicle_index.sql");
+
 pub(crate) async fn connect_with_retry(
     database_url: &str,
     pool_config: &DatabasePoolConfig,
@@ -56,6 +60,29 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // The production schema is strictly ordered. Avoid re-running legacy artifact probes and
+    // acquiring one advisory lock per historical migration on every API restart once the latest
+    // migration is recorded. This keeps service availability independent of catalog latency while
+    // the realtime worker is writing heavily.
+    let schema_is_current: bool = sqlx::query_scalar(
+        r#"
+        SELECT
+          EXISTS(
+            SELECT 1 FROM cesta_schema_migrations
+            WHERE version = '0021_pid_public_query_performance'
+          )
+          AND EXISTS(
+            SELECT 1 FROM cesta_schema_migrations
+            WHERE version = '0027_routing_geometries_and_walking_cache'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if schema_is_current {
+        return Ok(());
+    }
 
     // Existing installations predate migration tracking. Terminal schema artifacts prove that
     // these idempotent migrations already completed and prevent their full-table work repeating.
@@ -139,6 +166,20 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
     apply_startup_migration(
         pool,
+        "0012_stop_search_indexes",
+        include_str!("../../../../infra/postgres/migrations/0012_stop_search_indexes.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0013_stop_suggester_fast_path_indexes",
+        include_str!(
+            "../../../../infra/postgres/migrations/0013_stop_suggester_fast_path_indexes.sql"
+        ),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
         "0014_routing_range_and_endpoint_cache",
         include_str!(
             "../../../../infra/postgres/migrations/0014_routing_range_and_endpoint_cache.sql"
@@ -187,6 +228,50 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         pool,
         "0021_pid_public_query_performance",
         PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION,
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0021_pid_gtfs_transfers",
+        include_str!("../../../../infra/postgres/migrations/0021_pid_gtfs_transfers.sql"),
+    )
+    .await?;
+    apply_nontransactional_startup_migration(
+        pool,
+        "0022_realtime_routing_index",
+        include_str!("../../../../infra/postgres/migrations/0022_realtime_routing_index.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0023_reactivate_referenced_stops",
+        include_str!("../../../../infra/postgres/migrations/0023_reactivate_referenced_stops.sql"),
+    )
+    .await?;
+    apply_nontransactional_startup_migration(
+        pool,
+        "0024_journey_stop_expansion_index",
+        include_str!("../../../../infra/postgres/migrations/0024_journey_stop_expansion_index.sql"),
+    )
+    .await?;
+    apply_nontransactional_startup_migration(
+        pool,
+        "0025_realtime_trip_summary_index",
+        include_str!("../../../../infra/postgres/migrations/0025_realtime_trip_summary_index.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0026_realtime_expiry_index",
+        include_str!("../../../../infra/postgres/migrations/0026_realtime_expiry_index.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0027_routing_geometries_and_walking_cache",
+        include_str!(
+            "../../../../infra/postgres/migrations/0027_routing_geometries_and_walking_cache.sql"
+        ),
     )
     .await
 }
@@ -263,7 +348,7 @@ async fn apply_nontransactional_startup_migration(
 
 #[cfg(test)]
 mod tests {
-    use super::PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION;
+    use super::{PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION, PID_REALTIME_VEHICLE_INDEX_MIGRATION};
 
     #[test]
     fn pid_public_stop_projection_excludes_indirect_source_mappings() {
@@ -285,10 +370,11 @@ mod tests {
 
     #[test]
     fn pid_vehicle_map_has_a_latest_position_index() {
-        let migration = PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION.to_ascii_lowercase();
+        let migration = PID_REALTIME_VEHICLE_INDEX_MIGRATION.to_ascii_lowercase();
 
         assert!(migration.contains("realtime_updates_pid_vehicle_latest_idx"));
         assert!(migration.contains("(source_feed_id, vehicle_id, fetched_at desc)"));
         assert!(migration.contains("where source_feed_id = 'pid_realtime'"));
+        assert!(migration.contains("create index concurrently"));
     }
 }

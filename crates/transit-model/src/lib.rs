@@ -225,6 +225,8 @@ pub struct JourneyLeg {
     pub arrival_time: u32,
     pub mode: TransportMode,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub geometry: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

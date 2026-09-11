@@ -14,6 +14,11 @@ pub(crate) struct AppConfig {
     pub(crate) request_body_limit_bytes: usize,
     pub(crate) routing_snapshot_dir: PathBuf,
     pub(crate) routing_snapshot_files_to_keep: usize,
+    pub(crate) pedestrian_router_engine: String,
+    pub(crate) pedestrian_router_url: String,
+    pub(crate) pedestrian_router_revision: String,
+    pub(crate) pedestrian_router_timeout: Duration,
+    pub(crate) pedestrian_router_concurrency: usize,
     pub(crate) use_mock_data: bool,
     pub(crate) production: bool,
 }
@@ -100,9 +105,33 @@ impl AppConfig {
                 2_usize,
             )?
             .max(2),
+            pedestrian_router_engine: parse_pedestrian_router_engine()?,
+            pedestrian_router_url: env::var("PEDESTRIAN_ROUTER_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8002/route".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            pedestrian_router_revision: env::var("PEDESTRIAN_ROUTER_REVISION")
+                .unwrap_or_else(|_| "valhalla-cz-20260907-v1".to_string()),
+            pedestrian_router_timeout: Duration::from_secs(parse_number(
+                "PEDESTRIAN_ROUTER_TIMEOUT_SECONDS",
+                8_u64,
+            )?),
+            pedestrian_router_concurrency: parse_number("PEDESTRIAN_ROUTER_CONCURRENCY", 8_usize)?
+                .clamp(1, 64),
             use_mock_data,
             production,
         })
+    }
+}
+
+fn parse_pedestrian_router_engine() -> anyhow::Result<String> {
+    let engine = env::var("PEDESTRIAN_ROUTER_ENGINE")
+        .unwrap_or_else(|_| "valhalla".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match engine.as_str() {
+        "valhalla" | "osrm" => Ok(engine),
+        _ => bail!("PEDESTRIAN_ROUTER_ENGINE must be 'valhalla' or 'osrm'"),
     }
 }
 
@@ -149,6 +178,11 @@ mod tests {
             request_body_limit_bytes: 1024 * 1024,
             routing_snapshot_dir: PathBuf::from("storage").join("processed").join("routing"),
             routing_snapshot_files_to_keep: 2,
+            pedestrian_router_engine: "valhalla".to_string(),
+            pedestrian_router_url: "http://127.0.0.1:8002/route".to_string(),
+            pedestrian_router_revision: "valhalla-cz-20260907-v1".to_string(),
+            pedestrian_router_timeout: Duration::from_secs(8),
+            pedestrian_router_concurrency: 8,
             use_mock_data: true,
             production: false,
         };

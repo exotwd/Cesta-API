@@ -15,7 +15,7 @@ use reqwest::{
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use tokio::{fs, io::AsyncWriteExt};
 use transit_model::{AccessibilityStatus, StopLocationType, TransportMode, normalize_czech_name};
 use uuid::Uuid;
@@ -33,6 +33,7 @@ const GGU_FILES: &[(&str, &str, i32)] = &[
 
 const TRIP_BATCH_SIZE: usize = 10_000;
 const STOP_TIME_BATCH_SIZE: usize = 10_000;
+const SHAPE_BATCH_SIZE: usize = 10_000;
 const DEFAULT_CZ_CITIES_URL: &str =
     "https://raw.githubusercontent.com/33bcdd/souradnice-mest/master/souradnice.csv";
 const DEFAULT_PID_GTFS_URL: &str = "https://data.pid.cz/PID_GTFS.zip";
@@ -78,6 +79,8 @@ struct TripBatch {
     route_ids: Vec<String>,
     service_ids: Vec<String>,
     headsigns: Vec<Option<String>>,
+    direction_ids: Vec<Option<i16>>,
+    shape_ids: Vec<Option<String>>,
     source_priorities: Vec<i32>,
 }
 
@@ -91,6 +94,8 @@ impl TripBatch {
             route_ids: Vec::with_capacity(capacity),
             service_ids: Vec::with_capacity(capacity),
             headsigns: Vec::with_capacity(capacity),
+            direction_ids: Vec::with_capacity(capacity),
+            shape_ids: Vec::with_capacity(capacity),
             source_priorities: Vec::with_capacity(capacity),
         }
     }
@@ -111,7 +116,52 @@ impl TripBatch {
         self.route_ids.clear();
         self.service_ids.clear();
         self.headsigns.clear();
+        self.direction_ids.clear();
+        self.shape_ids.clear();
         self.source_priorities.clear();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShapeBatch {
+    shape_ids: Vec<String>,
+    sequences: Vec<i32>,
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    distances: Vec<Option<f64>>,
+    import_run_ids: Vec<Uuid>,
+    source_feed_ids: Vec<String>,
+}
+
+impl ShapeBatch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            shape_ids: Vec::with_capacity(capacity),
+            sequences: Vec::with_capacity(capacity),
+            lats: Vec::with_capacity(capacity),
+            lons: Vec::with_capacity(capacity),
+            distances: Vec::with_capacity(capacity),
+            import_run_ids: Vec::with_capacity(capacity),
+            source_feed_ids: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.shape_ids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.shape_ids.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.shape_ids.clear();
+        self.sequences.clear();
+        self.lats.clear();
+        self.lons.clear();
+        self.distances.clear();
+        self.import_run_ids.clear();
+        self.source_feed_ids.clear();
     }
 }
 
@@ -610,26 +660,31 @@ async fn sync_pid(
                 serde_json::json!({}),
             ),
         };
-        let counts = sqlx::query(
-            r#"
-                SELECT
-                  (SELECT COUNT(*) FROM routes WHERE source_feed_id = $1) AS routes,
-                  (SELECT COUNT(*) FROM trips WHERE source_feed_id = $1) AS trips,
-                  (SELECT COUNT(*) FROM stop_times WHERE source_feed_id = $1) AS stop_times
-                "#,
-        )
-        .bind(PID_FEED_ID)
-        .fetch_one(&pool)
-        .await
-        .ok();
-        let records = counts
-            .as_ref()
+        // Failed syncs can retry frequently. Do not amplify an upstream or housekeeping
+        // failure with full-table counts on every retry, especially while PostgreSQL is
+        // already under I/O pressure.
+        let records = if result.is_ok() {
+            sqlx::query(
+                r#"
+                    SELECT
+                      (SELECT COUNT(*) FROM routes WHERE source_feed_id = $1) AS routes,
+                      (SELECT COUNT(*) FROM trips WHERE source_feed_id = $1) AS trips,
+                      (SELECT COUNT(*) FROM stop_times WHERE source_feed_id = $1) AS stop_times
+                    "#,
+            )
+            .bind(PID_FEED_ID)
+            .fetch_one(&pool)
+            .await
+            .ok()
             .map(|row| {
                 row.get::<i64, _>("routes")
                     + row.get::<i64, _>("trips")
                     + row.get::<i64, _>("stop_times")
             })
-            .unwrap_or(0) as usize;
+            .unwrap_or(0) as usize
+        } else {
+            0
+        };
         record_data_sync(
             &pool,
             PID_FEED_ID,
@@ -663,7 +718,7 @@ async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
         && can_reuse_file(run, FILE_NAME, remote.as_ref())
     {
         tracing::info!(path = %run.path.display(), "PID GTFS has not changed");
-        prune_raw_run_directories(storage_dir, "pid", &run.path).await?;
+        prune_raw_run_directories_best_effort(storage_dir, "pid", &run.path).await;
         return Ok(run.path.clone());
     }
 
@@ -711,7 +766,7 @@ async fn download_pid_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
         serde_json::to_vec_pretty(&manifest)?,
     )
     .await?;
-    prune_raw_run_directories(storage_dir, "pid", &run_dir).await?;
+    prune_raw_run_directories_best_effort(storage_dir, "pid", &run_dir).await;
     Ok(run_dir)
 }
 
@@ -811,8 +866,10 @@ async fn import_pid_gtfs(
         "routes": dataset.routes.len(),
         "trips": dataset.trips.len(),
         "stop_times": dataset.stop_times.len(),
+        "shape_points": dataset.shapes.len(),
         "calendars": dataset.calendars.len(),
         "calendar_dates": dataset.calendar_dates.len(),
+        "transfers": dataset.transfers.len(),
         "validation_issues": dataset.validation_issues,
         "database": database
     });
@@ -1039,7 +1096,7 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
         let run = reusable_run.expect("checked above");
         write_reuse_checked_manifest(&run, base_url, &remote_metadata, &timestamp).await?;
         eprintln!("GGU latest has not changed; reusing {}", run.path.display());
-        prune_raw_run_directories(storage_dir, "ggu", &run.path).await?;
+        prune_raw_run_directories_best_effort(storage_dir, "ggu", &run.path).await;
         return Ok(run.path);
     }
 
@@ -1163,7 +1220,7 @@ async fn download_ggu_latest(storage_dir: &Path, base_url: &str) -> Result<PathB
             missing_files.join(", ")
         );
     }
-    prune_raw_run_directories(storage_dir, "ggu", &run_dir).await?;
+    prune_raw_run_directories_best_effort(storage_dir, "ggu", &run_dir).await;
     Ok(run_dir)
 }
 
@@ -1328,6 +1385,25 @@ async fn prune_raw_run_directories(
 ) -> Result<()> {
     prune_raw_run_directories_with_limit(storage_dir, source, protected_run, raw_runs_to_keep())
         .await
+}
+
+async fn prune_raw_run_directories_best_effort(
+    storage_dir: &Path,
+    source: &str,
+    protected_run: &Path,
+) -> bool {
+    match prune_raw_run_directories(storage_dir, source, protected_run).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                source,
+                path = %protected_run.display(),
+                %error,
+                "raw import retention cleanup failed; continuing schedule synchronization"
+            );
+            false
+        }
+    }
 }
 
 async fn prune_raw_run_directories_with_limit(
@@ -1557,9 +1633,10 @@ async fn import_ggu_latest(
             "agencies": dataset.agencies.len(),
             "stops": dataset.stops.len(),
             "routes": dataset.routes.len(),
-            "trips": dataset.trips.len(),
-            "stop_times": dataset.stop_times.len(),
-            "calendars": dataset.calendars.len(),
+        "trips": dataset.trips.len(),
+        "stop_times": dataset.stop_times.len(),
+        "shape_points": dataset.shapes.len(),
+        "calendars": dataset.calendars.len(),
             "calendar_dates": dataset.calendar_dates.len(),
             "validation_issues": dataset.validation_issues,
             "database": db_summary
@@ -1585,41 +1662,163 @@ async fn connect_import_database(database_url: &str) -> Result<PgPool> {
 }
 
 async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0005_cities.sql"
-    ))
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cesta_schema_migrations (
+          version text PRIMARY KEY,
+          applied_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
     .execute(pool)
     .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0006_public_transport_feeds.sql"
-    ))
-    .execute(pool)
+
+    let mut connection = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('cesta-api-startup-migrations'))")
+        .execute(&mut *connection)
+        .await?;
+    let migration_result = async {
+        apply_feed_migration(
+            &mut connection,
+            "0005_cities",
+            include_str!("../../../infra/postgres/migrations/0005_cities.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0006_public_transport_feeds",
+            include_str!("../../../infra/postgres/migrations/0006_public_transport_feeds.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0012_stop_search_indexes",
+            include_str!("../../../infra/postgres/migrations/0012_stop_search_indexes.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0013_stop_suggester_fast_path_indexes",
+            include_str!(
+                "../../../infra/postgres/migrations/0013_stop_suggester_fast_path_indexes.sql"
+            ),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0015_vehicle_map_contract",
+            include_str!("../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0016_data_repairs",
+            include_str!("../../../infra/postgres/migrations/0016_data_repairs.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0017_stop_deduplication",
+            include_str!("../../../infra/postgres/migrations/0017_stop_deduplication.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0018_automatic_directional_stop_merges",
+            include_str!(
+                "../../../infra/postgres/migrations/0018_automatic_directional_stop_merges.sql"
+            ),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0019_storage_optimization",
+            include_str!("../../../infra/postgres/migrations/0019_storage_optimization.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0021_pid_gtfs_transfers",
+            include_str!("../../../infra/postgres/migrations/0021_pid_gtfs_transfers.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0022_realtime_routing_index",
+            include_str!("../../../infra/postgres/migrations/0022_realtime_routing_index.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0023_reactivate_referenced_stops",
+            include_str!("../../../infra/postgres/migrations/0023_reactivate_referenced_stops.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0024_journey_stop_expansion_index",
+            include_str!(
+                "../../../infra/postgres/migrations/0024_journey_stop_expansion_index.sql"
+            ),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0025_realtime_trip_summary_index",
+            include_str!("../../../infra/postgres/migrations/0025_realtime_trip_summary_index.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0026_realtime_expiry_index",
+            include_str!("../../../infra/postgres/migrations/0026_realtime_expiry_index.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0027_routing_geometries_and_walking_cache",
+            include_str!(
+                "../../../infra/postgres/migrations/0027_routing_geometries_and_walking_cache.sql"
+            ),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0028_pid_realtime_vehicle_index",
+            include_str!("../../../infra/postgres/migrations/0028_pid_realtime_vehicle_index.sql"),
+        )
+        .await
+    }
+    .await;
+    let unlock_result =
+        sqlx::query("SELECT pg_advisory_unlock(hashtext('cesta-api-startup-migrations'))")
+            .execute(&mut *connection)
+            .await;
+    migration_result?;
+    unlock_result?;
+    Ok(())
+}
+
+async fn apply_feed_migration(
+    connection: &mut PgConnection,
+    version: &str,
+    statements: &str,
+) -> Result<()> {
+    let already_applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM cesta_schema_migrations WHERE version = $1)",
+    )
+    .bind(version)
+    .fetch_one(&mut *connection)
     .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0016_data_repairs.sql"
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0017_stop_deduplication.sql"
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0018_automatic_directional_stop_merges.sql"
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::raw_sql(include_str!(
-        "../../../infra/postgres/migrations/0019_storage_optimization.sql"
-    ))
-    .execute(pool)
-    .await?;
+    if already_applied {
+        return Ok(());
+    }
+
+    sqlx::raw_sql(statements).execute(&mut *connection).await?;
+    sqlx::query("INSERT INTO cesta_schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(version)
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -1650,6 +1849,27 @@ async fn database_import_skip_reason(
     source: &str,
     checksum: Option<&str>,
 ) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    // A killed importer used to leave its run in `running` forever. Every later
+    // scheduler pass then returned Ok(import_already_running), so the sync was
+    // reported as successful while no new timetable was ever imported.
+    sqlx::query(
+        r#"
+        UPDATE import_runs
+        SET status = 'failed',
+            finished_at = now(),
+            summary = summary || jsonb_build_object(
+              'failure_reason', 'stale_import_run_recovered',
+              'recovered_at', now()
+            )
+        WHERE source = $1
+          AND status = 'running'
+          AND started_at < now() - interval '2 hours'
+        "#,
+    )
+    .bind(source)
+    .execute(pool)
+    .await?;
+
     if let Some(row) = sqlx::query(
         r#"
         SELECT id, started_at, summary
@@ -1715,6 +1935,26 @@ async fn database_import_skip_reason(
         .await?;
         if previous_summary.get("calendars").is_none() || !has_service_calendar {
             return Ok(None);
+        }
+        if feed_id == PID_FEED_ID {
+            let has_official_transfers: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM transfers WHERE source_feed_id = $1 AND transfer_type = 2)",
+            )
+            .bind(feed_id)
+            .fetch_one(pool)
+            .await?;
+            if previous_summary.get("transfers").is_none() || !has_official_transfers {
+                return Ok(None);
+            }
+            let has_shapes: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM shapes WHERE source_feed_id = $1)",
+            )
+            .bind(feed_id)
+            .fetch_one(pool)
+            .await?;
+            if previous_summary.get("shape_points").is_none() || !has_shapes {
+                return Ok(None);
+            }
         }
         return Ok(Some(serde_json::json!({
             "exported": false,
@@ -2086,6 +2326,12 @@ async fn export_dataset_to_postgres(
             .service_ids
             .push(scoped_id(feed_id, &trip.service_id));
         trip_batch.headsigns.push(trip.trip_headsign.clone());
+        trip_batch.direction_ids.push(trip.direction_id);
+        trip_batch.shape_ids.push(
+            trip.shape_id
+                .as_deref()
+                .map(|shape_id| scoped_id(feed_id, shape_id)),
+        );
         trip_batch.source_priorities.push(priority);
         trips.insert(trip.trip_id.clone());
 
@@ -2101,6 +2347,27 @@ async fn export_dataset_to_postgres(
             inserted_trips,
             "exported trips with batched inserts"
         );
+    }
+
+    let mut inserted_shapes = 0_u64;
+    let mut shape_batch = ShapeBatch::with_capacity(SHAPE_BATCH_SIZE);
+    for point in &dataset.shapes {
+        shape_batch
+            .shape_ids
+            .push(scoped_id(feed_id, &point.shape_id));
+        shape_batch.sequences.push(point.sequence as i32);
+        shape_batch.lats.push(point.lat);
+        shape_batch.lons.push(point.lon);
+        shape_batch.distances.push(point.distance_traveled);
+        shape_batch.import_run_ids.push(import_run_id);
+        shape_batch.source_feed_ids.push(feed_id.to_string());
+        if shape_batch.len() >= SHAPE_BATCH_SIZE {
+            inserted_shapes += flush_shape_batch(pool, &mut shape_batch).await?;
+        }
+    }
+    inserted_shapes += flush_shape_batch(pool, &mut shape_batch).await?;
+    if inserted_shapes > 0 {
+        tracing::info!(feed_id, inserted_shapes, "exported GTFS shape points");
     }
 
     let mut stop_time_batch = StopTimeBatch::with_capacity(STOP_TIME_BATCH_SIZE);
@@ -2148,6 +2415,20 @@ async fn export_dataset_to_postgres(
             "exported stop_times with batched inserts"
         );
     }
+
+    let (inserted_transfers, ignored_trip_specific_transfers) = if feed_id == PID_FEED_ID {
+        export_pid_gtfs_transfers(
+            pool,
+            dataset,
+            feed_id,
+            import_run_id,
+            &stops,
+            complete_dataset,
+        )
+        .await?
+    } else {
+        (0, 0)
+    };
 
     let (inserted_calendars, inserted_calendar_dates) =
         export_service_calendars(pool, dataset, feed_id, import_run_id).await?;
@@ -2224,6 +2505,9 @@ async fn export_dataset_to_postgres(
         "routes": routes.len(),
         "trips": trips.len(),
         "stop_times": inserted_stop_times,
+        "shape_points": inserted_shapes,
+        "transfers": inserted_transfers,
+        "trip_specific_transfers_not_generalized": ignored_trip_specific_transfers,
         "calendars": inserted_calendars,
         "calendar_dates": inserted_calendar_dates,
         "skipped_stop_times": skipped_stop_times,
@@ -2263,6 +2547,75 @@ async fn export_dataset_to_postgres(
         "summary": summary,
         "visible_stops_for_feed": visible_stops
     }))
+}
+
+async fn export_pid_gtfs_transfers(
+    pool: &PgPool,
+    dataset: &GtfsDataset,
+    feed_id: &str,
+    import_run_id: Uuid,
+    known_stops: &HashSet<String>,
+    complete_dataset: bool,
+) -> Result<(u64, usize), sqlx::Error> {
+    let mut inserted = 0_u64;
+    let mut trip_specific = 0_usize;
+    for transfer in &dataset.transfers {
+        if transfer.from_trip_id.is_some() || transfer.to_trip_id.is_some() {
+            trip_specific += 1;
+            continue;
+        }
+        // PID type 2 rows are authoritative physical minimum-change times. Type 1
+        // rows are trip-pair guarantees and must not be widened into generic links.
+        if transfer.transfer_type != 2
+            || !known_stops.contains(&transfer.from_stop_id)
+            || !known_stops.contains(&transfer.to_stop_id)
+        {
+            continue;
+        }
+        let Some(min_transfer_seconds) = transfer.min_transfer_time else {
+            continue;
+        };
+        inserted += sqlx::query(
+            r#"
+            INSERT INTO transfers (
+              from_stop_id, to_stop_id, min_transfer_seconds, distance_meters,
+              walking_geometry, confidence, accessibility_level, source,
+              import_run_id, source_feed_id, transfer_type
+            )
+            VALUES ($1, $2, $3, NULL, NULL, 'exact', NULL, 'pid_gtfs_transfer', $4, $5, 2)
+            ON CONFLICT (from_stop_id, to_stop_id) DO UPDATE SET
+              min_transfer_seconds = EXCLUDED.min_transfer_seconds,
+              distance_meters = EXCLUDED.distance_meters,
+              walking_geometry = EXCLUDED.walking_geometry,
+              confidence = EXCLUDED.confidence,
+              accessibility_level = EXCLUDED.accessibility_level,
+              source = EXCLUDED.source,
+              import_run_id = EXCLUDED.import_run_id,
+              source_feed_id = EXCLUDED.source_feed_id,
+              transfer_type = EXCLUDED.transfer_type
+            "#,
+        )
+        .bind(scoped_id(feed_id, &transfer.from_stop_id))
+        .bind(scoped_id(feed_id, &transfer.to_stop_id))
+        .bind(min_transfer_seconds as i32)
+        .bind(import_run_id)
+        .bind(feed_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+
+    if complete_dataset {
+        sqlx::query(
+            "DELETE FROM transfers WHERE source_feed_id = $1 AND import_run_id IS DISTINCT FROM $2",
+        )
+        .bind(feed_id)
+        .bind(import_run_id)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok((inserted, trip_specific))
 }
 
 async fn export_service_calendars(
@@ -2433,6 +2786,28 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    let preserved_referenced_stops = sqlx::query(
+        r#"
+        UPDATE stops AS stop
+        SET import_run_id = $2,
+            is_active = true
+        WHERE stop.source_feed_id = $1
+          AND EXISTS (
+            SELECT 1
+            FROM stop_times AS stop_time
+            WHERE stop_time.stop_id = stop.id
+              AND stop_time.source_feed_id = $1
+              AND stop_time.import_run_id = $2
+          )
+          AND (stop.import_run_id IS DISTINCT FROM $2 OR stop.is_active = false)
+        "#,
+    )
+    .bind(feed_id)
+    .bind(import_run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
     let deactivated_stops = sqlx::query(
         r#"
         UPDATE stops
@@ -2521,6 +2896,7 @@ async fn prune_stale_feed_schedule_rows(
         "deleted_calendar_dates": deleted_calendar_dates,
         "deleted_shapes": deleted_shapes,
         "deleted_stop_source_ids": deleted_stop_source_ids,
+        "preserved_referenced_stops": preserved_referenced_stops,
         "deactivated_stops": deactivated_stops,
         "deleted_obsolete_transfers": deleted_obsolete_transfers,
         "deleted_stops": deleted_stops,
@@ -2588,6 +2964,7 @@ async fn prune_obsolete_feed_import_data(
           AND NOT EXISTS (SELECT 1 FROM stop_times item WHERE item.import_run_id = run.id)
           AND NOT EXISTS (SELECT 1 FROM calendars item WHERE item.import_run_id = run.id)
           AND NOT EXISTS (SELECT 1 FROM calendar_dates item WHERE item.import_run_id = run.id)
+          AND NOT EXISTS (SELECT 1 FROM transfers item WHERE item.import_run_id = run.id)
           AND NOT EXISTS (SELECT 1 FROM shapes item WHERE item.import_run_id = run.id)
           AND NOT EXISTS (SELECT 1 FROM validation_issues item WHERE item.import_run_id = run.id)
         "#,
@@ -2624,9 +3001,12 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
             $5::text[],
             $6::text[],
             $7::text[],
-            $8::integer[]
+            $8::smallint[],
+            $9::text[],
+            $10::integer[]
           ) AS t(
-            id, import_run_id, source_feed_id, source_id, route_id, service_id, headsign, source_priority
+            id, import_run_id, source_feed_id, source_id, route_id, service_id, headsign,
+            direction_id, shape_id, source_priority
           )
         )
         INSERT INTO trips (
@@ -2635,7 +3015,7 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
         )
         SELECT
           id, import_run_id, source_feed_id, source_id, route_id, service_id, headsign,
-          NULL::smallint, NULL::text, '{}'::jsonb, '{}'::jsonb, source_priority
+          direction_id, shape_id, '{}'::jsonb, '{}'::jsonb, source_priority
         FROM rows
         ON CONFLICT (id) DO UPDATE SET
           import_run_id = EXCLUDED.import_run_id,
@@ -2643,6 +3023,8 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           route_id = EXCLUDED.route_id,
           service_id = EXCLUDED.service_id,
           headsign = EXCLUDED.headsign,
+          direction_id = EXCLUDED.direction_id,
+          shape_id = EXCLUDED.shape_id,
           source_priority = EXCLUDED.source_priority
         WHERE (
           trips.import_run_id,
@@ -2650,6 +3032,8 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           trips.route_id,
           trips.service_id,
           trips.headsign,
+          trips.direction_id,
+          trips.shape_id,
           trips.source_priority
         ) IS DISTINCT FROM (
           EXCLUDED.import_run_id,
@@ -2657,6 +3041,8 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           EXCLUDED.route_id,
           EXCLUDED.service_id,
           EXCLUDED.headsign,
+          EXCLUDED.direction_id,
+          EXCLUDED.shape_id,
           EXCLUDED.source_priority
         )
         "#,
@@ -2668,7 +3054,49 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
     .bind(&batch.route_ids)
     .bind(&batch.service_ids)
     .bind(&batch.headsigns)
+    .bind(&batch.direction_ids)
+    .bind(&batch.shape_ids)
     .bind(&batch.source_priorities)
+    .execute(pool)
+    .await?;
+    batch.clear();
+    Ok(row_count)
+}
+
+async fn flush_shape_batch(pool: &PgPool, batch: &mut ShapeBatch) -> Result<u64, sqlx::Error> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+    let row_count = batch.len() as u64;
+    sqlx::query(
+        r#"
+        INSERT INTO shapes (
+          shape_id, shape_pt_sequence, geom, distance_traveled,
+          import_run_id, source_feed_id
+        )
+        SELECT shape_id, sequence,
+               ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography,
+               distance_traveled, import_run_id, source_feed_id
+        FROM UNNEST(
+          $1::text[], $2::integer[], $3::double precision[], $4::double precision[],
+          $5::double precision[], $6::uuid[], $7::text[]
+        ) AS item(
+          shape_id, sequence, lat, lon, distance_traveled, import_run_id, source_feed_id
+        )
+        ON CONFLICT (shape_id, shape_pt_sequence) DO UPDATE SET
+          geom = EXCLUDED.geom,
+          distance_traveled = EXCLUDED.distance_traveled,
+          import_run_id = EXCLUDED.import_run_id,
+          source_feed_id = EXCLUDED.source_feed_id
+        "#,
+    )
+    .bind(&batch.shape_ids)
+    .bind(&batch.sequences)
+    .bind(&batch.lats)
+    .bind(&batch.lons)
+    .bind(&batch.distances)
+    .bind(&batch.import_run_ids)
+    .bind(&batch.source_feed_ids)
     .execute(pool)
     .await?;
     batch.clear();
@@ -2991,6 +3419,22 @@ mod tests {
         assert!(!stale.exists());
         assert!(protected.exists());
         assert!(manual.exists());
+        fs::remove_dir_all(storage).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_run_retention_failure_is_non_fatal() {
+        let storage =
+            std::env::temp_dir().join(format!("cesta-retention-failure-{}", Uuid::new_v4()));
+        let latest = storage.join("raw").join("pid").join("latest");
+        fs::create_dir_all(latest.parent().unwrap()).await.unwrap();
+        fs::write(&latest, b"not a directory").await.unwrap();
+
+        assert!(
+            !prune_raw_run_directories_best_effort(&storage, "pid", &latest).await,
+            "retention failure should be reported without aborting the caller"
+        );
+
         fs::remove_dir_all(storage).await.unwrap();
     }
 }

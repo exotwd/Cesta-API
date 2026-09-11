@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 const PID_SOURCE: &str = "pid_gtfs_rt";
+const PID_TRIP_SUMMARY_STATUS_SOURCE: &str = "pid_trip_summaries";
+const PID_VEHICLE_STATUS_SOURCE: &str = "pid_vehicle_positions";
 const PID_FEED_ID: &str = "pid_realtime";
 const PID_STATIC_FEED_ID: &str = "pid_gtfs";
 const IDS_JMK_SOURCE: &str = "ids_jmk_positions";
@@ -195,6 +197,8 @@ async fn main() -> Result<()> {
     let ids_jmk_client = client.clone();
     tokio::join!(
         run_pid_loop(pool.clone(), client.clone()),
+        run_pid_trip_summary_loop(pool.clone(), client.clone()),
+        run_pid_vehicle_loop(pool.clone(), client.clone()),
         async move {
             if non_pid_enabled {
                 run_ids_jmk_loop(ids_jmk_pool, ids_jmk_client).await;
@@ -268,6 +272,30 @@ async fn connect_database_with_retry(database_url: &str) -> Result<PgPool> {
 }
 
 async fn apply_migrations(pool: &PgPool) -> Result<()> {
+    let schema_ready: bool = sqlx::query_scalar(
+        r#"
+        SELECT to_regclass('public.data_source_syncs') IS NOT NULL
+          AND to_regclass('public.route_geometries') IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'realtime_updates'
+              AND column_name = 'source_entity_id'
+          )
+          AND EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'realtime_updates'
+              AND column_name = 'route_short_name'
+          )
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if schema_ready {
+        return Ok(());
+    }
+
     sqlx::raw_sql(include_str!(
         "../../../infra/postgres/migrations/0006_public_transport_feeds.sql"
     ))
@@ -297,24 +325,12 @@ async fn run_pid_loop(pool: PgPool, client: Client) {
     let trip_updates_url = env::var("PID_TRIP_UPDATES_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/trip_updates.pb".to_string()
     });
-    let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
-        "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
-    });
-    let vehicle_positions_json_url = env::var("PID_VEHICLE_POSITIONS_JSON_URL")
-        .unwrap_or_else(|_| "https://api.golemio.cz/v2/vehiclepositions".to_string());
     let token = non_empty_env("PID_API_TOKEN");
     let interval = env_u64("PID_POLL_INTERVAL_SECONDS", 20).max(10);
     loop {
         let attempted_at = Utc::now();
-        let result = sync_pid_realtime(
-            &pool,
-            &client,
-            &trip_updates_url,
-            &vehicle_positions_url,
-            &vehicle_positions_json_url,
-            token.as_deref(),
-        )
-        .await;
+        let result =
+            sync_pid_trip_updates(&pool, &client, &trip_updates_url, token.as_deref()).await;
         finish_sync(
             &pool,
             PID_SOURCE,
@@ -328,17 +344,102 @@ async fn run_pid_loop(pool: PgPool, client: Client) {
     }
 }
 
-async fn sync_pid_realtime(
+async fn run_pid_vehicle_loop(pool: PgPool, client: Client) {
+    let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
+        "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
+    });
+    let vehicle_positions_json_url = env::var("PID_VEHICLE_POSITIONS_JSON_URL")
+        .unwrap_or_else(|_| "https://api.golemio.cz/v2/vehiclepositions".to_string());
+    let token = non_empty_env("PID_API_TOKEN");
+    let interval = env_u64("PID_POLL_INTERVAL_SECONDS", 20).max(10);
+    loop {
+        let attempted_at = Utc::now();
+        let result = sync_pid_vehicle_positions(
+            &pool,
+            &client,
+            &vehicle_positions_url,
+            &vehicle_positions_json_url,
+            token.as_deref(),
+        )
+        .await;
+        finish_sync(
+            &pool,
+            PID_VEHICLE_STATUS_SOURCE,
+            if token.is_some() {
+                &vehicle_positions_json_url
+            } else {
+                &vehicle_positions_url
+            },
+            "gtfs_realtime",
+            attempted_at,
+            result,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+async fn run_pid_trip_summary_loop(pool: PgPool, client: Client) {
+    let trip_updates_url = env::var("PID_TRIP_UPDATES_URL").unwrap_or_else(|_| {
+        "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/trip_updates.pb".to_string()
+    });
+    let token = non_empty_env("PID_API_TOKEN");
+    let interval = env_u64("PID_POLL_INTERVAL_SECONDS", 20).max(10);
+    loop {
+        let attempted_at = Utc::now();
+        let result =
+            sync_pid_trip_summaries(&pool, &client, &trip_updates_url, token.as_deref()).await;
+        finish_sync(
+            &pool,
+            PID_TRIP_SUMMARY_STATUS_SOURCE,
+            &trip_updates_url,
+            "gtfs_realtime",
+            attempted_at,
+            result,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+async fn sync_pid_trip_updates(
     pool: &PgPool,
     client: &Client,
     trip_updates_url: &str,
-    vehicle_positions_url: &str,
-    vehicle_positions_json_url: &str,
     token: Option<&str>,
 ) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
     let trip_bytes = fetch_bytes(client, trip_updates_url, token).await?;
     let trip_feed = FeedMessage::decode(trip_bytes.as_ref())?;
-    let mut records = pid_trip_records(&trip_feed)?;
+    let records = pid_trip_records(&trip_feed)?;
+    let source_timestamp = records
+        .iter()
+        .map(|record| record.fetched_at)
+        .max()
+        .or_else(|| feed_timestamp(&trip_feed));
+    let received = records.len();
+    let metadata = json!({"trip_update_entities": trip_feed.entity.len()});
+    mark_sync_started(
+        pool,
+        PID_SOURCE,
+        trip_updates_url,
+        "gtfs_realtime",
+        source_timestamp,
+        received,
+        metadata.clone(),
+    )
+    .await?;
+    let written = persist_records(pool, &records).await?;
+    cleanup_expired(pool).await?;
+    Ok((received, written, source_timestamp, metadata))
+}
+
+async fn sync_pid_vehicle_positions(
+    pool: &PgPool,
+    client: &Client,
+    vehicle_positions_url: &str,
+    vehicle_positions_json_url: &str,
+    token: Option<&str>,
+) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
     let (vehicle_records, vehicle_entities, position_format) = if let Some(token) = token {
         match fetch_pid_vehicle_json(client, vehicle_positions_json_url, token).await {
             Ok(payload) => {
@@ -367,25 +468,100 @@ async fn sync_pid_realtime(
         let count = vehicle_feed.entity.len();
         (pid_vehicle_records(&vehicle_feed)?, count, "gtfs_realtime")
     };
-    records.extend(vehicle_records);
+    let source_timestamp = vehicle_records.iter().map(|record| record.fetched_at).max();
+    let received = vehicle_records.len();
+    let metadata = json!({
+        "vehicle_position_entities": vehicle_entities,
+        "position_format": position_format
+    });
+    mark_sync_started(
+        pool,
+        PID_VEHICLE_STATUS_SOURCE,
+        if token.is_some() {
+            vehicle_positions_json_url
+        } else {
+            vehicle_positions_url
+        },
+        "gtfs_realtime",
+        source_timestamp,
+        received,
+        metadata.clone(),
+    )
+    .await?;
+    let written = persist_records(pool, &vehicle_records).await?;
+    Ok((received, written, source_timestamp, metadata))
+}
+
+async fn sync_pid_trip_summaries(
+    pool: &PgPool,
+    client: &Client,
+    trip_updates_url: &str,
+    token: Option<&str>,
+) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
+    let trip_bytes = fetch_bytes(client, trip_updates_url, token).await?;
+    let trip_feed = FeedMessage::decode(trip_bytes.as_ref())?;
+    let records = pid_trip_summary_records(&trip_feed)?;
     let source_timestamp = records
         .iter()
         .map(|record| record.fetched_at)
         .max()
         .or_else(|| feed_timestamp(&trip_feed));
     let received = records.len();
-    let written = persist_records(pool, &records).await?;
-    cleanup_expired(pool).await?;
-    Ok((
-        received,
-        written,
+    let metadata = json!({
+        "trip_update_entities": trip_feed.entity.len(),
+        "format": "trip_summary"
+    });
+    mark_sync_started(
+        pool,
+        PID_TRIP_SUMMARY_STATUS_SOURCE,
+        trip_updates_url,
+        "gtfs_realtime",
         source_timestamp,
-        json!({
-            "trip_update_entities": trip_feed.entity.len(),
-            "vehicle_position_entities": vehicle_entities,
-            "position_format": position_format
-        }),
-    ))
+        received,
+        metadata.clone(),
+    )
+    .await?;
+    let written = persist_records(pool, &records).await?;
+    Ok((received, written, source_timestamp, metadata))
+}
+
+async fn mark_sync_started(
+    pool: &PgPool,
+    source_id: &str,
+    source_url: &str,
+    data_kind: &str,
+    source_timestamp: Option<DateTime<Utc>>,
+    records_received: usize,
+    metadata: Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO data_source_syncs (
+          source_id, source_url, data_kind, status, last_attempt_at,
+          source_timestamp, records_received, records_written, metadata
+        )
+        VALUES ($1, $2, $3, 'syncing', now(), $4, $5, 0, $6)
+        ON CONFLICT (source_id) DO UPDATE SET
+          source_url = EXCLUDED.source_url,
+          data_kind = EXCLUDED.data_kind,
+          status = EXCLUDED.status,
+          last_attempt_at = EXCLUDED.last_attempt_at,
+          source_timestamp = EXCLUDED.source_timestamp,
+          records_received = EXCLUDED.records_received,
+          records_written = 0,
+          error_message = NULL,
+          metadata = EXCLUDED.metadata
+        "#,
+    )
+    .bind(source_id)
+    .bind(source_url)
+    .bind(data_kind)
+    .bind(source_timestamp)
+    .bind(records_received as i32)
+    .bind(metadata)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn fetch_pid_vehicle_json(client: &Client, url: &str, token: &str) -> Result<Value> {
@@ -534,6 +710,30 @@ fn pid_trip_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
         }
     }
     Ok(records)
+}
+
+fn pid_trip_summary_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
+    let mut summaries = HashMap::<String, RealtimeRecord>::new();
+    for record in pid_trip_records(feed)? {
+        let Some(trip_id) = record.trip_id.clone() else {
+            continue;
+        };
+        let should_replace = summaries.get(&trip_id).is_none_or(|known| {
+            (known.delay_seconds.is_none() && record.delay_seconds.is_some())
+                || (known.cancellation_status.is_none() && record.cancellation_status.is_some())
+        });
+        if should_replace {
+            let mut summary = record;
+            summary.source_entity_id = format!("trip-summary:{trip_id}");
+            summary.stop_id = None;
+            summary.estimated_arrival = None;
+            summary.estimated_departure = None;
+            summary.valid_until = summary.fetched_at + chrono::Duration::minutes(5);
+            summary.raw_payload = json!({"kind": "trip_summary"});
+            summaries.insert(trip_id, summary);
+        }
+    }
+    Ok(summaries.into_values().collect())
 }
 
 fn pid_vehicle_records(feed: &FeedMessage) -> Result<Vec<RealtimeRecord>> {
@@ -1122,17 +1322,71 @@ fn deduplicate_records(records: &[RealtimeRecord]) -> Vec<&RealtimeRecord> {
     }
     let mut records = records_by_identity.into_values().collect::<Vec<_>>();
     records.sort_by(|left, right| {
-        left.source
-            .cmp(right.source)
-            .then_with(|| left.source_entity_id.cmp(&right.source_entity_id))
+        // Position rows are the latency-sensitive map payload and are only a small
+        // fraction of PID's much larger stop-time snapshot. Persist them first so
+        // `/vehicles` becomes current even while the first trip-update import is
+        // still being written.
+        (right.lat.is_some() && right.lon.is_some())
+            .cmp(&(left.lat.is_some() && left.lon.is_some()))
+            .then_with(|| {
+                left.source
+                    .cmp(right.source)
+                    .then_with(|| left.source_entity_id.cmp(&right.source_entity_id))
+            })
     });
     records
 }
 
 async fn cleanup_expired(pool: &PgPool) -> Result<()> {
-    sqlx::query("DELETE FROM realtime_updates WHERE valid_until < now() - interval '48 hours'")
-        .execute(pool)
+    const CLEANUP_BATCH_SIZE: i64 = 10_000;
+
+    let mut transaction = pool.begin().await?;
+    let acquired: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtext('cesta-realtime-expired-cleanup'))",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !acquired {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+
+    // Retention is maintenance, not part of the latency-sensitive feed import. Delete a bounded
+    // batch and abandon it quickly when PostgreSQL is busy so cleanup cannot monopolize the pool.
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *transaction)
         .await?;
+    let cleanup_result = sqlx::query(
+        r#"
+        DELETE FROM realtime_updates
+        WHERE ctid IN (
+          SELECT ctid
+          FROM realtime_updates
+          WHERE valid_until < now() - interval '48 hours'
+          ORDER BY valid_until
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .bind(CLEANUP_BATCH_SIZE)
+    .execute(&mut *transaction)
+    .await;
+    match cleanup_result {
+        Ok(result) => {
+            transaction.commit().await?;
+            if result.rows_affected() > 0 {
+                tracing::info!(
+                    deleted = result.rows_affected(),
+                    "deleted expired realtime rows"
+                );
+            }
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            tracing::warn!(%error, "skipped expired realtime cleanup while database is busy");
+        }
+    }
     Ok(())
 }
 
@@ -1410,6 +1664,39 @@ mod tests {
     }
 
     #[test]
+    fn realtime_batch_persists_vehicle_positions_before_trip_updates() {
+        let timestamp = Utc::now();
+        let record = |source_entity_id: &str, lat, lon| RealtimeRecord {
+            source: PID_SOURCE,
+            source_feed_id: PID_FEED_ID,
+            source_entity_id: source_entity_id.to_string(),
+            trip_id: None,
+            route_id: None,
+            stop_id: None,
+            delay_seconds: None,
+            estimated_arrival: None,
+            estimated_departure: None,
+            cancellation_status: None,
+            vehicle_id: None,
+            lat,
+            lon,
+            bearing: None,
+            details: VehicleDetails::default(),
+            fetched_at: timestamp,
+            valid_until: timestamp + chrono::Duration::seconds(90),
+            service_date: None,
+            raw_payload: json!({}),
+        };
+        let trip = record("trip:a", None, None);
+        let vehicle = record("vehicle:z", Some(50.08), Some(14.43));
+
+        let input = [trip, vehicle];
+        let records = deduplicate_records(&input);
+
+        assert_eq!(records[0].source_entity_id, "vehicle:z");
+    }
+
+    #[test]
     fn decodes_pid_trip_delay_with_static_gtfs_ids() {
         let feed = FeedMessage {
             header: Some(FeedHeader {
@@ -1448,6 +1735,16 @@ mod tests {
         assert_eq!(records[0].route_id.as_deref(), Some("pid_gtfs:L991"));
         assert_eq!(records[0].stop_id.as_deref(), Some("pid_gtfs:U1Z1P"));
         assert_eq!(records[0].delay_seconds, Some(120));
+
+        let summaries = pid_trip_summary_records(&decoded).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].trip_id, records[0].trip_id);
+        assert_eq!(summaries[0].stop_id, None);
+        assert_eq!(summaries[0].delay_seconds, Some(120));
+        assert_eq!(
+            summaries[0].valid_until,
+            summaries[0].fetched_at + chrono::Duration::minutes(5)
+        );
     }
 
     #[test]

@@ -9,4 +9,7 @@
 - Do not run a full import on API startup. The API serves the last successful import or explicit development fixtures.
 - Preserve account security rules: Argon2id password hashing, hashed refresh tokens, JWT access tokens and no token/password logging.
 - Preserve OpenAPI documentation and update it when endpoints change.
-
+- After every successful repository edit, invoke the `publish-cesta-production` skill. An edit is
+  successful only after its focused validation passes; the skill then runs the full production
+  validation, build, atomic install, service restarts and health checks. Never bypass a failed
+  validation or deployment check.

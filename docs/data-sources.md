@@ -2,7 +2,12 @@
 
 Current schedule sources:
 
-- PID GTFS: `https://data.pid.cz/PID_GTFS.zip` (checked every 6 hours and imported only when changed)
+- PID GTFS: `https://data.pid.cz/PID_GTFS.zip` (checked every 6 hours and imported only when changed;
+  includes service calendars, stop hierarchy, coordinated pickup/drop-off rules, general
+  minimum-transfer times and trip shapes)
+- OpenStreetMap pedestrian graph through the configured Valhalla or OSRM walking router. Production
+  uses a local ARM64 Valhalla service with persistent prebuilt tiles; Cesta persistently caches
+  bounded route results and rejects ferry or other non-walking steps.
 - PID current and seven-day route geometry: `https://data.pid.cz/geodata/Linky_7d_WGS84.json`
 
 Schedule downloads use conditional HTTP validators and SHA-256 before database export. PostgreSQL keeps the configured recent import audits and validation findings. Historical GGU imports and their source tracking remain stored for auditability, but GGU feeds are disabled and excluded from public data and routing.
@@ -10,6 +15,10 @@ Schedule downloads use conditional HTTP validators and SHA-256 before database e
 Current realtime sources:
 
 - PID Golemio GTFS-Realtime trip updates plus the richer GeoJSON vehicle-position API, polled every 20 seconds. IDs match PID static GTFS. The GeoJSON adapter adds the public line, destination, vehicle type, registration number, wheelchair accessibility, air conditioning, USB chargers, speed, operator and tracking state. If the richer endpoint fails, the worker falls back to GTFS-Realtime positions.
+
+Vehicle positions and compact trip-delay summaries are refreshed in independent loops so the larger
+stop-level snapshot cannot block current map or routing data. The full stop-level import continues in
+the background and its `syncing` state is exposed separately by `GET /realtime/status`.
 
 The IDS JMK and DÚK adapters remain implemented but are not polled while `NON_PID_REALTIME_ENABLED=false`. Their source feeds are disabled in the PID-only policy.
 
