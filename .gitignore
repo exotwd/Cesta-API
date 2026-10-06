@@ -6,3 +6,4 @@ storage/reports/**
 !storage/raw/.gitkeep
 !storage/processed/.gitkeep
 !storage/reports/.gitkeep
+var/backups/

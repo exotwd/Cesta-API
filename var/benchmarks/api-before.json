@@ -1,0 +1,327 @@
+{
+  "created_at": "2026-10-04T21:46:22.592224+00:00",
+  "service_date": "2026-10-05",
+  "concurrency": 2,
+  "repetitions": 3,
+  "notes": [
+    "First probes may already have warm server caches.",
+    "A small benchmark is not a production SLO.",
+    "Empty journeys and warnings are recorded separately from HTTP failures."
+  ],
+  "first_probes": [
+    {
+      "fixture": "prague_tram",
+      "status": 200,
+      "elapsed_ms": 315.85,
+      "bytes": 161310,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_metro",
+      "status": 200,
+      "elapsed_ms": 2447.54,
+      "bytes": 71371,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "brno_city",
+      "status": 200,
+      "elapsed_ms": 5097.35,
+      "bytes": 5104,
+      "results": 0,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_coordinates",
+      "status": 200,
+      "elapsed_ms": 3968.34,
+      "bytes": 211471,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_detail",
+      "status": 200,
+      "elapsed_ms": 317.44,
+      "bytes": 284243,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_overnight",
+      "status": 200,
+      "elapsed_ms": 826.42,
+      "bytes": 36002,
+      "results": 7,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "stop_catalog_first",
+      "status": 200,
+      "elapsed_ms": 818.58,
+      "bytes": 14712516,
+      "results": 0,
+      "warnings": false,
+      "etag": "W/\"da6ea316e9715b32e855c0e735aebdd00bae98f905d73b54e0b7f896119936a8\""
+    }
+  ],
+  "summary": {
+    "samples": 21,
+    "failures": 0,
+    "p50_ms": 404.29,
+    "p95_ms": 1294.36,
+    "max_ms": 1460.41,
+    "mean_bytes": 109915
+  },
+  "fixtures": {
+    "brno_city": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 483.75,
+      "p95_ms": 677.7,
+      "max_ms": 677.7,
+      "mean_bytes": 5008
+    },
+    "prague_coordinates": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 566.49,
+      "p95_ms": 585.2,
+      "max_ms": 585.2,
+      "mean_bytes": 211471
+    },
+    "prague_detail": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 383.07,
+      "p95_ms": 452.25,
+      "max_ms": 452.25,
+      "mean_bytes": 284243
+    },
+    "prague_metro": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 180.72,
+      "p95_ms": 195.78,
+      "max_ms": 195.78,
+      "mean_bytes": 71371
+    },
+    "prague_overnight": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 192.15,
+      "p95_ms": 197.47,
+      "max_ms": 197.47,
+      "mean_bytes": 36002
+    },
+    "prague_tram": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 368.41,
+      "p95_ms": 404.29,
+      "max_ms": 404.29,
+      "mean_bytes": 161310
+    },
+    "stop_catalog_revalidate": {
+      "samples": 3,
+      "failures": 0,
+      "p50_ms": 1294.36,
+      "p95_ms": 1460.41,
+      "max_ms": 1460.41,
+      "mean_bytes": 0
+    }
+  },
+  "samples": [
+    {
+      "fixture": "prague_tram",
+      "status": 200,
+      "elapsed_ms": 365.54,
+      "bytes": 161310,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_tram",
+      "status": 200,
+      "elapsed_ms": 368.41,
+      "bytes": 161310,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_tram",
+      "status": 200,
+      "elapsed_ms": 404.29,
+      "bytes": 161310,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_metro",
+      "status": 200,
+      "elapsed_ms": 180.72,
+      "bytes": 71371,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_metro",
+      "status": 200,
+      "elapsed_ms": 195.78,
+      "bytes": 71371,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_metro",
+      "status": 200,
+      "elapsed_ms": 168.53,
+      "bytes": 71371,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "brno_city",
+      "status": 200,
+      "elapsed_ms": 483.75,
+      "bytes": 5008,
+      "results": 0,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "brno_city",
+      "status": 200,
+      "elapsed_ms": 677.7,
+      "bytes": 5008,
+      "results": 0,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "brno_city",
+      "status": 200,
+      "elapsed_ms": 463.71,
+      "bytes": 5008,
+      "results": 0,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_coordinates",
+      "status": 200,
+      "elapsed_ms": 558.31,
+      "bytes": 211471,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_coordinates",
+      "status": 200,
+      "elapsed_ms": 566.49,
+      "bytes": 211471,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_coordinates",
+      "status": 200,
+      "elapsed_ms": 585.2,
+      "bytes": 211471,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_detail",
+      "status": 200,
+      "elapsed_ms": 452.25,
+      "bytes": 284243,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_detail",
+      "status": 200,
+      "elapsed_ms": 383.07,
+      "bytes": 284243,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_detail",
+      "status": 200,
+      "elapsed_ms": 377.33,
+      "bytes": 284243,
+      "results": 20,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_overnight",
+      "status": 200,
+      "elapsed_ms": 197.47,
+      "bytes": 36002,
+      "results": 7,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_overnight",
+      "status": 200,
+      "elapsed_ms": 187.76,
+      "bytes": 36002,
+      "results": 7,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "prague_overnight",
+      "status": 200,
+      "elapsed_ms": 192.15,
+      "bytes": 36002,
+      "results": 7,
+      "warnings": true,
+      "etag": null
+    },
+    {
+      "fixture": "stop_catalog_revalidate",
+      "status": 304,
+      "elapsed_ms": 849.48,
+      "bytes": 0,
+      "error": "http_error"
+    },
+    {
+      "fixture": "stop_catalog_revalidate",
+      "status": 304,
+      "elapsed_ms": 1294.36,
+      "bytes": 0,
+      "error": "http_error"
+    },
+    {
+      "fixture": "stop_catalog_revalidate",
+      "status": 304,
+      "elapsed_ms": 1460.41,
+      "bytes": 0,
+      "error": "http_error"
+    }
+  ]
+}
