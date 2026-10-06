@@ -73,6 +73,14 @@ pub struct Stop {
     pub platform_code: Option<String>,
     pub location_type: StopLocationType,
     pub parent_station_id: Option<String>,
+    #[serde(default)]
+    pub station_id: Option<String>,
+    #[serde(default)]
+    pub complex_id: Option<String>,
+    #[serde(default)]
+    pub has_station_layout: bool,
+    #[serde(default)]
+    pub station_layout_version: Option<String>,
     pub wheelchair_boarding: AccessibilityStatus,
     pub modes: Vec<TransportMode>,
     pub is_active: bool,
@@ -142,6 +150,8 @@ pub struct StopTime {
     pub pickup_type: Option<i16>,
     pub drop_off_type: Option<i16>,
     pub timepoint: Option<bool>,
+    #[serde(default)]
+    pub stop_headsign: Option<String>,
     pub platform: Option<String>,
     pub raw_notes: Option<String>,
 }

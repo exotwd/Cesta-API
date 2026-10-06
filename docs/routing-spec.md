@@ -1,6 +1,7 @@
 # Routing Spec
 
-Phase 1 uses a simple Connection Scan Algorithm over fixture or prepared imported snapshots.
+Production uses round-based RAPTOR over indexed, date-specific imported timetables.
+The Connection Scan Algorithm remains available for explicit development fixtures.
 
 Required routing behavior:
 
@@ -40,15 +41,16 @@ RAPTOR first searches only calendar-verified trips, preventing a faster legacy t
 a real service during round scanning. It reruns with legacy trips enabled only when the verified
 search returns no journey, and any resulting fallback is returned with a response warning.
 
-For departure-at searches, RAPTOR uses a bounded rRAPTOR-style range probe. The requested
-departure time is searched first. If it produces too few distinct candidates, evenly spaced
-coverage probes and real departures from resolved origin stops within
-`range_search_window_seconds` are searched two at a time, up to `max_range_departures`, stopping as
-soon as the route-pattern diversity floor is reached. Repeated departures of the same line pattern
-do not end expansion early. Each small batch uses bounded concurrency. Candidates from
-those probes are merged, deduplicated and ranked after RAPTOR; weighted scoring is not used inside
-the RAPTOR round scan. Evening searches also skip next-service-day RAPTOR when the current service
-day already produced enough candidates.
+For departure-at searches, RAPTOR uses a bounded rRAPTOR-style profile. The requested departure
+time is searched first, followed by the real boardable departure events within
+`range_search_window_seconds`, up to `max_range_departures`. For coordinate origins, each vehicle
+departure is shifted backwards by its verified pedestrian-access duration, so the profile is based
+on when the passenger must actually leave rather than when the vehicle leaves the stop. Dense event
+sets are sampled across the complete time window instead of taking only the earliest events. Every
+selected profile event is searched; finding a few route patterns no longer terminates the range
+early. Each small batch uses bounded concurrency. Candidates are merged, deduplicated and ranked
+after RAPTOR; weighted scoring is not used inside the RAPTOR round scan. Evening searches also skip
+next-service-day RAPTOR when the current service day already produced enough candidates.
 
 If all bounded departure probes still produce too few reasonable route patterns, up to two
 additional bounded passes exclude the winning route and then the first route of the best alternative.
@@ -56,10 +58,30 @@ This exposes genuinely different itineraries, including metro combinations, with
 search into an unbounded combinatorial alternatives scan. Patterns outside the same 15-minute
 quality window do not satisfy the diversity target or receive a reserved result slot.
 
-Final selection applies objective Pareto dominance before transfer-count, route and carrier
-diversity. A candidate is removed when another allowed candidate departs no earlier, arrives no
-later and has no more transfers, with at least one strict improvement. Carrier and route diversity
-cannot restore such a candidate.
+RAPTOR's earliest-arrival labels do not enumerate every useful direct line. An additional indexed
+scan therefore intersects the expanded origin and destination boarding positions and enumerates
+forward direct services within the same departure window, independently of sampled range events.
+It honors mode, verified service, pickup/drop-off and realtime eligibility and retains scheduled
+leg times. It follows only the explicitly expanded endpoints; coordinate walking and nearby access
+remain part of regular RAPTOR. `max_direct_candidates` caps these additional results, with one
+earliest departure per line reserved before filling the cap with subsequent departures.
+
+Final Pareto selection compares departure time, expected arrival, transfer count and walking
+distance. A candidate is removed only when another departs no earlier, arrives no later, has no
+more transfers and requires no more walking, with at least one strict improvement. The configured
+primary ranked result reserves the first slot, including for a one-result limit. Simple journeys
+(fewest transfers, then least walking) and bounded reasonable route/carrier alternatives reserve
+slots before the remaining frontier is sampled across its full departure-time span. Each route
+and carrier reservation is limited to at most four candidates and approximately one third of the
+result limit; distinct route alternatives must satisfy the 15-minute arrival/duration quality
+window. `dominate_only_same_carrier` restricts comparisons to matching known carrier signatures
+when enabled. A best option for another carrier may survive as a potential fare exception.
+
+Bounded selection runs before expensive shape loading, with dominance disabled. Up to twice the
+public result limit is kept for geometry validation, providing fallbacks for invalid shapes without
+fetching and clipping geometry for every raw range-search candidate. Final dominance and ranking
+run after geometry validation, so an invalid faster candidate does not prematurely discard its
+valid fallback.
 
 When final selection returns no journey, `related.routing_diagnostics` identifies the failure
 stage and reports expanded endpoint IDs, coordinate-access status, timetable size, active mode and
@@ -84,6 +106,15 @@ source-native station relationships and conservative name/proximity grouping. Cr
 edges are admitted only after the pedestrian engine finds a walking-only route; source proximity
 never creates an edge by itself. Trip-pair `transfer_type=1` guarantees are counted in the import
 summary but are not widened into generic links.
+
+PID interchange-complex membership creates walking-transfer candidates; it never makes all member
+stops equivalent journey endpoints. Differently named boarding points such as Karlovo náměstí,
+Palackého náměstí and Moráň therefore retain their own served routes while still allowing a verified
+walk between them.
+Cross-name and cross-mode links always require a walking-only route from the pedestrian engine.
+Same-name, same-mode platform links may use their measured straight-line distance, capped by the
+same maximum interchange distance. Changing these rules increments the serialized timetable format
+so an older transfer graph cannot remain active after deployment.
 
 Among valid GTFS pickup and drop-off values, `1` is the prohibited action. PID values `2` and `3`
 remain routable because they permit service with advance or driver coordination; the API exposes

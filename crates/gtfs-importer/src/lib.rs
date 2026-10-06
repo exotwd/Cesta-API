@@ -317,6 +317,10 @@ fn parse_stops<R: Read + Seek>(
                 platform_code: row.platform_code,
                 location_type,
                 parent_station_id: row.parent_station.filter(|value| !value.trim().is_empty()),
+                station_id: None,
+                complex_id: None,
+                has_station_layout: false,
+                station_layout_version: None,
                 wheelchair_boarding,
                 modes: Vec::new(),
                 is_active: true,
@@ -465,6 +469,7 @@ struct StopTimeRow {
     pickup_type: Option<i16>,
     drop_off_type: Option<i16>,
     timepoint: Option<i16>,
+    stop_headsign: Option<String>,
 }
 
 fn parse_stop_times<R: Read + Seek>(
@@ -492,6 +497,7 @@ fn parse_stop_times<R: Read + Seek>(
                         pickup_type: row.pickup_type,
                         drop_off_type: row.drop_off_type,
                         timepoint: row.timepoint.map(|value| value == 1),
+                        stop_headsign: row.stop_headsign,
                         platform: None,
                         raw_notes: None,
                     }),
@@ -742,7 +748,7 @@ mod tests {
             zip.write_all(b"route_id,service_id,trip_id,trip_headsign,direction_id,shape_id\nr1,wd,t1,Brno,1,shape-1\n")
                 .unwrap();
             zip.start_file("stop_times.txt", options).unwrap();
-            zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,08:00:00,08:00:00,s1,1\nt1,10:35:00,10:35:00,s2,2\n").unwrap();
+            zip.write_all(b"trip_id,arrival_time,departure_time,stop_id,stop_sequence,stop_headsign\nt1,08:00:00,08:00:00,s1,1,Brno via Kolin\nt1,10:35:00,10:35:00,s2,2,\n").unwrap();
             zip.start_file("shapes.txt", options).unwrap();
             zip.write_all(b"shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence,shape_dist_traveled\nshape-1,50.083,14.435,1,0\nshape-1,49.191,16.612,2,210000\n").unwrap();
             zip.start_file("calendar.txt", options).unwrap();
@@ -777,6 +783,10 @@ mod tests {
         );
         assert_eq!(dataset.stops[1].parent_station_id.as_deref(), Some("s1"));
         assert_eq!(dataset.stop_times.len(), 2);
+        assert_eq!(
+            dataset.stop_times[0].stop_headsign.as_deref(),
+            Some("Brno via Kolin")
+        );
         assert_eq!(dataset.trips[0].direction_id, Some(1));
         assert_eq!(dataset.trips[0].shape_id.as_deref(), Some("shape-1"));
         assert_eq!(dataset.shapes.len(), 2);

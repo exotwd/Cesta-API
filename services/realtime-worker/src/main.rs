@@ -1,11 +1,18 @@
-use std::{collections::HashMap, env, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    path::PathBuf,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use prost::Message;
 use reqwest::{Client, header::HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 const PID_SOURCE: &str = "pid_gtfs_rt";
 const PID_TRIP_SUMMARY_STATUS_SOURCE: &str = "pid_trip_summaries";
@@ -14,8 +21,45 @@ const PID_FEED_ID: &str = "pid_realtime";
 const PID_STATIC_FEED_ID: &str = "pid_gtfs";
 const IDS_JMK_SOURCE: &str = "ids_jmk_positions";
 const IDS_JMK_FEED_ID: &str = "ids_jmk_realtime";
+const IDS_JMK_STATIC_FEED_ID: &str = "ids_jmk_gtfs";
 const DUK_SOURCE: &str = "duk_positions";
 const DUK_FEED_ID: &str = "duk_realtime";
+const DEFAULT_DATABASE_STORAGE_PATH: &str = "/mnt/cesta-data";
+const DEFAULT_MIN_DATABASE_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+fn ensure_database_storage_headroom() -> Result<()> {
+    let configured_path = env::var_os("DATABASE_STORAGE_PATH");
+    let storage_path = configured_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE_STORAGE_PATH));
+    if !storage_path.exists() {
+        if configured_path.is_some() {
+            anyhow::bail!(
+                "configured database storage path does not exist: {}",
+                storage_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let available_bytes = fs2::available_space(&storage_path).with_context(|| {
+        format!(
+            "failed to inspect database storage headroom at {}",
+            storage_path.display()
+        )
+    })?;
+    let required_bytes = env::var("MIN_DATABASE_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MIN_DATABASE_FREE_BYTES);
+    if available_bytes < required_bytes {
+        anyhow::bail!(
+            "realtime persistence deferred: database storage has {available_bytes} bytes free but requires at least {required_bytes} bytes"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct FeedMessage {
@@ -164,6 +208,46 @@ struct VehicleDetails {
     state: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FcmServiceAccount {
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_google_token_uri")]
+    token_uri: String,
+}
+
+fn default_google_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct FcmJwtClaims<'a> {
+    iss: &'a str,
+    scope: &'static str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FcmTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApnsJwtClaims<'a> {
+    iss: &'a str,
+    iat: i64,
+}
+
+#[derive(Debug)]
+enum PushSendResult {
+    Delivered,
+    Retry(&'static str),
+    InvalidToken(&'static str),
+    Failed(&'static str),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -192,6 +276,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("starting public transport realtime worker");
     let non_pid_enabled = env_bool("NON_PID_REALTIME_ENABLED", false);
+    let ids_jmk_enabled = env_bool("IDS_JMK_ENABLED", true);
     let duk_enabled = env_bool("DUK_ENABLED", false);
     let ids_jmk_pool = pool.clone();
     let ids_jmk_client = client.clone();
@@ -199,11 +284,12 @@ async fn main() -> Result<()> {
         run_pid_loop(pool.clone(), client.clone()),
         run_pid_trip_summary_loop(pool.clone(), client.clone()),
         run_pid_vehicle_loop(pool.clone(), client.clone()),
+        run_push_delivery_loop(pool.clone(), client.clone()),
         async move {
-            if non_pid_enabled {
+            if ids_jmk_enabled {
                 run_ids_jmk_loop(ids_jmk_pool, ids_jmk_client).await;
             } else {
-                tracing::info!("IDS JMK realtime connector is disabled in PID-only mode");
+                tracing::info!("IDS JMK realtime connector is disabled by configuration");
             }
         },
         async move {
@@ -232,14 +318,19 @@ async fn check_external_feeds() -> Result<()> {
     let vehicle_positions_url = env::var("PID_VEHICLE_POSITIONS_URL").unwrap_or_else(|_| {
         "https://api.golemio.cz/v2/vehiclepositions/gtfsrt/vehicle_positions.pb".to_string()
     });
-    let (trip_bytes, vehicle_bytes) = tokio::try_join!(
+    let ids_jmk_url = env::var("IDS_JMK_VEHICLES_URL")
+        .unwrap_or_else(|_| "https://kordis-jmk.cz/gtfs/gtfsReal.dat".to_string());
+    let (trip_bytes, vehicle_bytes, ids_jmk_bytes) = tokio::try_join!(
         fetch_bytes(&client, &trip_updates_url, token.as_deref()),
-        fetch_bytes(&client, &vehicle_positions_url, token.as_deref())
+        fetch_bytes(&client, &vehicle_positions_url, token.as_deref()),
+        fetch_bytes(&client, &ids_jmk_url, None)
     )?;
     let trip_feed = FeedMessage::decode(trip_bytes.as_slice())?;
     let vehicle_feed = FeedMessage::decode(vehicle_bytes.as_slice())?;
+    let ids_jmk_feed = FeedMessage::decode(ids_jmk_bytes.as_slice())?;
     let trip_records = pid_trip_records(&trip_feed)?;
     let vehicle_records = pid_vehicle_records(&vehicle_feed)?;
+    let ids_jmk_records = ids_jmk_vehicle_records(&ids_jmk_feed);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -249,6 +340,18 @@ async fn check_external_feeds() -> Result<()> {
                 "vehicle_entities": vehicle_feed.entity.len(),
                 "vehicle_records": vehicle_records.len(),
                 "source_timestamp": feed_timestamp(&trip_feed)
+            },
+            "ids_jmk": {
+                "entities": ids_jmk_feed.entity.len(),
+                "vehicle_records": ids_jmk_records.len(),
+                "source_timestamp": feed_timestamp(&ids_jmk_feed),
+                "sample": ids_jmk_records.iter().take(3).map(|record| json!({
+                    "trip_id": record.trip_id,
+                    "route_id": record.route_id,
+                    "stop_id": record.stop_id,
+                    "route_short_name": record.details.route_short_name,
+                    "vehicle_id": record.vehicle_id
+                })).collect::<Vec<_>>()
             }
         }))?
     );
@@ -288,6 +391,18 @@ async fn apply_migrations(pool: &PgPool) -> Result<()> {
               AND table_name = 'realtime_updates'
               AND column_name = 'route_short_name'
           )
+          AND EXISTS (
+            SELECT 1 FROM source_feeds
+            WHERE id = 'ids_jmk_realtime' AND enabled = true
+          )
+          AND COALESCE(
+            (SELECT enabled FROM source_feeds WHERE id = 'ids_jmk_gtfs'),
+            false
+          ) = EXISTS (
+            SELECT 1 FROM import_runs
+            WHERE status = 'success'
+              AND summary->>'feed_id' = 'ids_jmk_gtfs'
+          )
         "#,
     )
     .fetch_one(pool)
@@ -303,6 +418,16 @@ async fn apply_migrations(pool: &PgPool) -> Result<()> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../../infra/postgres/migrations/0015_vehicle_map_contract.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0029_ids_jmk_dpmb.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../infra/postgres/migrations/0030_ids_jmk_activation.sql"
     ))
     .execute(pool)
     .await?;
@@ -889,7 +1014,7 @@ fn pid_json_vehicle_records(payload: &Value) -> Result<Vec<RealtimeRecord>> {
 async fn run_ids_jmk_loop(pool: PgPool, client: Client) {
     let url = env::var("IDS_JMK_VEHICLES_URL")
         .unwrap_or_else(|_| "https://kordis-jmk.cz/gtfs/gtfsReal.dat".to_string());
-    let interval = env_u64("IDS_JMK_POLL_INTERVAL_SECONDS", 30).max(15);
+    let interval = env_u64("IDS_JMK_POLL_INTERVAL_SECONDS", 15).max(10);
     loop {
         let attempted_at = Utc::now();
         let result = sync_ids_jmk(&pool, &client, &url).await;
@@ -913,15 +1038,32 @@ async fn sync_ids_jmk(
 ) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
     let bytes = fetch_bytes(client, url, None).await?;
     let feed = FeedMessage::decode(bytes.as_slice())?;
-    let records = ids_jmk_vehicle_records(&feed);
+    let mut records = ids_jmk_vehicle_records(&feed);
+    enrich_ids_jmk_vehicle_records(pool, &mut records).await?;
     let received = records.len();
-    let written = persist_records(pool, &records).await?;
-    Ok((
+    let source_timestamp = records
+        .iter()
+        .map(|record| record.fetched_at)
+        .max()
+        .or_else(|| feed_timestamp(&feed));
+    let metadata = json!({
+        "entities": feed.entity.len(),
+        "format": "gtfs_realtime",
+        "capabilities": ["vehicle_positions"]
+    });
+    mark_sync_started(
+        pool,
+        IDS_JMK_SOURCE,
+        url,
+        "gtfs_realtime",
+        source_timestamp,
         received,
-        written,
-        feed_timestamp(&feed),
-        json!({"entities": feed.entity.len(), "format": "gtfs_realtime"}),
-    ))
+        metadata.clone(),
+    )
+    .await?;
+    let written = persist_records(pool, &records).await?;
+    cleanup_expired(pool).await?;
+    Ok((received, written, source_timestamp, metadata))
 }
 
 fn ids_jmk_vehicle_records(feed: &FeedMessage) -> Vec<RealtimeRecord> {
@@ -940,21 +1082,21 @@ fn ids_jmk_vehicle_records(feed: &FeedMessage) -> Vec<RealtimeRecord> {
                 .timestamp
                 .and_then(|timestamp| unix_time(Some(timestamp as i64)))
                 .unwrap_or(feed_fetched_at);
-            let route_short_name = trip.and_then(|trip| trip.route_id.clone());
             Some(RealtimeRecord {
                 source: IDS_JMK_SOURCE,
                 source_feed_id: IDS_JMK_FEED_ID,
                 source_entity_id: format!("vehicle:{}", entity.id),
                 trip_id: trip
                     .and_then(|trip| trip.trip_id.as_deref())
-                    .map(|id| format!("ids_jmk:trip:{id}")),
+                    .map(|id| scoped_pid_id(IDS_JMK_STATIC_FEED_ID, id)),
                 route_id: trip
                     .and_then(|trip| trip.route_id.as_deref())
-                    .map(|id| format!("ids_jmk:route:{id}")),
+                    .map(|id| scoped_pid_id(IDS_JMK_STATIC_FEED_ID, id)),
                 stop_id: vehicle
                     .stop_id
                     .as_deref()
-                    .map(|id| format!("ids_jmk:stop:{id}")),
+                    .map(ids_jmk_static_stop_id)
+                    .map(|id| scoped_pid_id(IDS_JMK_STATIC_FEED_ID, &id)),
                 delay_seconds: None,
                 estimated_arrival: None,
                 estimated_departure: None,
@@ -964,7 +1106,6 @@ fn ids_jmk_vehicle_records(feed: &FeedMessage) -> Vec<RealtimeRecord> {
                 lon: Some(position.longitude as f64),
                 bearing: position.bearing.map(f64::from),
                 details: VehicleDetails {
-                    route_short_name,
                     speed_kmh: position.speed.map(|speed| f64::from(speed) * 3.6),
                     occupancy_status: occupancy_status_name(vehicle.occupancy_status)
                         .map(str::to_string),
@@ -991,6 +1132,87 @@ fn ids_jmk_vehicle_records(feed: &FeedMessage) -> Vec<RealtimeRecord> {
             })
         })
         .collect()
+}
+
+fn ids_jmk_static_stop_id(realtime_stop_id: &str) -> String {
+    let Some((node, platform)) = realtime_stop_id
+        .strip_prefix('U')
+        .and_then(|value| value.split_once('Z'))
+    else {
+        return realtime_stop_id.to_string();
+    };
+    let (Ok(node), Ok(platform)) = (node.parse::<u64>(), platform.parse::<u64>()) else {
+        return realtime_stop_id.to_string();
+    };
+    format!("U{node}Z{platform}")
+}
+
+async fn enrich_ids_jmk_vehicle_records(
+    pool: &PgPool,
+    records: &mut [RealtimeRecord],
+) -> Result<()> {
+    let trip_ids = records
+        .iter()
+        .filter_map(|record| record.trip_id.clone())
+        .collect::<Vec<_>>();
+    let trip_rows = sqlx::query("SELECT id, route_id, headsign FROM trips WHERE id = ANY($1)")
+        .bind(trip_ids)
+        .fetch_all(pool)
+        .await?;
+    let trips = trip_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                (
+                    row.get::<String, _>("route_id"),
+                    row.get::<Option<String>, _>("headsign"),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let route_ids = records
+        .iter()
+        .filter_map(|record| record.route_id.clone())
+        .chain(trips.values().map(|(route_id, _)| route_id.clone()))
+        .collect::<Vec<_>>();
+    let route_rows = sqlx::query("SELECT id, short_name, mode FROM routes WHERE id = ANY($1)")
+        .bind(route_ids)
+        .fetch_all(pool)
+        .await?;
+    let routes = route_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                (
+                    row.get::<Option<String>, _>("short_name"),
+                    row.get::<String, _>("mode"),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for record in records {
+        if let Some((route_id, headsign)) = record
+            .trip_id
+            .as_ref()
+            .and_then(|trip_id| trips.get(trip_id))
+        {
+            if record.route_id.is_none() {
+                record.route_id = Some(route_id.clone());
+            }
+            record.details.destination = headsign.clone();
+        }
+        if let Some((short_name, mode)) = record
+            .route_id
+            .as_ref()
+            .and_then(|route_id| routes.get(route_id))
+        {
+            record.details.route_short_name = short_name.clone();
+            record.details.vehicle_type = Some(mode.clone());
+        }
+    }
+    Ok(())
 }
 
 async fn run_duk_loop(pool: PgPool, client: Client) {
@@ -1090,6 +1312,7 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
     let records = deduplicate_records(records);
     let mut written = 0usize;
     for chunk in records.chunks(2_000) {
+        ensure_database_storage_headroom()?;
         let sources = chunk.iter().map(|record| record.source).collect::<Vec<_>>();
         let source_feed_ids = chunk
             .iter()
@@ -1305,7 +1528,428 @@ async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<us
         .await?
         .rows_affected() as usize;
     }
+    enqueue_push_events(pool, &records).await?;
     Ok(written)
+}
+
+async fn enqueue_push_events(pool: &PgPool, records: &[&RealtimeRecord]) -> Result<()> {
+    let trip_ids = records
+        .iter()
+        .filter_map(|record| record.trip_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if trip_ids.is_empty() {
+        return Ok(());
+    }
+    let subscriptions = sqlx::query(
+        r#"SELECT subscription.id::text AS subscription_id, subscription.device_id,
+                  subscription.run_id, subscription.service_date, subscription.trip_id,
+                  subscription.boarding_call_id, subscription.boarding_stop_id,
+                  subscription.boarding_stop_sequence, subscription.alighting_stop_sequence,
+                  subscription.connection_service_date, subscription.connection_trip_id,
+                  subscription.minimum_transfer_seconds, subscription.significant_delay_seconds
+           FROM journey_subscriptions subscription
+           JOIN mobile_devices device ON device.id=subscription.device_id AND device.enabled
+           WHERE subscription.trip_id=ANY($1)
+             AND subscription.ended_at IS NULL AND subscription.expires_at>now()"#,
+    )
+    .bind(&trip_ids)
+    .fetch_all(pool)
+    .await?;
+    for subscription in subscriptions {
+        let trip_id = subscription.get::<String, _>("trip_id");
+        let service_date = subscription.get::<NaiveDate, _>("service_date");
+        let subscription_id = subscription.get::<String, _>("subscription_id");
+        let device_id = subscription.get::<uuid::Uuid, _>("device_id");
+        let run_id = subscription.get::<String, _>("run_id");
+        let boarding_call_id = subscription.get::<String, _>("boarding_call_id");
+        let boarding_stop_id = subscription.get::<String, _>("boarding_stop_id");
+        let boarding_sequence = subscription.get::<i32, _>("boarding_stop_sequence");
+        let significant_delay = subscription.get::<i32, _>("significant_delay_seconds");
+        for record in records.iter().filter(|record| {
+            record.trip_id.as_deref() == Some(trip_id.as_str())
+                && record.service_date == Some(service_date)
+        }) {
+            let stop_sequence = record
+                .raw_payload
+                .get("stop_sequence")
+                .and_then(Value::as_u64)
+                .and_then(|value| i32::try_from(value).ok());
+            let base_payload = json!({
+                "subscription_id": subscription_id,
+                "run_id": run_id,
+                "service_date": service_date,
+                "trip_id": trip_id,
+                "boarding_call_id": boarding_call_id,
+                "fetched_at": record.fetched_at
+            });
+            if record.cancellation_status.is_some() {
+                insert_push_event(
+                    pool,
+                    &subscription_id,
+                    device_id,
+                    &format!("{subscription_id}:trip_cancelled"),
+                    "trip_cancelled",
+                    merge_json(
+                        base_payload.clone(),
+                        json!({"cancellation_status":record.cancellation_status}),
+                    ),
+                )
+                .await?;
+            }
+            if let Some(delay) = record
+                .delay_seconds
+                .filter(|delay| *delay >= significant_delay)
+            {
+                insert_push_event(
+                    pool,
+                    &subscription_id,
+                    device_id,
+                    &format!("{subscription_id}:significant_delay"),
+                    "significant_delay",
+                    merge_json(base_payload.clone(), json!({"delay_seconds":delay})),
+                )
+                .await?;
+            }
+            if stop_sequence == Some(boarding_sequence)
+                && let Some(actual_stop_id) = record
+                    .stop_id
+                    .as_deref()
+                    .filter(|id| *id != boarding_stop_id)
+            {
+                insert_push_event(
+                    pool, &subscription_id, device_id,
+                    &format!("{subscription_id}:platform_changed:{actual_stop_id}"), "platform_changed",
+                    merge_json(base_payload.clone(), json!({"scheduled_stop_id":boarding_stop_id,"actual_stop_id":actual_stop_id})),
+                ).await?;
+            }
+            if connection_is_at_risk(pool, &subscription, record, stop_sequence).await? {
+                insert_push_event(
+                    pool,
+                    &subscription_id,
+                    device_id,
+                    &format!("{subscription_id}:connection_at_risk"),
+                    "connection_at_risk",
+                    merge_json(
+                        base_payload.clone(),
+                        json!({"delay_seconds":record.delay_seconds}),
+                    ),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_json(mut base: Value, extra: Value) -> Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        base.extend(extra.clone());
+    }
+    base
+}
+
+async fn insert_push_event(
+    pool: &PgPool,
+    subscription_id: &str,
+    device_id: uuid::Uuid,
+    event_key: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO push_deliveries(subscription_id,device_id,event_key,event_type,payload)
+           VALUES($1::uuid,$2,$3,$4,$5) ON CONFLICT(device_id,event_key) DO NOTHING"#,
+    )
+    .bind(subscription_id)
+    .bind(device_id)
+    .bind(event_key)
+    .bind(event_type)
+    .bind(payload)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn connection_is_at_risk(
+    pool: &PgPool,
+    subscription: &sqlx::postgres::PgRow,
+    record: &RealtimeRecord,
+    stop_sequence: Option<i32>,
+) -> Result<bool> {
+    let Some(connection_trip_id) = subscription.get::<Option<String>, _>("connection_trip_id")
+    else {
+        return Ok(false);
+    };
+    let Some(alighting_sequence) = subscription.get::<Option<i32>, _>("alighting_stop_sequence")
+    else {
+        return Ok(false);
+    };
+    if stop_sequence.is_some() && stop_sequence != Some(alighting_sequence) {
+        return Ok(false);
+    }
+    let Some(delay) = record.delay_seconds else {
+        return Ok(false);
+    };
+    let row = sqlx::query(
+        r#"SELECT
+             (SELECT arrival_time FROM stop_times WHERE trip_id=$1 AND stop_sequence=$2) AS arrival_time,
+             (SELECT departure_time FROM stop_times WHERE trip_id=$3 ORDER BY stop_sequence LIMIT 1) AS departure_time"#,
+    )
+    .bind(subscription.get::<String, _>("trip_id"))
+    .bind(alighting_sequence)
+    .bind(connection_trip_id)
+    .fetch_one(pool)
+    .await?;
+    let (Some(arrival), Some(departure)) = (
+        row.get::<Option<i32>, _>("arrival_time"),
+        row.get::<Option<i32>, _>("departure_time"),
+    ) else {
+        return Ok(false);
+    };
+    let service_date = subscription.get::<NaiveDate, _>("service_date");
+    let connection_date = subscription
+        .get::<Option<NaiveDate>, _>("connection_service_date")
+        .unwrap_or(service_date);
+    let day_offset = (connection_date - service_date).num_days() * 86_400;
+    let remaining = i64::from(departure) + day_offset - i64::from(arrival) - i64::from(delay);
+    let required = i64::from(
+        subscription
+            .get::<Option<i32>, _>("minimum_transfer_seconds")
+            .unwrap_or(0),
+    );
+    Ok(remaining < required)
+}
+
+async fn run_push_delivery_loop(pool: PgPool, client: Client) {
+    loop {
+        if let Err(error) = deliver_next_push(&pool, &client).await {
+            tracing::warn!(error = %error, "push queue processing failed");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        } else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+async fn deliver_next_push(pool: &PgPool, client: &Client) -> Result<()> {
+    sqlx::query("UPDATE push_deliveries SET status='retry',available_at=now() WHERE status='sending' AND available_at<now()-interval '5 minutes'")
+        .execute(pool).await?;
+    let mut transaction = pool.begin().await?;
+    let row = sqlx::query(
+        r#"SELECT delivery.id,delivery.device_id,delivery.event_type,delivery.payload,
+                  delivery.attempts,device.platform,device.push_token
+           FROM push_deliveries delivery JOIN mobile_devices device ON device.id=delivery.device_id
+           WHERE delivery.status IN ('pending','retry') AND delivery.available_at<=now() AND device.enabled
+           ORDER BY delivery.available_at,delivery.created_at
+           FOR UPDATE OF delivery SKIP LOCKED LIMIT 1"#,
+    ).fetch_optional(&mut *transaction).await?;
+    let Some(row) = row else {
+        transaction.commit().await?;
+        return Ok(());
+    };
+    let id = row.get::<uuid::Uuid, _>("id");
+    let device_id = row.get::<uuid::Uuid, _>("device_id");
+    let attempts = row.get::<i32, _>("attempts") + 1;
+    sqlx::query(
+        "UPDATE push_deliveries SET status='sending',attempts=$2,available_at=now() WHERE id=$1",
+    )
+    .bind(id)
+    .bind(attempts)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    let platform = row.get::<String, _>("platform");
+    let token = row.get::<String, _>("push_token");
+    let event_type = row.get::<String, _>("event_type");
+    let payload = row.get::<Value, _>("payload");
+    let result = match platform.as_str() {
+        "android" => send_fcm(client, &token, &event_type, &payload).await,
+        "ios" => send_apns(client, &token, &event_type, &payload).await,
+        _ => PushSendResult::Failed("unsupported_platform"),
+    };
+    match result {
+        PushSendResult::Delivered => {
+            sqlx::query("UPDATE push_deliveries SET status='delivered',delivered_at=now(),last_error_code=NULL WHERE id=$1")
+                .bind(id).execute(pool).await?;
+        }
+        PushSendResult::InvalidToken(code) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query(
+                "UPDATE push_deliveries SET status='failed',last_error_code=$2 WHERE id=$1",
+            )
+            .bind(id)
+            .bind(code)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("UPDATE mobile_devices SET enabled=false,push_token='',updated_at=now() WHERE id=$1")
+                .bind(device_id).execute(&mut *transaction).await?;
+            sqlx::query("UPDATE journey_subscriptions SET ended_at=COALESCE(ended_at,now()) WHERE device_id=$1")
+                .bind(device_id).execute(&mut *transaction).await?;
+            transaction.commit().await?;
+        }
+        PushSendResult::Retry(code) if code.ends_with("_not_configured") => {
+            sqlx::query("UPDATE push_deliveries SET status='retry',attempts=GREATEST(attempts-1,0),available_at=now()+interval '5 minutes',last_error_code=$2 WHERE id=$1")
+                .bind(id).bind(code).execute(pool).await?;
+        }
+        PushSendResult::Retry(code) if attempts < 8 => {
+            let delay = 2_i64.pow(attempts.min(8) as u32).min(300);
+            sqlx::query("UPDATE push_deliveries SET status='retry',available_at=now()+make_interval(secs=>$2),last_error_code=$3 WHERE id=$1")
+                .bind(id).bind(delay as f64).bind(code).execute(pool).await?;
+        }
+        PushSendResult::Retry(code) | PushSendResult::Failed(code) => {
+            sqlx::query(
+                "UPDATE push_deliveries SET status='failed',last_error_code=$2 WHERE id=$1",
+            )
+            .bind(id)
+            .bind(code)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn notification_text(event_type: &str) -> (&'static str, &'static str) {
+    match event_type {
+        "trip_cancelled" => ("Spoj byl zrušen", "Sledovaný spoj byl zrušen."),
+        "platform_changed" => (
+            "Změna nástupiště",
+            "Sledovanému spoji se změnilo nástupiště.",
+        ),
+        "significant_delay" => ("Významné zpoždění", "Sledovaný spoj má významné zpoždění."),
+        "connection_at_risk" => (
+            "Ohrožený přestup",
+            "Kvůli zpoždění může být přestup ohrožen.",
+        ),
+        _ => ("Aktualizace cesty", "Sledovaná cesta se změnila."),
+    }
+}
+
+async fn send_fcm(
+    client: &Client,
+    token: &str,
+    event_type: &str,
+    payload: &Value,
+) -> PushSendResult {
+    let (Ok(project_id), Ok(service_account_json)) = (
+        env::var("FCM_PROJECT_ID"),
+        env::var("FCM_SERVICE_ACCOUNT_JSON"),
+    ) else {
+        return PushSendResult::Retry("fcm_not_configured");
+    };
+    let Ok(account) = serde_json::from_str::<FcmServiceAccount>(&service_account_json) else {
+        return PushSendResult::Failed("fcm_invalid_credentials");
+    };
+    let now = Utc::now().timestamp();
+    let claims = FcmJwtClaims {
+        iss: &account.client_email,
+        scope: "https://www.googleapis.com/auth/firebase.messaging",
+        aud: &account.token_uri,
+        iat: now,
+        exp: now + 3600,
+    };
+    let Ok(key) = EncodingKey::from_rsa_pem(account.private_key.replace("\\n", "\n").as_bytes())
+    else {
+        return PushSendResult::Failed("fcm_invalid_private_key");
+    };
+    let Ok(assertion) = encode(&Header::new(Algorithm::RS256), &claims, &key) else {
+        return PushSendResult::Failed("fcm_jwt_failed");
+    };
+    let token_response = client
+        .post(&account.token_uri)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await;
+    let Ok(token_response) = token_response else {
+        return PushSendResult::Retry("fcm_oauth_unavailable");
+    };
+    if !token_response.status().is_success() {
+        return PushSendResult::Retry("fcm_oauth_rejected");
+    }
+    let Ok(access) = token_response.json::<FcmTokenResponse>().await else {
+        return PushSendResult::Retry("fcm_oauth_invalid_response");
+    };
+    let (title, body) = notification_text(event_type);
+    let response = client.post(format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"))
+        .bearer_auth(access.access_token)
+        .json(&json!({"message":{"token":token,"notification":{"title":title,"body":body},"data":{"event_type":event_type,"payload":payload.to_string()},"android":{"priority":"high"}}}))
+        .send().await;
+    classify_push_response(response, true).await
+}
+
+async fn send_apns(
+    client: &Client,
+    token: &str,
+    event_type: &str,
+    payload: &Value,
+) -> PushSendResult {
+    let (Ok(team_id), Ok(key_id), Ok(private_key), Ok(bundle_id)) = (
+        env::var("APNS_TEAM_ID"),
+        env::var("APNS_KEY_ID"),
+        env::var("APNS_PRIVATE_KEY"),
+        env::var("APNS_BUNDLE_ID"),
+    ) else {
+        return PushSendResult::Retry("apns_not_configured");
+    };
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(key_id);
+    let Ok(key) = EncodingKey::from_ec_pem(private_key.replace("\\n", "\n").as_bytes()) else {
+        return PushSendResult::Failed("apns_invalid_private_key");
+    };
+    let claims = ApnsJwtClaims {
+        iss: &team_id,
+        iat: Utc::now().timestamp(),
+    };
+    let Ok(jwt) = encode(&header, &claims, &key) else {
+        return PushSendResult::Failed("apns_jwt_failed");
+    };
+    let host = if env_bool("APNS_USE_SANDBOX", false) {
+        "https://api.sandbox.push.apple.com"
+    } else {
+        "https://api.push.apple.com"
+    };
+    let (title, body) = notification_text(event_type);
+    let response = client.post(format!("{host}/3/device/{token}"))
+        .bearer_auth(jwt).header("apns-topic", bundle_id).header("apns-push-type", "alert").header("apns-priority", "10")
+        .json(&json!({"aps":{"alert":{"title":title,"body":body},"sound":"default","content-available":1},"event_type":event_type,"payload":payload}))
+        .send().await;
+    classify_push_response(response, false).await
+}
+
+async fn classify_push_response(
+    response: Result<reqwest::Response, reqwest::Error>,
+    fcm: bool,
+) -> PushSendResult {
+    let Ok(response) = response else {
+        return PushSendResult::Retry("push_transport_error");
+    };
+    let status = response.status();
+    if status.is_success() {
+        return PushSendResult::Delivered;
+    }
+    let body = response.text().await.unwrap_or_default();
+    classify_push_status(status, &body, fcm)
+}
+
+fn classify_push_status(status: reqwest::StatusCode, body: &str, fcm: bool) -> PushSendResult {
+    if (!fcm
+        && (status.as_u16() == 410
+            || body.contains("BadDeviceToken")
+            || body.contains("Unregistered")))
+        || (fcm && (status.as_u16() == 404 || body.contains("UNREGISTERED")))
+    {
+        return PushSendResult::InvalidToken("push_token_invalid");
+    }
+    if status.as_u16() == 429 || status.is_server_error() {
+        PushSendResult::Retry("push_provider_temporary_failure")
+    } else {
+        PushSendResult::Failed("push_provider_rejected")
+    }
 }
 
 fn deduplicate_records(records: &[RealtimeRecord]) -> Vec<&RealtimeRecord> {
@@ -1748,6 +2392,50 @@ mod tests {
     }
 
     #[test]
+    fn decodes_ids_jmk_vehicle_with_exact_static_gtfs_ids() {
+        let feed = FeedMessage {
+            header: Some(FeedHeader {
+                timestamp: Some(1_788_000_000),
+            }),
+            entity: vec![FeedEntity {
+                id: "vehicle-update-1".to_string(),
+                trip_update: None,
+                vehicle: Some(VehiclePosition {
+                    trip: Some(TripDescriptor {
+                        trip_id: Some("12345".to_string()),
+                        route_id: Some("L25D99".to_string()),
+                        start_date: Some("20260704".to_string()),
+                        ..Default::default()
+                    }),
+                    position: Some(Position {
+                        latitude: 49.195,
+                        longitude: 16.608,
+                        bearing: Some(90.0),
+                        speed: None,
+                    }),
+                    stop_id: Some("U1424Z1".to_string()),
+                    vehicle: Some(VehicleDescriptor {
+                        id: Some("7015".to_string()),
+                        label: None,
+                    }),
+                    timestamp: Some(1_788_000_000),
+                    ..Default::default()
+                }),
+            }],
+        };
+
+        let records = ids_jmk_vehicle_records(&feed);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].trip_id.as_deref(), Some("ids_jmk_gtfs:12345"));
+        assert_eq!(records[0].route_id.as_deref(), Some("ids_jmk_gtfs:L25D99"));
+        assert_eq!(records[0].stop_id.as_deref(), Some("ids_jmk_gtfs:U1424Z1"));
+        assert_eq!(records[0].delay_seconds, None);
+        assert_eq!(ids_jmk_static_stop_id("U01566Z06"), "U1566Z6");
+        assert_eq!(ids_jmk_static_stop_id("unexpected"), "unexpected");
+    }
+
+    #[test]
     fn normalizes_golemio_vehicle_equipment() {
         let payload = json!({
             "type": "FeatureCollection",
@@ -1793,5 +2481,33 @@ mod tests {
         assert_eq!(records[0].details.air_conditioned, Some(true));
         assert_eq!(records[0].details.usb_chargers, Some(false));
         assert_eq!(records[0].details.destination.as_deref(), Some("Letiště"));
+    }
+
+    #[test]
+    fn classifies_push_provider_failures_without_exposing_tokens() {
+        assert!(matches!(
+            classify_push_status(
+                reqwest::StatusCode::GONE,
+                r#"{"reason":"Unregistered"}"#,
+                false
+            ),
+            PushSendResult::InvalidToken("push_token_invalid")
+        ));
+        assert!(matches!(
+            classify_push_status(
+                reqwest::StatusCode::NOT_FOUND,
+                r#"{"error":{"details":[{"errorCode":"UNREGISTERED"}]}}"#,
+                true
+            ),
+            PushSendResult::InvalidToken("push_token_invalid")
+        ));
+        assert!(matches!(
+            classify_push_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "", true),
+            PushSendResult::Retry("push_provider_temporary_failure")
+        ));
+        assert!(matches!(
+            classify_push_status(reqwest::StatusCode::BAD_REQUEST, "invalid payload", true),
+            PushSendResult::Failed("push_provider_rejected")
+        ));
     }
 }

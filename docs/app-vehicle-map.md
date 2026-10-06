@@ -7,7 +7,7 @@ Mobilní aplikace se připojuje pouze k Cesta API. Klíč Golemio ani adresy reg
 | Provider | Stav | Interval backendu | Licence | Rozšířené vybavení vozidla |
 | --- | --- | ---: | --- | --- |
 | PID / Golemio | aktivní po nastavení `PID_API_TOKEN` | 20 s | CC BY; uvést PID/Golemio | bezbariérovost, klimatizace, USB, typ, rychlost, evidenční číslo, dopravce |
-| IDS JMK | aktivní, bez tajného klíče | 30 s | CC BY 4.0; uvést KORDIS JMK | standardní GTFS-RT; nedostupné položky jsou `null` |
+| IDS JMK (včetně DPMB) | aktivní, bez tajného klíče | 15 s | CC BY 4.0; uvést KORDIS JMK / DPMB | GTFS-RT VehiclePositions; nedostupné položky jsou `null` |
 | DÚK | výchozí stav vypnuto | 30 s po explicitním zapnutí | další poskytování nepotvrzeno | zdrojově závislé |
 
 Backend vrací jen poslední úspěšně uložený stav. Pohyb mapy tedy nikdy nespouští volání Golemio nebo KORDIS.
@@ -113,6 +113,7 @@ Pro první verzi není potřeba WebSocket. Polling 15 sekund je v souladu s obno
 1. Vytvoř bezplatný Golemio API klíč na `https://api.golemio.cz/api-keys`.
 2. Nastav jej pouze na serveru jako `PID_API_TOKEN`.
 3. Ponech `IDS_JMK_VEHICLES_URL=https://kordis-jmk.cz/gtfs/gtfsReal.dat`.
-4. Ponech `DUK_ENABLED=false`, dokud nebude potvrzeno další poskytování dat.
-5. Spusť `docker compose up --build api realtime-worker schedule-updater`.
-6. Ověř `GET /data-sources/status`, `GET /vehicles?bbox=...` a `GET /openapi.json`.
+4. Ponech `IDS_JMK_ENABLED=true`.
+5. Ponech `DUK_ENABLED=false`, dokud nebude potvrzeno další poskytování dat.
+6. Spusť `docker compose up --build api realtime-worker schedule-updater`.
+7. Ověř `GET /data-sources/status`, `GET /vehicles?bbox=...` a `GET /openapi.json`.

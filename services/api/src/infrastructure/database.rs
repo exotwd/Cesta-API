@@ -7,6 +7,9 @@ use crate::config::DatabasePoolConfig;
 
 const PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION: &str =
     include_str!("../../../../infra/postgres/migrations/0021_pid_public_query_performance.sql");
+const ACCOUNT_MANAGEMENT_MIGRATION: &str = include_str!(
+    "../../../../infra/postgres/migrations/0036_account_management_and_saved_routes.sql"
+);
 
 #[cfg(test)]
 const PID_REALTIME_VEHICLE_INDEX_MIGRATION: &str =
@@ -65,7 +68,7 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     // acquiring one advisory lock per historical migration on every API restart once the latest
     // migration is recorded. This keeps service availability independent of catalog latency while
     // the realtime worker is writing heavily.
-    let schema_is_current: bool = sqlx::query_scalar(
+    let base_schema_is_current: bool = sqlx::query_scalar(
         r#"
         SELECT
           EXISTS(
@@ -80,7 +83,71 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .fetch_one(pool)
     .await?;
-    if schema_is_current {
+    if base_schema_is_current {
+        let latest_schema_is_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cesta_schema_migrations WHERE version = '0037_api_telemetry')",
+        )
+        .fetch_one(pool)
+        .await?;
+        if latest_schema_is_current {
+            return Ok(());
+        }
+        apply_startup_migration(
+            pool,
+            "0029_ids_jmk_dpmb",
+            include_str!("../../../../infra/postgres/migrations/0029_ids_jmk_dpmb.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0030_ids_jmk_activation",
+            include_str!("../../../../infra/postgres/migrations/0030_ids_jmk_activation.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0031_stop_headsigns",
+            include_str!("../../../../infra/postgres/migrations/0031_stop_headsigns.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0032_profile_raptor_defaults",
+            include_str!("../../../../infra/postgres/migrations/0032_profile_raptor_defaults.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0033_schedule_import_storage_safety",
+            include_str!(
+                "../../../../infra/postgres/migrations/0033_schedule_import_storage_safety.sql"
+            ),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0034_realtime_unlogged",
+            include_str!("../../../../infra/postgres/migrations/0034_realtime_unlogged.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0035_station_assistance",
+            include_str!("../../../../infra/postgres/migrations/0035_station_assistance.sql"),
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0036_account_management_and_saved_routes",
+            ACCOUNT_MANAGEMENT_MIGRATION,
+        )
+        .await?;
+        apply_startup_migration(
+            pool,
+            "0037_api_telemetry",
+            include_str!("../../../../infra/postgres/migrations/0037_api_telemetry.sql"),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -273,6 +340,62 @@ async fn apply_startup_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
             "../../../../infra/postgres/migrations/0027_routing_geometries_and_walking_cache.sql"
         ),
     )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0029_ids_jmk_dpmb",
+        include_str!("../../../../infra/postgres/migrations/0029_ids_jmk_dpmb.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0030_ids_jmk_activation",
+        include_str!("../../../../infra/postgres/migrations/0030_ids_jmk_activation.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0031_stop_headsigns",
+        include_str!("../../../../infra/postgres/migrations/0031_stop_headsigns.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0032_profile_raptor_defaults",
+        include_str!("../../../../infra/postgres/migrations/0032_profile_raptor_defaults.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0033_schedule_import_storage_safety",
+        include_str!(
+            "../../../../infra/postgres/migrations/0033_schedule_import_storage_safety.sql"
+        ),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0034_realtime_unlogged",
+        include_str!("../../../../infra/postgres/migrations/0034_realtime_unlogged.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0035_station_assistance",
+        include_str!("../../../../infra/postgres/migrations/0035_station_assistance.sql"),
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0036_account_management_and_saved_routes",
+        ACCOUNT_MANAGEMENT_MIGRATION,
+    )
+    .await?;
+    apply_startup_migration(
+        pool,
+        "0037_api_telemetry",
+        include_str!("../../../../infra/postgres/migrations/0037_api_telemetry.sql"),
+    )
     .await
 }
 
@@ -348,7 +471,20 @@ async fn apply_nontransactional_startup_migration(
 
 #[cfg(test)]
 mod tests {
-    use super::{PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION, PID_REALTIME_VEHICLE_INDEX_MIGRATION};
+    use super::{
+        ACCOUNT_MANAGEMENT_MIGRATION, PID_PUBLIC_QUERY_PERFORMANCE_MIGRATION,
+        PID_REALTIME_VEHICLE_INDEX_MIGRATION,
+    };
+
+    #[test]
+    fn account_migration_contains_auth_version_routes_and_push_queue() {
+        let migration = ACCOUNT_MANAGEMENT_MIGRATION.to_ascii_lowercase();
+
+        assert!(migration.contains("add column if not exists auth_version"));
+        assert!(migration.contains("create table if not exists password_reset_tokens"));
+        assert!(migration.contains("create table if not exists saved_routes"));
+        assert!(migration.contains("create table if not exists push_deliveries"));
+    }
 
     #[test]
     fn pid_public_stop_projection_excludes_indirect_source_mappings() {

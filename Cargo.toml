@@ -27,6 +27,7 @@ chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 futures-util = "0.3"
+fs2 = "0.4"
 geo-types = { version = "0.7", features = ["serde"] }
 hex = "0.4"
 jsonwebtoken = "9"
@@ -45,7 +46,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "request-id", "set-header", "trace"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "request-id", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }

@@ -235,9 +235,11 @@ impl RaptorTimetable {
         self.has_unverified_services
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn departure_times_from_stops(
         &self,
         stop_ids: &[String],
+        access_transfers: &[Transfer],
         departure_time: u32,
         window_seconds: u32,
         max_departures: usize,
@@ -252,18 +254,29 @@ impl RaptorTimetable {
 
         let allowed_modes = modes.iter().cloned().collect::<HashSet<_>>();
         let latest_departure = departure_time.saturating_add(window_seconds);
-        let coverage_probe_count = max_departures.saturating_sub(1).min(11);
-        for probe_index in 1..=coverage_probe_count {
-            let offset = ((window_seconds as u64 * probe_index as u64)
-                / (coverage_probe_count as u64 + 1)) as u32;
-            selected.insert(departure_time.saturating_add(offset));
+        let requested_stop_ids = stop_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut origin_access_seconds = HashMap::<usize, u32>::new();
+        for stop_id in stop_ids {
+            if let Some(stop_index) = self.stop_indices.get(stop_id).copied() {
+                origin_access_seconds.insert(stop_index, 0);
+            }
+        }
+        for transfer in access_transfers {
+            if !requested_stop_ids.contains(transfer.from_stop_id.as_str()) {
+                continue;
+            }
+            let Some(stop_index) = self.stop_indices.get(&transfer.to_stop_id).copied() else {
+                continue;
+            };
+            origin_access_seconds
+                .entry(stop_index)
+                .and_modify(|known| *known = (*known).min(transfer.min_transfer_seconds))
+                .or_insert(transfer.min_transfer_seconds);
         }
 
-        let mut route_departures = Vec::<Vec<u32>>::new();
-        for stop_index in stop_ids
-            .iter()
-            .filter_map(|stop_id| self.stop_indices.get(stop_id).copied())
-        {
+        for (stop_index, access_seconds) in origin_access_seconds {
+            let earliest_vehicle_departure = departure_time.saturating_add(access_seconds);
+            let latest_vehicle_departure = latest_departure.saturating_add(access_seconds);
             for &(route_index, route_stop_index) in
                 self.stop_routes.get(stop_index).into_iter().flatten()
             {
@@ -281,30 +294,31 @@ impl RaptorTimetable {
                     continue;
                 };
                 let first_candidate = indices.partition_point(|trip_index| {
-                    trips[*trip_index].stop_times[route_stop_index].departure_time < departure_time
+                    trips[*trip_index].stop_times[route_stop_index].departure_time
+                        < earliest_vehicle_departure
                 });
                 for trip_index in &indices[first_candidate..] {
                     let stop_time = &trips[*trip_index].stop_times[route_stop_index];
-                    if stop_time.departure_time > latest_departure {
+                    if stop_time.departure_time > latest_vehicle_departure {
                         break;
                     }
                     if stop_time.pickup_allowed {
-                        route_departures.push(vec![stop_time.departure_time]);
-                        break;
+                        selected.insert(stop_time.departure_time.saturating_sub(access_seconds));
                     }
                 }
             }
         }
 
-        route_departures.sort_by_key(|departures| departures[0]);
-        for departures in route_departures {
-            if selected.len() >= max_departures {
-                break;
-            }
-            selected.extend(departures);
+        let departures = selected.into_iter().collect::<Vec<_>>();
+        if departures.len() <= max_departures {
+            return departures;
         }
-
-        selected.into_iter().take(max_departures).collect()
+        (0..max_departures)
+            .map(|sample_index| {
+                let candidate_index = sample_index * (departures.len() - 1) / (max_departures - 1);
+                departures[candidate_index]
+            })
+            .collect()
     }
 }
 
@@ -316,6 +330,8 @@ pub struct RaptorRequest {
     pub departure_time: u32,
     pub max_transfers: u32,
     pub min_transfer_seconds: u32,
+    /// Extra user-requested margin added after every interchange movement.
+    pub transfer_buffer_seconds: u32,
     pub modes: Vec<TransportMode>,
     pub allow_unverified_services: bool,
     pub realtime: Arc<RaptorRealtimeData>,
@@ -471,6 +487,198 @@ pub fn raptor_with_stats(
     request: RaptorRequest,
 ) -> RaptorSearchOutput {
     raptor_with_stats_excluding_routes(timetable, request, &HashSet::new())
+}
+
+/// Enumerate bounded direct services between the explicitly expanded endpoints.
+///
+/// RAPTOR keeps earliest-arrival labels, so a quicker service can suppress a
+/// useful direct line. This complements those labels with actual direct trips,
+/// without following walking links or depending on sampled range departures.
+/// The departure window and aggregate journey times include realtime; leg times
+/// remain scheduled, matching the regular RAPTOR response convention.
+pub fn direct_journeys(
+    timetable: &RaptorTimetable,
+    request: &RaptorRequest,
+    window_seconds: u32,
+    max_candidates: usize,
+) -> Vec<Journey> {
+    if max_candidates == 0 {
+        return Vec::new();
+    }
+    let allowed_modes = request.modes.iter().collect::<HashSet<_>>();
+    let latest_departure = request.departure_time.saturating_add(window_seconds);
+    let bounds_by_route = request.realtime.delay_bounds_by_route(timetable);
+    let mut destination_positions = HashMap::<usize, BTreeSet<usize>>::new();
+    for stop_id in &request.to_stop_ids {
+        let Some(&stop_index) = timetable.stop_indices.get(stop_id) else {
+            continue;
+        };
+        for &(route_index, position) in &timetable.stop_routes[stop_index] {
+            destination_positions
+                .entry(route_index)
+                .or_default()
+                .insert(position);
+        }
+    }
+    let mut endpoint_pairs = BTreeSet::new();
+    for stop_id in &request.from_stop_ids {
+        let Some(&stop_index) = timetable.stop_indices.get(stop_id) else {
+            continue;
+        };
+        for &(route_index, board) in &timetable.stop_routes[stop_index] {
+            if let Some(destinations) = destination_positions.get(&route_index) {
+                for &alight in destinations.range((board + 1)..) {
+                    endpoint_pairs.insert((route_index, board, alight));
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::<DirectJourneyCandidate>::new();
+    for (route_index, board, alight) in endpoint_pairs {
+        let route = &timetable.routes[route_index];
+        if !allowed_modes.is_empty() && !allowed_modes.contains(&route.trips[0].mode) {
+            continue;
+        }
+        let departures = if request.allow_unverified_services {
+            &route.departures_by_stop_index[board]
+        } else {
+            &route.verified_departures_by_stop_index[board]
+        };
+        let bounds = bounds_by_route[route_index];
+        let earliest_scheduled = request
+            .departure_time
+            .saturating_sub(bounds.max_positive_seconds);
+        let latest_scheduled = latest_departure.saturating_add(bounds.max_early_seconds);
+        let first = departures.partition_point(|&trip_index| {
+            route.trips[trip_index].stop_times[board].departure_time < earliest_scheduled
+        });
+        let mut pair_candidates = Vec::new();
+        for &trip_index in &departures[first..] {
+            let trip = &route.trips[trip_index];
+            let boarded_at = &trip.stop_times[board];
+            if boarded_at.departure_time > latest_scheduled {
+                break;
+            }
+            let alighted_at = &trip.stop_times[alight];
+            if !boarded_at.pickup_allowed || !alighted_at.drop_off_allowed {
+                continue;
+            }
+            let departure_time = request.realtime.adjusted_time(
+                &trip.trip_id,
+                &boarded_at.stop_id,
+                boarded_at.departure_time,
+            );
+            if departure_time < request.departure_time || departure_time > latest_departure {
+                continue;
+            }
+            let arrival_time = request.realtime.adjusted_time(
+                &trip.trip_id,
+                &alighted_at.stop_id,
+                alighted_at.arrival_time,
+            );
+            if arrival_time < departure_time {
+                continue;
+            }
+            let mut warnings = Vec::new();
+            if departure_time != boarded_at.departure_time
+                || arrival_time != alighted_at.arrival_time
+            {
+                warnings.push("realtime_routing_applied".to_string());
+            }
+            pair_candidates.push(DirectJourneyCandidate {
+                trip_id: trip.trip_id.clone(),
+                route_id: trip.route_id.clone(),
+                from_stop_id: boarded_at.stop_id.clone(),
+                to_stop_id: alighted_at.stop_id.clone(),
+                journey: Journey {
+                    id: String::new(),
+                    legs: vec![JourneyLeg {
+                        from_stop_id: boarded_at.stop_id.clone(),
+                        to_stop_id: alighted_at.stop_id.clone(),
+                        route_id: Some(trip.route_id.clone()),
+                        trip_id: Some(trip.trip_id.clone()),
+                        departure_time: boarded_at.departure_time,
+                        arrival_time: alighted_at.arrival_time,
+                        mode: trip.mode.clone(),
+                        warnings,
+                        geometry: None,
+                    }],
+                    departure_time,
+                    arrival_time,
+                    duration_seconds: arrival_time - departure_time,
+                    transfer_count: 0,
+                    walking_distance_meters: 0,
+                    realtime_status: RealtimeStatus::Unavailable,
+                    risk_score: 0.0,
+                    labels: Vec::new(),
+                },
+            });
+            // Keep memory bounded even if a busy route has many departures.
+            // Realtime can reorder them, so retain the best rather than stopping
+            // after the first scheduled departures.
+            pair_candidates.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+            pair_candidates.truncate(max_candidates);
+        }
+        candidates.extend(pair_candidates);
+    }
+    candidates.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+    let mut identities = HashSet::new();
+    candidates.retain(|candidate| identities.insert(candidate.identity()));
+
+    // Reserve one earliest candidate per public line before filling the limit.
+    // Pattern partitions and later departures of a frequent line must not crowd
+    // out another direct line serving the same selected stops.
+    let mut routes = HashSet::new();
+    let mut selected = BTreeSet::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if routes.insert(&candidate.route_id) {
+            selected.insert(index);
+            if selected.len() == max_candidates {
+                break;
+            }
+        }
+    }
+    for index in 0..candidates.len() {
+        if selected.len() == max_candidates {
+            break;
+        }
+        selected.insert(index);
+    }
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| selected.contains(&index).then_some(candidate.journey))
+        .collect()
+}
+
+struct DirectJourneyCandidate {
+    trip_id: String,
+    route_id: String,
+    from_stop_id: String,
+    to_stop_id: String,
+    journey: Journey,
+}
+
+impl DirectJourneyCandidate {
+    fn sort_key(&self) -> (u32, u32, &str, &str, &str, &str) {
+        (
+            self.journey.departure_time,
+            self.journey.arrival_time,
+            &self.route_id,
+            &self.trip_id,
+            &self.from_stop_id,
+            &self.to_stop_id,
+        )
+    }
+
+    fn identity(&self) -> (String, String, String) {
+        (
+            self.trip_id.clone(),
+            self.from_stop_id.clone(),
+            self.to_stop_id.clone(),
+        )
+    }
 }
 
 pub fn raptor_with_stats_excluding_routes(
@@ -633,36 +841,36 @@ pub fn raptor_with_stats_excluding_routes(
                         &stop_time.stop_id,
                         stop_time.arrival_time,
                     );
-                    if effective_arrival_time >= best_target
-                        || effective_arrival_time >= best[stop_index]
+                    if effective_arrival_time < best_target
+                        && effective_arrival_time < best[stop_index]
                     {
-                        continue;
+                        let boarded_at = &trip.stop_times[board_index];
+                        let effective_departure_time = realtime.adjusted_time(
+                            &trip.trip_id,
+                            &boarded_at.stop_id,
+                            boarded_at.departure_time,
+                        );
+                        let boarded_stop = timetable.routes[route_index].stop_indices[board_index];
+                        rounds[round][stop_index] = effective_arrival_time;
+                        best[stop_index] = effective_arrival_time;
+                        mark_raptor_stop(stop_index, &mut marked, &mut marked_flags);
+                        parents[round].insert(
+                            stop_index,
+                            RaptorParent::Ride {
+                                previous_stop: boarded_stop,
+                                previous_round: round - 1,
+                                trip_id: trip.trip_id.clone(),
+                                route_id: trip.route_id.clone(),
+                                mode: trip.mode.clone(),
+                                departure_time: boarded_at.departure_time,
+                                arrival_time: stop_time.arrival_time,
+                                used_official_change_time,
+                                realtime_applied: effective_departure_time
+                                    != boarded_at.departure_time
+                                    || effective_arrival_time != stop_time.arrival_time,
+                            },
+                        );
                     }
-                    let boarded_at = &trip.stop_times[board_index];
-                    let effective_departure_time = realtime.adjusted_time(
-                        &trip.trip_id,
-                        &boarded_at.stop_id,
-                        boarded_at.departure_time,
-                    );
-                    let boarded_stop = timetable.routes[route_index].stop_indices[board_index];
-                    rounds[round][stop_index] = effective_arrival_time;
-                    best[stop_index] = effective_arrival_time;
-                    mark_raptor_stop(stop_index, &mut marked, &mut marked_flags);
-                    parents[round].insert(
-                        stop_index,
-                        RaptorParent::Ride {
-                            previous_stop: boarded_stop,
-                            previous_round: round - 1,
-                            trip_id: trip.trip_id.clone(),
-                            route_id: trip.route_id.clone(),
-                            mode: trip.mode.clone(),
-                            departure_time: boarded_at.departure_time,
-                            arrival_time: stop_time.arrival_time,
-                            used_official_change_time,
-                            realtime_applied: effective_departure_time != boarded_at.departure_time
-                                || effective_arrival_time != stop_time.arrival_time,
-                        },
-                    );
                 }
 
                 let previous_arrival = rounds[round - 1][stop_index];
@@ -672,17 +880,30 @@ pub fn raptor_with_stats_excluding_routes(
                 let (transfer_slack, used_official_change_time) =
                     match parents[round - 1].get(&stop_index) {
                         None if round == 1 => (0, false),
-                        Some(RaptorParent::Walk { .. }) => (0, false),
+                        Some(RaptorParent::Walk { .. }) => (request.transfer_buffer_seconds, false),
                         Some(RaptorParent::Ride { .. }) => match timetable
                             .minimum_change_seconds_by_stop
                             .get(stop_index)
                             .copied()
                             .flatten()
                         {
-                            Some(seconds) => (seconds, true),
-                            None => (request.min_transfer_seconds, false),
+                            Some(seconds) => (
+                                seconds.saturating_add(request.transfer_buffer_seconds),
+                                true,
+                            ),
+                            None => (
+                                request
+                                    .min_transfer_seconds
+                                    .saturating_add(request.transfer_buffer_seconds),
+                                false,
+                            ),
                         },
-                        _ => (request.min_transfer_seconds, false),
+                        _ => (
+                            request
+                                .min_transfer_seconds
+                                .saturating_add(request.transfer_buffer_seconds),
+                            false,
+                        ),
                     };
                 let ready_time = previous_arrival.saturating_add(transfer_slack);
                 let catchable = earliest_catchable_trip(
@@ -1294,6 +1515,287 @@ mod tests {
 
     use super::*;
 
+    fn direct_scan_trip(trip_id: &str, route_id: &str, departure: u32, arrival: u32) -> RaptorTrip {
+        RaptorTrip {
+            trip_id: trip_id.into(),
+            route_id: route_id.into(),
+            mode: TransportMode::Tram,
+            service_verified: true,
+            stop_times: vec![
+                RaptorStopTime {
+                    stop_id: "karlovo".into(),
+                    departure_time: departure,
+                    arrival_time: departure,
+                    pickup_allowed: true,
+                    drop_off_allowed: true,
+                },
+                RaptorStopTime {
+                    stop_id: "strossmayerovo".into(),
+                    departure_time: arrival,
+                    arrival_time: arrival,
+                    pickup_allowed: true,
+                    drop_off_allowed: true,
+                },
+            ],
+        }
+    }
+
+    fn direct_scan_request() -> RaptorRequest {
+        RaptorRequest {
+            from_stop_ids: vec!["karlovo".into()],
+            to_stop_ids: vec!["strossmayerovo".into()],
+            extra_transfers: Vec::new(),
+            departure_time: 8 * 3600,
+            max_transfers: 0,
+            min_transfer_seconds: 180,
+            transfer_buffer_seconds: 0,
+            modes: Vec::new(),
+            allow_unverified_services: false,
+            realtime: Arc::new(RaptorRealtimeData::default()),
+        }
+    }
+
+    #[test]
+    fn direct_scan_preserves_a_line_suppressed_by_earliest_arrival_labels() {
+        let request = direct_scan_request();
+        let start = request.departure_time;
+        let timetable = RaptorTimetable::new(
+            vec![
+                direct_scan_trip("17-fast", "17", start, start + 600),
+                direct_scan_trip("6-direct", "6", start + 60, start + 780),
+            ],
+            Vec::new(),
+        );
+        let regular = raptor(&timetable, request.clone());
+        assert_eq!(regular.len(), 1);
+        assert_eq!(regular[0].legs[0].route_id.as_deref(), Some("17"));
+
+        let direct = direct_journeys(&timetable, &request, 1800, 10);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(direct[1].legs[0].route_id.as_deref(), Some("6"));
+        assert_eq!(direct[1].duration_seconds, 720);
+        assert_eq!(direct[1].walking_distance_meters, 0);
+        assert_eq!(direct[1].transfer_count, 0);
+    }
+
+    #[test]
+    fn direct_scan_honors_modes_verified_services_and_departure_window() {
+        let mut request = direct_scan_request();
+        let start = request.departure_time;
+        let mut unverified = direct_scan_trip("unverified", "6", start + 60, start + 600);
+        unverified.service_verified = false;
+        let mut bus = direct_scan_trip("bus", "bus", start + 120, start + 720);
+        bus.mode = TransportMode::Bus;
+        let timetable = RaptorTimetable::new(
+            vec![
+                unverified,
+                bus,
+                direct_scan_trip("too-early", "6", start - 1, start + 600),
+                direct_scan_trip("boundary", "6", start + 1800, start + 2400),
+                direct_scan_trip("too-late", "6", start + 1801, start + 2500),
+            ],
+            Vec::new(),
+        );
+        request.modes = vec![TransportMode::Tram];
+        let verified = direct_journeys(&timetable, &request, 1800, 10);
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].legs[0].trip_id.as_deref(), Some("boundary"));
+        request.allow_unverified_services = true;
+        let all = direct_journeys(&timetable, &request, 1800, 10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].legs[0].trip_id.as_deref(), Some("unverified"));
+    }
+
+    #[test]
+    fn direct_scan_handles_delayed_held_trips_and_early_departures() {
+        let mut request = direct_scan_request();
+        let start = request.departure_time;
+        let timetable = RaptorTimetable::new(
+            vec![
+                direct_scan_trip("held", "6", start - 120, start + 600),
+                direct_scan_trip("already-left", "6", start + 30, start + 750),
+                direct_scan_trip("early-boundary", "6", start + 1810, start + 2530),
+            ],
+            Vec::new(),
+        );
+        request.realtime = Arc::new(RaptorRealtimeData::from_updates([
+            RaptorRealtimeUpdate {
+                trip_id: "held".into(),
+                stop_id: None,
+                delay_seconds: 180,
+            },
+            RaptorRealtimeUpdate {
+                trip_id: "already-left".into(),
+                stop_id: None,
+                delay_seconds: -60,
+            },
+            RaptorRealtimeUpdate {
+                trip_id: "early-boundary".into(),
+                stop_id: None,
+                delay_seconds: -10,
+            },
+        ]));
+        let direct = direct_journeys(&timetable, &request, 1800, 10);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(direct[0].legs[0].trip_id.as_deref(), Some("held"));
+        assert_eq!(direct[0].departure_time, start + 60);
+        assert_eq!(direct[0].arrival_time, start + 780);
+        assert_eq!(direct[0].duration_seconds, 720);
+        assert_eq!(direct[0].legs[0].departure_time, start - 120);
+        assert_eq!(direct[0].legs[0].arrival_time, start + 600);
+        assert!(
+            direct[0].legs[0]
+                .warnings
+                .contains(&"realtime_routing_applied".to_string())
+        );
+        assert_eq!(direct[1].departure_time, start + 1800);
+    }
+
+    #[test]
+    fn direct_scan_requires_correct_direction_and_allowed_boarding() {
+        let request = direct_scan_request();
+        let start = request.departure_time;
+        let mut reverse = direct_scan_trip("reverse", "6", start, start + 600);
+        reverse.stop_times[0].stop_id = "strossmayerovo".into();
+        reverse.stop_times[1].stop_id = "karlovo".into();
+        let mut no_pickup = direct_scan_trip("no-pickup", "6", start, start + 600);
+        no_pickup.stop_times[0].pickup_allowed = false;
+        let mut no_dropoff = direct_scan_trip("no-dropoff", "6", start, start + 600);
+        no_dropoff.stop_times[1].drop_off_allowed = false;
+        let mut wrong_platform = direct_scan_trip("wrong-platform", "6", start, start + 600);
+        wrong_platform.stop_times[0].stop_id = "other-platform".into();
+        let timetable = RaptorTimetable::new(
+            vec![reverse, no_pickup, no_dropoff, wrong_platform],
+            Vec::new(),
+        );
+        assert!(direct_journeys(&timetable, &request, 1800, 10).is_empty());
+        let mut same_stop = request;
+        same_stop.to_stop_ids = same_stop.from_stop_ids.clone();
+        assert!(direct_journeys(&timetable, &same_stop, 1800, 10).is_empty());
+    }
+
+    #[test]
+    fn direct_scan_does_not_follow_extra_walking_links() {
+        let mut request = direct_scan_request();
+        let start = request.departure_time;
+        let mut trip = direct_scan_trip("nearby", "17", start + 300, start + 900);
+        trip.stop_times[0].stop_id = "nearby-platform".into();
+        let access = Transfer {
+            from_stop_id: "karlovo".into(),
+            to_stop_id: "nearby-platform".into(),
+            min_transfer_seconds: 60,
+            distance_meters: Some(100),
+            walking_geometry: None,
+            confidence: CoordinateConfidence::High,
+            accessibility_level: None,
+            source: "fixture".into(),
+        };
+        let timetable = RaptorTimetable::new(vec![trip], vec![access.clone()]);
+        request.extra_transfers.push(access);
+        assert!(direct_journeys(&timetable, &request, 1800, 10).is_empty());
+        assert!(!raptor(&timetable, request).is_empty());
+    }
+
+    #[test]
+    fn direct_scan_caps_realtime_reordered_candidates_by_effective_departure() {
+        let mut request = direct_scan_request();
+        let start = request.departure_time;
+        let timetable = RaptorTimetable::new(
+            vec![
+                direct_scan_trip("delayed", "6", start - 60, start + 660),
+                direct_scan_trip("on-time", "6", start + 60, start + 780),
+            ],
+            Vec::new(),
+        );
+        request.realtime = Arc::new(RaptorRealtimeData::from_updates([RaptorRealtimeUpdate {
+            trip_id: "delayed".into(),
+            stop_id: None,
+            delay_seconds: 600,
+        }]));
+        let direct = direct_journeys(&timetable, &request, 1800, 1);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].legs[0].trip_id.as_deref(), Some("on-time"));
+    }
+
+    #[test]
+    fn direct_scan_reserves_each_line_and_is_deterministic_and_bounded() {
+        let mut request = direct_scan_request();
+        let start = request.departure_time;
+        request.from_stop_ids.push("karlovo".into());
+        request.to_stop_ids.push("strossmayerovo".into());
+        let mut trips = (0..10)
+            .map(|index| {
+                direct_scan_trip(
+                    &format!("17-{index}"),
+                    "17",
+                    start + index * 60,
+                    start + index * 60 + 600,
+                )
+            })
+            .collect::<Vec<_>>();
+        trips.push(direct_scan_trip("6-later", "6", start + 1200, start + 1920));
+        let timetable = RaptorTimetable::new(trips.clone(), Vec::new());
+        trips.reverse();
+        let reversed = RaptorTimetable::new(trips, Vec::new());
+        assert!(direct_journeys(&timetable, &request, 1800, 0).is_empty());
+        let direct = direct_journeys(&timetable, &request, 1800, 2);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(direct[0].legs[0].trip_id.as_deref(), Some("17-0"));
+        assert_eq!(direct[1].legs[0].trip_id.as_deref(), Some("6-later"));
+        let reversed_direct = direct_journeys(&reversed, &request, 1800, 2);
+        assert_eq!(
+            direct
+                .iter()
+                .map(|journey| &journey.legs[0].trip_id)
+                .collect::<Vec<_>>(),
+            reversed_direct
+                .iter()
+                .map(|journey| &journey.legs[0].trip_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_scan_finds_departures_omitted_by_range_sampling() {
+        let request = direct_scan_request();
+        let start = request.departure_time;
+        let mut trips = (1..=30)
+            .map(|minute| {
+                let mut trip = direct_scan_trip(
+                    &format!("crowding-{minute}"),
+                    "local",
+                    start + minute * 60,
+                    start + (minute + 10) * 60,
+                );
+                trip.stop_times[1].stop_id = "local-destination".into();
+                trip
+            })
+            .collect::<Vec<_>>();
+        trips.push(direct_scan_trip(
+            "direct-unsampled",
+            "6",
+            start + 840,
+            start + 1560,
+        ));
+        let timetable = RaptorTimetable::new(trips, Vec::new());
+        let sampled = timetable.departure_times_from_stops(
+            &request.from_stop_ids,
+            &[],
+            start,
+            1800,
+            4,
+            &[],
+            false,
+        );
+        assert!(!sampled.contains(&(start + 840)));
+        let direct = direct_journeys(&timetable, &request, 1800, 10);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(
+            direct[0].legs[0].trip_id.as_deref(),
+            Some("direct-unsampled")
+        );
+    }
+
     #[test]
     fn direct_trip() {
         let journeys = earliest_arrivals(
@@ -1485,6 +1987,7 @@ mod tests {
                 departure_time: 8 * 3600,
                 max_transfers: 2,
                 min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1495,6 +1998,68 @@ mod tests {
         assert_eq!(journeys[0].transfer_count, 1);
         assert_eq!(journeys[0].arrival_time, 9 * 3600 + 1800);
         assert_eq!(journeys[1].transfer_count, 0);
+    }
+
+    #[test]
+    fn raptor_adds_requested_buffer_after_interchange() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![
+                RaptorTrip {
+                    trip_id: "feeder".into(),
+                    route_id: "feeder-route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![stop_time("a", 8 * 3600), stop_time("b", 9 * 3600)],
+                },
+                RaptorTrip {
+                    trip_id: "tight".into(),
+                    route_id: "connection-route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("b", 9 * 3600 + 10 * 60),
+                        stop_time("c", 10 * 3600),
+                    ],
+                },
+                RaptorTrip {
+                    trip_id: "buffered".into(),
+                    route_id: "connection-route".into(),
+                    mode: TransportMode::Train,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("b", 9 * 3600 + 20 * 60),
+                        stop_time("c", 10 * 3600 + 10 * 60),
+                    ],
+                },
+            ],
+            Vec::new(),
+        );
+
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["a".into()],
+                to_stop_ids: vec!["c".into()],
+                extra_transfers: Vec::new(),
+                departure_time: 8 * 3600,
+                max_transfers: 1,
+                min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 10 * 60,
+                modes: vec![TransportMode::Train],
+                allow_unverified_services: false,
+                realtime: Arc::new(RaptorRealtimeData::default()),
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].legs[1].trip_id.as_deref(), Some("buffered"));
     }
 
     #[test]
@@ -1538,6 +2103,7 @@ mod tests {
             departure_time: 8 * 3600,
             max_transfers: 0,
             min_transfer_seconds: 180,
+            transfer_buffer_seconds: 0,
             modes: vec![TransportMode::Tram, TransportMode::Metro],
             allow_unverified_services: false,
             realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1603,6 +2169,7 @@ mod tests {
                 departure_time: 8 * 3600,
                 max_transfers: 1,
                 min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Bus],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1666,6 +2233,7 @@ mod tests {
                 departure_time: 8 * 3600,
                 max_transfers: 1,
                 min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::from_updates([RaptorRealtimeUpdate {
@@ -1725,6 +2293,7 @@ mod tests {
                 departure_time: 8 * 3600,
                 max_transfers: 1,
                 min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::from_updates([RaptorRealtimeUpdate {
@@ -1781,6 +2350,7 @@ mod tests {
                 departure_time: 8 * 3600,
                 max_transfers: 1,
                 min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Bus],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1794,6 +2364,78 @@ mod tests {
         assert_eq!(journeys[0].legs[0].arrival_time, 8 * 3600 + 180);
         assert_eq!(journeys[0].departure_time, 8 * 3600 + 60);
         assert_eq!(journeys[0].walking_distance_meters, 150);
+    }
+
+    #[test]
+    fn nearby_access_does_not_hide_better_trip_at_selected_origin() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![
+                RaptorTrip {
+                    trip_id: "direct-from-selected-origin".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Tram,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("nearby-earlier-stop", 7 * 3600 + 58 * 60),
+                        stop_time("selected-origin-platform", 8 * 3600 + 4 * 60),
+                        stop_time("target", 8 * 3600 + 20 * 60),
+                    ],
+                },
+                RaptorTrip {
+                    trip_id: "later-from-nearby-stop".into(),
+                    route_id: "route".into(),
+                    mode: TransportMode::Tram,
+                    service_verified: true,
+                    stop_times: vec![
+                        stop_time("nearby-earlier-stop", 8 * 3600 + 10 * 60),
+                        stop_time("selected-origin-platform", 8 * 3600 + 12 * 60),
+                        stop_time("target", 8 * 3600 + 28 * 60),
+                    ],
+                },
+            ],
+            Vec::new(),
+        );
+
+        let journeys = raptor(
+            &timetable,
+            RaptorRequest {
+                from_stop_ids: vec!["selected-origin".into(), "selected-origin-platform".into()],
+                to_stop_ids: vec!["target".into()],
+                extra_transfers: vec![Transfer {
+                    from_stop_id: "selected-origin".into(),
+                    to_stop_id: "nearby-earlier-stop".into(),
+                    min_transfer_seconds: 388,
+                    distance_meters: Some(485),
+                    walking_geometry: None,
+                    confidence: CoordinateConfidence::High,
+                    accessibility_level: None,
+                    source: "endpoint_access".into(),
+                }],
+                departure_time: 8 * 3600,
+                max_transfers: 0,
+                min_transfer_seconds: 5 * 60,
+                transfer_buffer_seconds: 0,
+                modes: vec![TransportMode::Tram],
+                allow_unverified_services: false,
+                realtime: Arc::new(RaptorRealtimeData::default()),
+            },
+        );
+
+        assert_eq!(journeys.len(), 1);
+        assert_eq!(journeys[0].legs.len(), 1);
+        assert_eq!(
+            journeys[0].legs[0].trip_id.as_deref(),
+            Some("direct-from-selected-origin")
+        );
+        assert_eq!(journeys[0].departure_time, 8 * 3600 + 4 * 60);
+        assert_eq!(journeys[0].arrival_time, 8 * 3600 + 20 * 60);
     }
 
     #[test]
@@ -1851,6 +2493,7 @@ mod tests {
                 departure_time: 0,
                 max_transfers: 1,
                 min_transfer_seconds: 0,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1911,6 +2554,7 @@ mod tests {
                 departure_time: 7 * 3600,
                 max_transfers: 0,
                 min_transfer_seconds: 0,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1961,6 +2605,7 @@ mod tests {
                 departure_time: 4 * 3600,
                 max_transfers: 0,
                 min_transfer_seconds: 300,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),
@@ -1972,7 +2617,7 @@ mod tests {
     }
 
     #[test]
-    fn timetable_samples_coverage_probes_for_range_search() {
+    fn timetable_profiles_real_departure_events() {
         let stop_time = |stop: &str, time| RaptorStopTime {
             stop_id: stop.to_string(),
             arrival_time: time,
@@ -2012,6 +2657,7 @@ mod tests {
 
         let departures = timetable.departure_times_from_stops(
             &["a".to_string()],
+            &[],
             8 * 3600,
             1800,
             3,
@@ -2019,11 +2665,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(departures, vec![8 * 3600, 8 * 3600 + 600, 8 * 3600 + 1200]);
+        assert_eq!(departures, vec![8 * 3600, 8 * 3600 + 900]);
     }
 
     #[test]
-    fn timetable_keeps_later_coverage_when_origin_departures_are_crowded() {
+    fn timetable_samples_the_full_window_when_origin_departures_are_crowded() {
         let stop_time = |stop: &str, time| RaptorStopTime {
             stop_id: stop.to_string(),
             arrival_time: time,
@@ -2057,6 +2703,7 @@ mod tests {
 
         let departures = timetable.departure_times_from_stops(
             &["a".to_string()],
+            &[],
             8 * 3600,
             3600,
             6,
@@ -2064,7 +2711,54 @@ mod tests {
             false,
         );
 
-        assert!(departures.contains(&(8 * 3600 + 50 * 60)));
+        assert!(departures.contains(&(8 * 3600 + 55 * 60)));
+    }
+
+    #[test]
+    fn timetable_profiles_vehicle_departures_from_coordinate_access_time() {
+        let stop_time = |stop: &str, time| RaptorStopTime {
+            stop_id: stop.to_string(),
+            arrival_time: time,
+            departure_time: time,
+            pickup_allowed: true,
+            drop_off_allowed: true,
+        };
+        let timetable = RaptorTimetable::new(
+            vec![RaptorTrip {
+                trip_id: "tram".into(),
+                route_id: "tram-1".into(),
+                mode: TransportMode::Tram,
+                service_verified: true,
+                stop_times: vec![
+                    stop_time("boarding", 8 * 3600 + 10 * 60),
+                    stop_time("destination", 8 * 3600 + 30 * 60),
+                ],
+            }],
+            Vec::new(),
+        );
+        let coordinate = "coordinate:50.000000,14.000000".to_string();
+        let access = Transfer {
+            from_stop_id: coordinate.clone(),
+            to_stop_id: "boarding".to_string(),
+            min_transfer_seconds: 4 * 60,
+            distance_meters: Some(300),
+            walking_geometry: None,
+            confidence: transit_model::CoordinateConfidence::High,
+            accessibility_level: None,
+            source: "test".to_string(),
+        };
+
+        let departures = timetable.departure_times_from_stops(
+            &[coordinate],
+            &[access],
+            8 * 3600,
+            30 * 60,
+            10,
+            &[TransportMode::Tram],
+            false,
+        );
+
+        assert_eq!(departures, vec![8 * 3600, 8 * 3600 + 6 * 60]);
     }
 
     #[test]
@@ -2118,6 +2812,7 @@ mod tests {
                 departure_time: 7 * 3600,
                 max_transfers: 3,
                 min_transfer_seconds: 300,
+                transfer_buffer_seconds: 0,
                 modes: vec![TransportMode::Train],
                 allow_unverified_services: false,
                 realtime: Arc::new(RaptorRealtimeData::default()),

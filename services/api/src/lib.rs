@@ -11,15 +11,14 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, header},
-    middleware::Next,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, NaiveDateTime, NaiveTime, Timelike, Utc};
 use routing_core::{
     RaptorRealtimeData, RaptorRealtimeUpdate, RaptorRequest, RaptorSearchStats, RaptorStopTime,
-    RaptorTimetable, RaptorTrip, SearchRequest as RoutingSearchRequest, earliest_arrivals,
-    fixture_snapshot, raptor_with_stats_excluding_routes,
+    RaptorTimetable, RaptorTrip, SearchRequest as RoutingSearchRequest, direct_journeys,
+    earliest_arrivals, fixture_snapshot, raptor_with_stats_excluding_routes,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,8 +40,12 @@ mod controllers;
 mod error;
 mod http;
 mod infrastructure;
+mod operations;
+#[cfg(test)]
+mod security_tests;
 mod repositories;
 mod services;
+mod telemetry;
 mod ticketing;
 
 use config::AppConfig;
@@ -51,10 +54,9 @@ use error::ApiError;
 use repositories::users::{find_by_email as user_by_email_db, find_by_id as user_by_id_db};
 use services::auth::{
     auth_response, create_user_record, current_user, hash_token, public_user, require_admin,
-    verify_password,
 };
 
-const MAX_JOURNEY_RESULTS: usize = 5;
+const MAX_JOURNEY_RESULTS: usize = 20;
 const MAX_DIRECT_JOURNEY_CANDIDATES: i64 = 20;
 const MAX_TRANSFER_JOURNEY_CANDIDATES: i64 = 40;
 const SERVICE_DAY_SECONDS: u32 = 24 * 3600;
@@ -63,12 +65,11 @@ const MIN_TRANSFER_SECONDS: u32 = 5 * 60;
 const MAX_TRANSFER_WAIT_SECONDS: u32 = 2 * 3600;
 const TRANSFER_SEARCH_TIMEOUT_SECONDS: u64 = 6;
 const STOP_SEARCH_TIMEOUT_SECONDS: u64 = 3;
-const PID_INTERCHANGE_ALIAS_RADIUS_M: f64 = 300.0;
 const NEARBY_JOURNEY_STOP_RADIUS_M: f64 = 700.0;
-const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 12;
+const MAX_NEARBY_JOURNEY_STOPS_PER_ENDPOINT: i64 = 24;
 const RANGE_SEARCH_WINDOW_SECONDS: u32 = 90 * 60;
-const MAX_RANGE_DEPARTURES: usize = 10;
-const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 12;
+const MAX_RANGE_DEPARTURES: usize = 48;
+const RAPTOR_TIMETABLE_SNAPSHOT_VERSION: u32 = 13;
 const RAPTOR_RANGE_SEARCH_CONCURRENCY: usize = 2;
 const RAPTOR_INITIAL_RANGE_DEPARTURES: usize = 1;
 const RAPTOR_RANGE_EXPANSION_BATCH_DEPARTURES: usize = 2;
@@ -103,7 +104,19 @@ const ADMIN_DEFAULT_PAGE_SIZE: usize = 50;
 const ADMIN_MAX_PAGE_SIZE: usize = 200;
 const ADMIN_MAX_MAP_STOPS: usize = 5000;
 const ADMIN_VALIDATION_SOURCE_FILE: &str = "admin_database_validation";
-const PID_SOURCE_STATUS_ID: &str = "pid_gtfs_rt";
+const REALTIME_SOURCE_STATUS_IDS: &[&str] = &["pid_gtfs_rt", "ids_jmk_positions"];
+const STOP_SEARCH_SOURCE_IDS_QUERY: &str = r#"
+        SELECT source_id.stop_id, source_id.source_feed_id, source_id.original_source_id,
+               source_id.import_run_id, source_id.priority, source_id.confidence,
+               source_id.suppressed_as_duplicate
+        FROM stop_source_ids AS source_id
+        JOIN source_feeds AS source_feed
+          ON source_feed.id = source_id.source_feed_id
+         AND source_feed.enabled = true
+        WHERE source_id.stop_id = ANY($1)
+        ORDER BY source_id.stop_id ASC, source_id.priority ASC,
+                 source_id.source_feed_id ASC
+        "#;
 
 type RaptorCacheKey = (chrono::NaiveDate, String);
 type RaptorCacheCell = Arc<OnceCell<Arc<RaptorTimetable>>>;
@@ -380,6 +393,9 @@ struct AppState {
     routing_realtime_cache: RoutingRealtimeCache,
     routing_warmup_status: RoutingWarmupStatus,
     route_search_diagnostics: RouteSearchDiagnostics,
+    security: http::security::Security,
+    telemetry: telemetry::Telemetry,
+    stop_catalog_cache: Arc<tokio::sync::Mutex<Option<controllers::transit::CachedStopCatalog>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -403,6 +419,7 @@ struct UserRecord {
     roles: Vec<String>,
     created_at: chrono::DateTime<Utc>,
     deleted_at: Option<chrono::DateTime<Utc>>,
+    auth_version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +428,8 @@ struct Claims {
     email: String,
     roles: Vec<String>,
     exp: usize,
+    #[serde(default)]
+    auth_version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +466,100 @@ struct PublicUser {
 #[derive(Debug, Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordResetRequest {
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordResetCompleteRequest {
+    token: String,
+    new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileUpdateRequest {
+    preferred_walking_speed: Option<String>,
+    prefer_fewer_transfers: Option<bool>,
+    prefer_reliable_transfers: Option<bool>,
+    default_departure_mode: Option<String>,
+    language: Option<String>,
+    accessibility_preferences: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedRouteRequest {
+    name: String,
+    origin: Value,
+    destination: Value,
+    via: Option<Value>,
+    #[serde(default)]
+    via_dwell_seconds: i32,
+    #[serde(default)]
+    transport_modes: Vec<String>,
+    #[serde(default)]
+    preferences: Value,
+    #[serde(default)]
+    position: i32,
+    #[serde(default)]
+    pinned: bool,
+    commute: Option<Value>,
+    expected_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedRouteListQuery {
+    since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    include_deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedRouteDeleteQuery {
+    expected_version: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceRegistrationRequest {
+    platform: String,
+    push_token: String,
+    timezone: String,
+    app_version: Option<String>,
+    locale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JourneySubscriptionRequest {
+    device_id: Uuid,
+    run_id: String,
+    service_date: chrono::NaiveDate,
+    trip_id: String,
+    boarding_call_id: String,
+    boarding_stop_id: String,
+    boarding_stop_sequence: i32,
+    alighting_call_id: Option<String>,
+    alighting_stop_id: Option<String>,
+    alighting_stop_sequence: Option<i32>,
+    connection_run_id: Option<String>,
+    connection_service_date: Option<chrono::NaiveDate>,
+    connection_trip_id: Option<String>,
+    connection_call_id: Option<String>,
+    minimum_transfer_seconds: Option<i32>,
+    #[serde(default = "default_significant_delay_seconds")]
+    significant_delay_seconds: i32,
+    expires_at: DateTime<Utc>,
+}
+
+fn default_significant_delay_seconds() -> i32 {
+    300
 }
 
 #[derive(Debug, Deserialize)]
@@ -617,6 +730,34 @@ struct DeparturesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct StationLayoutQuery {
+    level: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FormationQuery {
+    #[serde(default, rename = "atCallId", alias = "at_call_id")]
+    at_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BoardingGuidanceQuery {
+    profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JourneyPreferences {
+    profile: String,
+    #[serde(default)]
+    step_free: bool,
+    #[serde(default)]
+    prefer_fewer_stairs: bool,
+    #[serde(default)]
+    minimum_transfer_buffer_seconds: u32,
+}
+
+#[derive(Debug, Deserialize)]
 struct JourneySearchBody {
     from: JourneyPoint,
     to: JourneyPoint,
@@ -629,6 +770,8 @@ struct JourneySearchBody {
     offline_compatible: bool,
     #[serde(default, alias = "includeIntermediateStops")]
     include_intermediate_stops: bool,
+    #[serde(default, alias = "journeyPreferences")]
+    journey_preferences: Option<JourneyPreferences>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +790,10 @@ struct JourneyStopCall {
     lat: Option<f64>,
     lon: Option<f64>,
     platform_code: Option<String>,
+    station_id: Option<String>,
+    complex_id: Option<String>,
+    has_station_layout: bool,
+    station_layout_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -909,12 +1056,16 @@ pub async fn run() -> anyhow::Result<()> {
         ),
     }
     let app = app_state_with_config(config.clone()).await?;
+    tokio::spawn(operations::monitor(app.clone()));
     let router = build_router(app);
     tracing::info!(address = %config.bind_address, "starting Cesta API");
     let listener = tokio::net::TcpListener::bind(config.bind_address).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 
@@ -1016,6 +1167,7 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
     } else {
         false
     };
+    services::auth::dummy_password_hash();
     let state = AppState {
         config: Arc::new(config.clone()),
         users: Arc::new(RwLock::new(HashMap::new())),
@@ -1024,6 +1176,12 @@ async fn app_state_with_config(config: AppConfig) -> anyhow::Result<AppState> {
         favorite_stops: Arc::new(RwLock::new(HashMap::new())),
         stops: Arc::new(fixture_stops()),
         cities: Arc::new(fixture_cities()),
+        security: http::security::Security::new(
+            config.max_concurrent_requests,
+            config.max_concurrent_searches,
+        ),
+        telemetry: telemetry::Telemetry::new(db.clone()),
+        stop_catalog_cache: Arc::new(tokio::sync::Mutex::new(None)),
         db,
         jwt_secret: config.jwt_secret.clone(),
         use_mock_data: config.use_mock_data,
@@ -1129,14 +1287,6 @@ fn cd_private_key() -> anyhow::Result<Option<String>> {
 
 fn build_router(state: AppState) -> Router {
     http::routes::build(state)
-}
-
-async fn auth_marker(
-    State(_state): State<AppState>,
-    request: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    next.run(request).await
 }
 
 async fn admin_app() -> Html<&'static str> {
@@ -1535,7 +1685,8 @@ async fn admin_trip_related_data(pool: &PgPool, id: &str) -> Result<Option<Value
     let stop_rows = sqlx::query(
         r#"
         SELECT st.trip_id, st.stop_id, st.stop_sequence, st.arrival_time, st.departure_time,
-               st.pickup_type, st.drop_off_type, st.timepoint, st.platform, st.raw_notes,
+               st.pickup_type, st.drop_off_type, st.timepoint, st.stop_headsign,
+               st.platform, st.raw_notes,
                st.source_feed_id, st.source_priority,
                s.name AS stop_name, s.municipality, s.platform_code, s.stop_area_id
         FROM stop_times st
@@ -3054,7 +3205,8 @@ async fn admin_unmatched_stops(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               platform_code, location_type, parent_station_id, station_id, complex_id,
+               has_station_layout, station_layout_version, wheelchair_boarding,
                modes, source_priority, is_active
         FROM stops
         WHERE is_active = true
@@ -3447,8 +3599,22 @@ async fn append_route_search_timing(
     }
 }
 
+fn latency_percentile(sorted: &[u64], percentile: usize) -> Option<u64> {
+    if sorted.is_empty() || !(1..=100).contains(&percentile) {
+        return None;
+    }
+    sorted
+        .get((sorted.len() * percentile).div_ceil(100) - 1)
+        .copied()
+}
+
 async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) -> Value {
     let recent = diagnostics.read().await;
+    let mut latencies = recent
+        .iter()
+        .map(|search| search.total_ms)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
     let mut stage_totals = HashMap::<String, (u64, u64, u64)>::new();
     let mut total_sum = 0_u64;
     let mut total_max = 0_u64;
@@ -3480,6 +3646,8 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
         "sample_count": recent.len(),
         "average_total_ms": if recent.is_empty() { 0 } else { total_sum / recent.len() as u64 },
         "max_total_ms": total_max,
+        "p50_total_ms": latency_percentile(&latencies, 50),
+        "p95_total_ms": latency_percentile(&latencies, 95),
         "bottleneck": bottleneck,
         "stage_aggregates": stages,
         "recent": recent.iter().take(10).collect::<Vec<_>>(),
@@ -3488,8 +3656,13 @@ async fn route_search_diagnostics_payload(diagnostics: &RouteSearchDiagnostics) 
             "Reuse one routing-data revision for all service days in a request",
             "Pre-index RAPTOR route departures by stop for faster catchable-trip lookup",
             "Use numeric stop indexes and array labels inside RAPTOR scans",
-            "Sample bounded coverage probes for rRAPTOR-style alternatives",
-            "Search the exact departure first and expand two probes at a time only while distinct candidates are thin",
+            "Build bounded rRAPTOR-style profiles from real boardable departure events",
+            "Shift coordinate-origin departure events by verified pedestrian access time",
+            "Search the complete bounded departure profile instead of stopping after a few route patterns",
+            "Preserve departure, arrival, transfers and walking as Pareto criteria",
+            "Enumerate bounded exact-stop direct services independently of sampled range departures",
+            "Reserve primary, simple and reasonable distinct-route alternatives before range sampling",
+            "Keep bounded geometry fallbacks before applying final dominance",
             "Reuse route-sized scratch indexes across RAPTOR rounds",
             "Store sparse request-only walking links without stop-sized allocations",
             "Run each small range-probe batch with bounded concurrency",
@@ -3623,10 +3796,23 @@ fn not_found() -> ApiError {
     }
 }
 
-fn internal_error(error: impl std::fmt::Display) -> ApiError {
+fn internal_error(_error: impl std::fmt::Display) -> ApiError {
+    // SQL errors may contain literal user input or credentials. Do not emit their text.
+    tracing::error!("Internal API operation failed");
     ApiError {
-        code: "internal_error".to_string(),
-        message: error.to_string(),
+        code: "internal_error".into(),
+        message: "An internal service error occurred".into(),
+    }
+}
+fn safe_data_warning(_error: impl std::fmt::Display, message: &str) -> String {
+    tracing::warn!(context = message, "Data operation unavailable");
+    message.to_owned()
+}
+fn service_unavailable(_error: impl std::fmt::Display) -> ApiError {
+    tracing::error!("Transport data query unavailable");
+    ApiError {
+        code: "upstream_unavailable".into(),
+        message: "Transport data is temporarily unavailable".into(),
     }
 }
 
@@ -3715,25 +3901,35 @@ async fn database_status(pool: &PgPool) -> Result<Value, sqlx::Error> {
         SELECT source_id, status, last_success_at, source_timestamp,
                records_received, records_written, error_message
         FROM data_source_syncs
-        WHERE source_id = $1
+        WHERE source_id = ANY($1)
         ORDER BY source_id ASC
         "#,
     )
-    .bind(PID_SOURCE_STATUS_ID)
+    .bind(REALTIME_SOURCE_STATUS_IDS)
     .fetch_all(pool)
     .await?;
-    let pid_realtime_current = realtime_sources.iter().any(|row| {
-        row.get::<String, _>("source_id") == PID_SOURCE_STATUS_ID
-            && row.get::<String, _>("status") == "success"
-            && row
-                .get::<Option<DateTime<Utc>>, _>("source_timestamp")
-                .is_some_and(|timestamp| timestamp > Utc::now() - Duration::minutes(5))
-    });
+    let current_realtime_sources = realtime_sources
+        .iter()
+        .filter(|row| {
+            row.get::<String, _>("status") == "success"
+                && row
+                    .get::<Option<DateTime<Utc>>, _>("source_timestamp")
+                    .is_some_and(|timestamp| timestamp > Utc::now() - Duration::minutes(5))
+        })
+        .count();
     let has_successful_import = latest.is_some();
 
     Ok(json!({
         "schedule": if has_successful_import { "current" } else { "unknown" },
-        "realtime": if pid_realtime_current { "full" } else if realtime_sources.is_empty() { "unavailable" } else { "stale" },
+        "realtime": if current_realtime_sources == REALTIME_SOURCE_STATUS_IDS.len() {
+            "full"
+        } else if current_realtime_sources > 0 {
+            "partial"
+        } else if realtime_sources.is_empty() {
+            "unavailable"
+        } else {
+            "stale"
+        },
         "realtime_sources": realtime_sources.into_iter().map(|row| json!({
             "source_id": row.get::<String, _>("source_id"),
             "status": row.get::<String, _>("status"),
@@ -4088,6 +4284,7 @@ async fn query_journeys_db(
     routing_realtime_cache: &RoutingRealtimeCache,
     routing_snapshot_dir: &FsPath,
     diagnostics: &RouteSearchDiagnostics,
+    telemetry: &telemetry::Telemetry,
     body: &JourneySearchBody,
     departure_time: u32,
     service_date: chrono::NaiveDate,
@@ -4119,6 +4316,7 @@ async fn query_journeys_db(
         service_date = %completed.service_date,
         "profiled route search completed"
     );
+    telemetry.stages(&completed);
     record_route_search_timing(diagnostics, completed).await;
     result.map(|(journeys, warnings, related)| (journeys, warnings, related, search_started_at))
 }
@@ -4295,6 +4493,10 @@ async fn query_journeys_profiled_db(
         .iter()
         .filter_map(transport_mode_to_db)
         .collect::<Vec<_>>();
+    let transfer_buffer_seconds = body
+        .journey_preferences
+        .as_ref()
+        .map_or(0, |preferences| preferences.minimum_transfer_buffer_seconds);
     let current_service_day_result = service_day_journeys_db(
         pool,
         raptor_cache,
@@ -4306,6 +4508,7 @@ async fn query_journeys_profiled_db(
         departure_time,
         &mode_filters,
         body.max_transfers,
+        transfer_buffer_seconds,
         service_date,
         &routing_config,
         &nearby_transfers.transfers,
@@ -4420,6 +4623,7 @@ async fn query_journeys_profiled_db(
                 0,
                 &mode_filters,
                 body.max_transfers,
+                transfer_buffer_seconds,
                 service_date.succ_opt().unwrap_or(service_date),
                 &routing_config,
                 &nearby_transfers.transfers,
@@ -4529,6 +4733,7 @@ async fn query_journeys_profiled_db(
             0,
             &mode_filters,
             body.max_transfers,
+            transfer_buffer_seconds,
             service_date.succ_opt().unwrap_or(service_date),
             &routing_config,
             &nearby_transfers.transfers,
@@ -4656,6 +4861,22 @@ async fn query_journeys_profiled_db(
         ));
     }
     let stage_started = time::Instant::now();
+    let carrier_keys = journey_carrier_keys_db(pool, &journeys).await?;
+    let geometry_preselection_config = geometry_preselection_config(&routing_config);
+    journeys = ranked_journey_results_with_carriers(
+        journeys,
+        &carrier_keys,
+        &geometry_preselection_config,
+    );
+    timing.push(
+        "carrier_lookup_and_preselect",
+        stage_started,
+        Some(format!(
+            "{} candidates selected for geometry validation",
+            journeys.len()
+        )),
+    );
+    let stage_started = time::Instant::now();
     let geometry_diagnostics =
         attach_journey_geometries_db(pool, pedestrian_router, &mut journeys).await?;
     let geometry_valid_candidate_count = journeys.len();
@@ -4669,7 +4890,6 @@ async fn query_journeys_profiled_db(
         )),
     );
     let stage_started = time::Instant::now();
-    let carrier_keys = journey_carrier_keys_db(pool, &journeys).await?;
     let dominance_removed = if routing_config.remove_dominated {
         journeys.len().saturating_sub(
             remove_dominated_journeys(journeys.clone(), &carrier_keys, &routing_config).len(),
@@ -4678,12 +4898,12 @@ async fn query_journeys_profiled_db(
         0
     };
     journeys = ranked_journey_results_with_carriers(journeys, &carrier_keys, &routing_config);
-    let final_candidate_count = journeys.len();
     if dominance_removed > 0 {
         warnings.push(format!("candidate_rejected:dominance:{dominance_removed}"));
     }
+    let final_candidate_count = journeys.len();
     timing.push(
-        "carrier_lookup_and_rank",
+        "final_rank",
         stage_started,
         Some(format!("{} final journeys", journeys.len())),
     );
@@ -4751,6 +4971,7 @@ async fn query_journeys_profiled_db(
             &realtime_updates,
         );
     }
+    attach_journey_assistance_identity(&mut journey_values, &related, service_date);
     related["realtime_updates"] = Value::Array(realtime_updates);
     related["realtime_status"] = json!(journeys_realtime_status(&journey_values));
     related["intermediate_stops_included"] = json!(body.include_intermediate_stops);
@@ -4881,7 +5102,7 @@ async fn nearby_journey_transfers_db(
     walking_speed_mps: f64,
 ) -> Result<NearbyJourneyTransfers, sqlx::Error> {
     let origin_transfers = async {
-        if from_point.point_type == "coordinate" {
+        if journey_point_uses_nearby_access(from_point) {
             nearby_endpoint_transfers_cached_db(
                 pool,
                 endpoint_access_cache,
@@ -4899,7 +5120,7 @@ async fn nearby_journey_transfers_db(
         }
     };
     let destination_transfers = async {
-        if to_point.point_type == "coordinate" {
+        if journey_point_uses_nearby_access(to_point) {
             nearby_endpoint_transfers_cached_db(
                 pool,
                 endpoint_access_cache,
@@ -4922,6 +5143,7 @@ async fn nearby_journey_transfers_db(
     let (destination, destination_cache_hit) = destination_transfers?;
     origin.transfers.extend(destination.transfers);
     origin.diagnostics.extend(destination.diagnostics);
+    remove_direct_endpoint_walks(&mut origin.transfers, from_stop_ids, to_stop_ids);
 
     origin.transfers.sort_by(|left, right| {
         left.from_stop_id
@@ -4934,14 +5156,38 @@ async fn nearby_journey_transfers_db(
     });
 
     let cache_hits = usize::from(origin_cache_hit) + usize::from(destination_cache_hit);
-    let cache_misses = usize::from(from_point.point_type == "coordinate" && !origin_cache_hit)
-        + usize::from(to_point.point_type == "coordinate" && !destination_cache_hit);
+    let cache_misses =
+        usize::from(journey_point_uses_nearby_access(from_point) && !origin_cache_hit)
+            + usize::from(journey_point_uses_nearby_access(to_point) && !destination_cache_hit);
     Ok(NearbyJourneyTransfers {
         transfers: origin.transfers,
         cache_hits,
         cache_misses,
         diagnostics: origin.diagnostics,
     })
+}
+
+fn remove_direct_endpoint_walks(
+    transfers: &mut Vec<Transfer>,
+    from_stop_ids: &[String],
+    to_stop_ids: &[String],
+) {
+    let origins = from_stop_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let destinations = to_stop_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    transfers.retain(|transfer| {
+        !(origins.contains(transfer.from_stop_id.as_str())
+            && destinations.contains(transfer.to_stop_id.as_str()))
+    });
+}
+
+fn journey_point_uses_nearby_access(point: &JourneyPoint) -> bool {
+    matches!(point.point_type.as_str(), "coordinate" | "stop")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5073,6 +5319,8 @@ async fn nearby_endpoint_transfers_db(
               SELECT id, lat, lon, geom
               FROM enabled_source_stops
               WHERE id = ANY($1) AND is_active = true AND geom IS NOT NULL
+              ORDER BY array_position($1::text[], id) NULLS LAST
+              LIMIT 1
             )
             SELECT selected.id AS selected_id, candidate.id AS candidate_id,
                    selected.lat AS selected_lat, selected.lon AS selected_lon,
@@ -5658,6 +5906,7 @@ async fn service_day_journeys_db(
     departure_time: u32,
     mode_filters: &[String],
     max_transfers: u32,
+    transfer_buffer_seconds: u32,
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
@@ -5683,6 +5932,7 @@ async fn service_day_journeys_db(
         departure_time,
         mode_filters,
         max_transfers,
+        transfer_buffer_seconds,
         service_date,
         routing_config,
         extra_transfers,
@@ -5700,6 +5950,7 @@ async fn cached_service_day_journeys_db(
     departure_time: u32,
     mode_filters: &[String],
     max_transfers: u32,
+    transfer_buffer_seconds: u32,
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
@@ -5721,6 +5972,7 @@ async fn cached_service_day_journeys_db(
         departure_time,
         mode_filters,
         max_transfers,
+        transfer_buffer_seconds,
         service_date,
         routing_config,
         extra_transfers,
@@ -5740,6 +5992,7 @@ async fn service_day_journeys_for_timetable(
     departure_time: u32,
     mode_filters: &[String],
     max_transfers: u32,
+    transfer_buffer_seconds: u32,
     service_date: chrono::NaiveDate,
     routing_config: &RoutingAlgorithmConfig,
     extra_transfers: &[Transfer],
@@ -5758,6 +6011,7 @@ async fn service_day_journeys_for_timetable(
         departure_time,
         max_transfers,
         routing_config.min_transfer_seconds as u32,
+        transfer_buffer_seconds,
         &modes,
         false,
         routing_config,
@@ -5775,6 +6029,7 @@ async fn service_day_journeys_for_timetable(
             departure_time,
             max_transfers,
             routing_config.min_transfer_seconds as u32,
+            transfer_buffer_seconds,
             &modes,
             true,
             routing_config,
@@ -5814,12 +6069,38 @@ async fn service_day_journeys_for_timetable(
     ))
 }
 
+fn routing_cpu_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    PERMITS
+        .get_or_init(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    .clamp(1, 4),
+            ))
+        })
+        .clone()
+}
+
 #[derive(Debug)]
 struct AdaptiveRaptorSearchResult {
     journeys: Vec<Journey>,
     stats: RaptorSearchStats,
     departure_count: usize,
     expanded: bool,
+}
+
+fn geometry_preselection_config(configuration: &RoutingAlgorithmConfig) -> RoutingAlgorithmConfig {
+    let mut preselection = configuration.clone();
+    preselection.max_results = configuration
+        .max_results
+        .saturating_mul(2)
+        .clamp(configuration.max_results, 40);
+    // A timetable winner may have unusable geometry. Keep bounded fallbacks
+    // until actual geometry has been validated, then perform final dominance.
+    preselection.remove_dominated = false;
+    preselection
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5831,6 +6112,7 @@ async fn run_adaptive_raptor_searches(
     departure_time: u32,
     max_transfers: u32,
     min_transfer_seconds: u32,
+    transfer_buffer_seconds: u32,
     modes: &[TransportMode],
     allow_unverified_services: bool,
     routing_config: &RoutingAlgorithmConfig,
@@ -5839,6 +6121,7 @@ async fn run_adaptive_raptor_searches(
     let max_departures = routing_config.max_range_departures.max(1) as usize;
     let initial_departures = timetable.departure_times_from_stops(
         from_stop_ids,
+        extra_transfers,
         departure_time,
         routing_config.range_search_window_seconds.max(0) as u32,
         max_departures.min(RAPTOR_INITIAL_RANGE_DEPARTURES),
@@ -5853,6 +6136,7 @@ async fn run_adaptive_raptor_searches(
         &initial_departures,
         max_transfers,
         min_transfer_seconds,
+        transfer_buffer_seconds,
         modes,
         allow_unverified_services,
         realtime.clone(),
@@ -5863,12 +6147,43 @@ async fn run_adaptive_raptor_searches(
     let mut departure_count = initial_departures.len();
     let mut expanded = false;
 
-    if should_expand_raptor_range(distinct_raptor_candidate_count(&journeys), routing_config)
-        && searched_departures.len() < max_departures
-    {
+    let direct_request = RaptorRequest {
+        from_stop_ids: from_stop_ids.to_vec(),
+        to_stop_ids: to_stop_ids.to_vec(),
+        extra_transfers: Vec::new(),
+        departure_time,
+        max_transfers: 0,
+        min_transfer_seconds,
+        transfer_buffer_seconds,
+        modes: modes.to_vec(),
+        allow_unverified_services,
+        realtime: realtime.clone(),
+    };
+    let direct_timetable = timetable.clone();
+    let direct_window_seconds = routing_config.range_search_window_seconds.max(0) as u32;
+    let max_direct_candidates = routing_config.max_direct_candidates.max(1) as usize;
+    let cpu_permit = routing_cpu_permits()
+        .acquire_owned()
+        .await
+        .map_err(|_| sqlx::Error::Protocol("Routing worker pool closed".into()))?;
+    let mut direct_candidates = tokio::task::spawn_blocking(move || {
+        let _cpu_permit = cpu_permit;
+        direct_journeys(
+            direct_timetable.as_ref(),
+            &direct_request,
+            direct_window_seconds,
+            max_direct_candidates,
+        )
+    })
+    .await
+    .map_err(|error| sqlx::Error::Protocol(format!("direct journey worker failed: {error}")))?;
+    journeys.append(&mut direct_candidates);
+
+    if searched_departures.len() < max_departures {
         let remaining_departures = timetable
             .departure_times_from_stops(
                 from_stop_ids,
+                extra_transfers,
                 departure_time,
                 routing_config.range_search_window_seconds.max(0) as u32,
                 max_departures,
@@ -5888,6 +6203,7 @@ async fn run_adaptive_raptor_searches(
                 departure_batch,
                 max_transfers,
                 min_transfer_seconds,
+                transfer_buffer_seconds,
                 modes,
                 allow_unverified_services,
                 realtime.clone(),
@@ -5900,12 +6216,6 @@ async fn run_adaptive_raptor_searches(
             stats.marked_stops += extra_stats.marked_stops;
             departure_count += departure_batch.len();
             expanded = true;
-            if !should_expand_raptor_range(
-                distinct_raptor_candidate_count(&journeys),
-                routing_config,
-            ) {
-                break;
-            }
         }
     }
 
@@ -5929,6 +6239,7 @@ async fn run_adaptive_raptor_searches(
                     &alternative_departures,
                     max_transfers,
                     min_transfer_seconds,
+                    transfer_buffer_seconds,
                     modes,
                     allow_unverified_services,
                     realtime.clone(),
@@ -6018,6 +6329,7 @@ async fn run_raptor_searches(
     departure_times: &[u32],
     max_transfers: u32,
     min_transfer_seconds: u32,
+    transfer_buffer_seconds: u32,
     modes: &[TransportMode],
     allow_unverified_services: bool,
     realtime: Arc<RaptorRealtimeData>,
@@ -6040,13 +6352,19 @@ async fn run_raptor_searches(
                 departure_time,
                 max_transfers,
                 min_transfer_seconds,
+                transfer_buffer_seconds,
                 modes: modes.to_vec(),
                 allow_unverified_services,
                 realtime: realtime.clone(),
             };
             let timetable = timetable.clone();
             let excluded_route_ids = excluded_route_ids.clone();
+            let cpu_permit = routing_cpu_permits()
+                .acquire_owned()
+                .await
+                .map_err(|_| sqlx::Error::Protocol("Routing worker pool closed".into()))?;
             join_set.spawn_blocking(move || {
+                let _cpu_permit = cpu_permit;
                 raptor_with_stats_excluding_routes(timetable.as_ref(), request, &excluded_route_ids)
             });
         }
@@ -6771,19 +7089,22 @@ async fn implicit_station_transfers_db(
     .await?;
 
     let mut stops_by_signature =
-        HashMap::<String, Vec<(String, (f64, f64), Vec<String>, HashSet<String>)>>::new();
+        HashMap::<String, Vec<(String, String, (f64, f64), Vec<String>, HashSet<String>)>>::new();
     for row in rows {
         let id = row.get::<String, _>("id");
+        let source_name = row.get::<String, _>("name");
+        let platform_code = row.get::<Option<String>, _>("platform_code");
+        let public_name = pid_public_stop_name(&id, &source_name, platform_code.as_deref());
         let modes = row.get::<Vec<String>, _>("modes");
         let signature = implicit_station_transfer_signature(
             &id,
-            &row.get::<String, _>("name"),
+            &source_name,
             row.get::<Option<String>, _>("municipality").as_deref(),
             row.get::<Option<f64>, _>("lat"),
             row.get::<Option<f64>, _>("lon"),
             row.get::<Option<String>, _>("stop_area_id").as_deref(),
             row.get::<Option<String>, _>("parent_station_id").as_deref(),
-            row.get::<Option<String>, _>("platform_code").as_deref(),
+            platform_code.as_deref(),
             &modes,
         );
         if let (Some(signature), Some(lat), Some(lon)) = (
@@ -6793,6 +7114,10 @@ async fn implicit_station_transfers_db(
         ) {
             stops_by_signature.entry(signature).or_default().push((
                 id.clone(),
+                canonical_stop_name_parts(
+                    &public_name,
+                    row.get::<Option<String>, _>("municipality").as_deref(),
+                ),
                 (lat, lon),
                 modes,
                 route_ids_by_stop.get(&id).cloned().unwrap_or_default(),
@@ -6808,8 +7133,8 @@ async fn implicit_station_transfers_db(
         if group.len() < 2 || group.len() > 80 {
             continue;
         }
-        for (from_stop_id, from_coordinate, from_modes, from_route_ids) in &group {
-            for (to_stop_id, to_coordinate, to_modes, to_route_ids) in &group {
+        for (from_stop_id, from_name, from_coordinate, from_modes, from_route_ids) in &group {
+            for (to_stop_id, to_name, to_coordinate, to_modes, to_route_ids) in &group {
                 if from_stop_id == to_stop_id
                     || !station_interchange_needs_connector(
                         from_modes,
@@ -6820,15 +7145,18 @@ async fn implicit_station_transfers_db(
                 {
                     continue;
                 }
-                if from_modes == to_modes {
-                    let distance_meters = haversine_m(
-                        from_coordinate.0,
-                        from_coordinate.1,
-                        to_coordinate.0,
-                        to_coordinate.1,
-                    )
-                    .round()
-                    .max(0.0) as u32;
+                let distance_meters = haversine_m(
+                    from_coordinate.0,
+                    from_coordinate.1,
+                    to_coordinate.0,
+                    to_coordinate.1,
+                )
+                .round()
+                .max(0.0) as u32;
+                if from_name == to_name
+                    && from_modes == to_modes
+                    && distance_meters <= MAX_INTERCHANGE_WALKING_DISTANCE_M
+                {
                     internal_transfers.push(Transfer {
                         from_stop_id: from_stop_id.clone(),
                         to_stop_id: to_stop_id.clone(),
@@ -6913,10 +7241,7 @@ fn implicit_station_transfer_signature(
     modes: &[String],
 ) -> Option<String> {
     if let Some(source_complex_id) = pid_stop_complex_id(stop_id) {
-        return Some(format!(
-            "source:{source_complex_id}:{}",
-            canonical_stop_name_parts(name, municipality)
-        ));
+        return Some(format!("source:{source_complex_id}"));
     }
     if let Some(stop_area_id) = stop_area_id.filter(|value| !value.trim().is_empty()) {
         return Some(format!("area:{stop_area_id}"));
@@ -6971,10 +7296,139 @@ fn journey_query_context(
         "max_transfers": body.max_transfers,
         "transport_modes": body.transport_modes,
         "include_intermediate_stops": body.include_intermediate_stops,
+        "journey_preferences": body.journey_preferences,
         "from_stop_ids": from_stop_ids,
         "to_stop_ids": to_stop_ids,
         "nearby_walking_transfer_count": nearby_transfer_count
     })
+}
+
+fn validate_journey_preferences(body: &JourneySearchBody) -> Result<(), ApiError> {
+    let Some(preferences) = &body.journey_preferences else {
+        return Ok(());
+    };
+    if !matches!(
+        preferences.profile.as_str(),
+        "standard" | "wheelchair" | "stroller" | "luggage"
+    ) {
+        return Err(ApiError {
+            code: "unsupported_journey_profile".to_string(),
+            message:
+                "journey_preferences.profile must be standard, wheelchair, stroller, or luggage"
+                    .to_string(),
+        });
+    }
+    if preferences.minimum_transfer_buffer_seconds > 30 * 60 {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "minimum_transfer_buffer_seconds must be between 0 and 1800".to_string(),
+        });
+    }
+    if matches!(preferences.profile.as_str(), "wheelchair" | "stroller")
+        || preferences.step_free
+        || preferences.prefer_fewer_stairs
+    {
+        return Err(ApiError {
+            code: "journey_accessibility_unverified".to_string(),
+            message: "This deployment cannot yet verify a complete step-free route; the requested accessibility profile was not applied"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn operational_run_id(trip_id: &str, service_date: chrono::NaiveDate) -> String {
+    let digest = Sha256::digest(format!("{service_date}\0{trip_id}").as_bytes());
+    format!("run:{service_date}:{}", &hex::encode(digest)[..24])
+}
+
+fn operational_call_id(run_id: &str, stop_id: &str, stop_sequence: i64) -> String {
+    let digest = Sha256::digest(format!("{run_id}\0{stop_sequence}\0{stop_id}").as_bytes());
+    format!("call:{}", &hex::encode(digest)[..32])
+}
+
+fn attach_journey_assistance_identity(
+    journeys: &mut [Value],
+    related: &Value,
+    service_date: chrono::NaiveDate,
+) {
+    let stops = related["stops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|stop| Some((stop["id"].as_str()?.to_string(), stop)))
+        .collect::<HashMap<_, _>>();
+    let stop_times = related["stop_times"].as_array();
+
+    for journey in journeys {
+        journey["accessibility"] = json!({
+            "verified": false,
+            "step_free": null,
+            "reason": "complete_journey_not_verified"
+        });
+        let Some(legs) = journey["legs"].as_array_mut() else {
+            continue;
+        };
+        for leg in legs {
+            let from_stop_id = leg["from_stop_id"].as_str().map(str::to_string);
+            let to_stop_id = leg["to_stop_id"].as_str().map(str::to_string);
+            let trip_id = leg["trip_id"].as_str().map(str::to_string);
+            let from_stop = from_stop_id.as_deref().and_then(|id| stops.get(id));
+            let to_stop = to_stop_id.as_deref().and_then(|id| stops.get(id));
+            leg["from_station_id"] = from_stop
+                .and_then(|stop| stop.get("station_id"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            leg["to_station_id"] = to_stop
+                .and_then(|stop| stop.get("station_id"))
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            if let Some(trip_id) = trip_id {
+                let run_id = operational_run_id(&trip_id, service_date);
+                leg["run_id"] = json!(run_id);
+                let departure_sequence = stop_times
+                    .into_iter()
+                    .flatten()
+                    .find(|stop_time| {
+                        stop_time["trip_id"].as_str() == Some(trip_id.as_str())
+                            && stop_time["stop_id"].as_str() == from_stop_id.as_deref()
+                    })
+                    .and_then(|stop_time| stop_time["stop_sequence"].as_i64());
+                leg["departure_call_id"] = departure_sequence
+                    .zip(from_stop_id.as_deref())
+                    .map(|(sequence, stop_id)| {
+                        json!(operational_call_id(&run_id, stop_id, sequence))
+                    })
+                    .unwrap_or(Value::Null);
+
+                if let Some(calls) = leg["stop_calls"].as_array_mut() {
+                    for call in calls {
+                        let stop_id = call["stop_id"].as_str().map(str::to_string);
+                        let sequence = call["stop_sequence"].as_i64();
+                        call["run_id"] = json!(run_id);
+                        call["call_id"] = sequence
+                            .zip(stop_id.as_deref())
+                            .map(|(sequence, stop_id)| {
+                                json!(operational_call_id(&run_id, stop_id, sequence))
+                            })
+                            .unwrap_or(Value::Null);
+                        if call.get("station_id").is_none() {
+                            call["station_id"] = stop_id
+                                .as_deref()
+                                .and_then(|id| stops.get(id))
+                                .and_then(|stop| stop.get("station_id"))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                        }
+                    }
+                }
+            } else {
+                leg["run_id"] = Value::Null;
+                leg["departure_call_id"] = Value::Null;
+            }
+        }
+    }
 }
 
 fn next_service_day_journey_results(
@@ -7305,29 +7759,31 @@ fn ranked_journey_results_with_carriers(
 
     let mut selected = Vec::new();
     let mut selected_keys = HashSet::new();
+    let max_results = configuration.max_results as usize;
+
+    // The configured primary result must survive even a one-result limit.
     push_ranked_journey(
         &mut selected,
         &mut selected_keys,
         &candidates[0],
-        configuration.max_results as usize,
+        max_results,
     );
 
+    // Reserve useful alternatives before a large Pareto frontier fills the
+    // result limit. A direct ride with little walking is a distinct option
+    // from boarding a nearby service after a long access walk.
     if configuration.preserve_simplest
         && let Some(simplest) = candidates.iter().min_by_key(|journey| {
             (
                 journey.transfer_count,
+                journey.walking_distance_meters,
                 journey.arrival_time,
                 journey.duration_seconds,
                 journey.departure_time,
             )
         })
     {
-        push_ranked_journey(
-            &mut selected,
-            &mut selected_keys,
-            simplest,
-            configuration.max_results as usize,
-        );
+        push_ranked_journey(&mut selected, &mut selected_keys, simplest, max_results);
     }
 
     let mut transfer_counts = candidates
@@ -7336,7 +7792,6 @@ fn ranked_journey_results_with_carriers(
         .collect::<Vec<_>>();
     transfer_counts.sort_unstable();
     transfer_counts.dedup();
-
     for transfer_count in transfer_counts {
         if !configuration.preserve_each_transfer_count {
             break;
@@ -7350,11 +7805,12 @@ fn ranked_journey_results_with_carriers(
                 &mut selected,
                 &mut selected_keys,
                 best_for_transfer_count,
-                configuration.max_results as usize,
+                max_results,
             );
         }
     }
 
+    let alternative_slot_limit = max_results.div_ceil(3).clamp(1, 4);
     if configuration.preserve_carrier_diversity {
         let mut best_by_carrier = HashMap::<String, &Journey>::new();
         for journey in &candidates {
@@ -7370,12 +7826,12 @@ fn ranked_journey_results_with_carriers(
         }
         let mut carrier_candidates = best_by_carrier.into_values().collect::<Vec<_>>();
         carrier_candidates.sort_by_key(|journey| journey_rank(journey, configuration));
-        for best_for_carrier in carrier_candidates {
+        for best_for_carrier in carrier_candidates.into_iter().take(alternative_slot_limit) {
             push_ranked_journey(
                 &mut selected,
                 &mut selected_keys,
                 best_for_carrier,
-                configuration.max_results as usize,
+                max_results,
             );
         }
     }
@@ -7402,22 +7858,60 @@ fn ranked_journey_results_with_carriers(
     }
     let mut route_candidates = best_by_route.into_values().collect::<Vec<_>>();
     route_candidates.sort_by_key(|journey| journey_rank(journey, configuration));
-    for best_for_route in route_candidates {
-        push_ranked_journey(
-            &mut selected,
-            &mut selected_keys,
-            best_for_route,
-            configuration.max_results as usize,
-        );
+    if configuration.preserve_simplest || configuration.preserve_each_transfer_count {
+        let selected_routes = selected
+            .iter()
+            .map(journey_route_signature)
+            .collect::<HashSet<_>>();
+        for best_for_route in route_candidates
+            .into_iter()
+            .filter(|journey| !selected_routes.contains(&journey_route_signature(journey)))
+            .take(alternative_slot_limit)
+        {
+            push_ranked_journey(
+                &mut selected,
+                &mut selected_keys,
+                best_for_route,
+                max_results,
+            );
+        }
+    }
+
+    let mut time_frontier = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidates
+                .iter()
+                .any(|other| journey_dominates(other, candidate, carrier_keys, configuration))
+        })
+        .collect::<Vec<_>>();
+    time_frontier.sort_by_key(|journey| {
+        (
+            journey.departure_time,
+            journey.arrival_time,
+            journey.transfer_count,
+            journey.walking_distance_meters,
+            journey.duration_seconds,
+        )
+    });
+    let reserved_frontier_slots = time_frontier
+        .iter()
+        .filter(|journey| selected_keys.contains(&journey_identity_key(journey)))
+        .count();
+    let remaining_slots = max_results.saturating_sub(selected.len());
+    let sampled_frontier = evenly_spaced_journey_refs(
+        &time_frontier,
+        remaining_slots.saturating_add(reserved_frontier_slots),
+    )
+    .into_iter()
+    .filter(|journey| !selected_keys.contains(&journey_identity_key(journey)))
+    .collect::<Vec<_>>();
+    for journey in evenly_spaced_journey_refs(&sampled_frontier, remaining_slots) {
+        push_ranked_journey(&mut selected, &mut selected_keys, journey, max_results);
     }
 
     for journey in &candidates {
-        push_ranked_journey(
-            &mut selected,
-            &mut selected_keys,
-            journey,
-            configuration.max_results as usize,
-        );
+        push_ranked_journey(&mut selected, &mut selected_keys, journey, max_results);
     }
 
     let simplest_key = selected
@@ -7425,6 +7919,7 @@ fn ranked_journey_results_with_carriers(
         .min_by_key(|journey| {
             (
                 journey.transfer_count,
+                journey.walking_distance_meters,
                 journey.arrival_time,
                 journey.duration_seconds,
                 journey.departure_time,
@@ -7467,24 +7962,122 @@ fn ranked_journey_results_with_carriers(
 
 fn remove_dominated_journeys(
     journeys: Vec<Journey>,
-    _carrier_keys: &HashMap<String, String>,
-    _configuration: &RoutingAlgorithmConfig,
+    carrier_keys: &HashMap<String, String>,
+    configuration: &RoutingAlgorithmConfig,
 ) -> Vec<Journey> {
+    let time_frontier_keys = journeys
+        .iter()
+        .filter(|candidate| {
+            !journeys
+                .iter()
+                .any(|other| journey_dominates(other, candidate, carrier_keys, configuration))
+        })
+        .map(journey_identity_key)
+        .collect::<HashSet<_>>();
+    let minimum_frontier_transfers = journeys
+        .iter()
+        .filter(|journey| time_frontier_keys.contains(&journey_identity_key(journey)))
+        .map(|journey| journey.transfer_count)
+        .min()
+        .unwrap_or(u32::MAX);
+    let mut exception_keys = HashSet::new();
+    if configuration.preserve_simplest
+        && let Some(simplest) = journeys
+            .iter()
+            .filter(|journey| journey.transfer_count < minimum_frontier_transfers)
+            .min_by_key(|journey| (journey.transfer_count, journey_rank(journey, configuration)))
+    {
+        exception_keys.insert(journey_identity_key(simplest));
+    }
+    if configuration.preserve_each_transfer_count {
+        let mut best_by_transfer_count = HashMap::<u32, &Journey>::new();
+        for journey in journeys
+            .iter()
+            .filter(|journey| journey.transfer_count < minimum_frontier_transfers)
+        {
+            let replace = best_by_transfer_count
+                .get(&journey.transfer_count)
+                .is_none_or(|known| {
+                    journey_rank(journey, configuration) < journey_rank(known, configuration)
+                });
+            if replace {
+                best_by_transfer_count.insert(journey.transfer_count, journey);
+            }
+        }
+        exception_keys.extend(
+            best_by_transfer_count
+                .into_values()
+                .map(journey_identity_key),
+        );
+    }
+    if configuration.preserve_carrier_diversity {
+        let mut best_by_carrier = HashMap::<String, &Journey>::new();
+        for journey in &journeys {
+            let Some(carrier) = journey_carrier_signature(journey, carrier_keys) else {
+                continue;
+            };
+            let replace = best_by_carrier.get(&carrier).is_none_or(|known| {
+                journey_rank(journey, configuration) < journey_rank(known, configuration)
+            });
+            if replace {
+                best_by_carrier.insert(carrier, journey);
+            }
+        }
+        exception_keys.extend(best_by_carrier.into_values().map(journey_identity_key));
+    }
+
     journeys
         .iter()
-        .enumerate()
-        .filter(|(candidate_index, candidate)| {
-            !journeys.iter().enumerate().any(|(other_index, other)| {
-                other_index != *candidate_index
-                    && other.departure_time >= candidate.departure_time
-                    && other.arrival_time <= candidate.arrival_time
-                    && other.transfer_count <= candidate.transfer_count
-                    && (other.departure_time > candidate.departure_time
-                        || other.arrival_time < candidate.arrival_time
-                        || other.transfer_count < candidate.transfer_count)
-            })
+        .filter(|candidate| {
+            time_frontier_keys.contains(&journey_identity_key(candidate))
+                || exception_keys.contains(&journey_identity_key(candidate))
         })
-        .map(|(_, journey)| journey.clone())
+        .cloned()
+        .collect()
+}
+
+fn time_dominates(better: &Journey, candidate: &Journey) -> bool {
+    better.departure_time >= candidate.departure_time
+        && better.arrival_time <= candidate.arrival_time
+        && better.transfer_count <= candidate.transfer_count
+        && better.walking_distance_meters <= candidate.walking_distance_meters
+        && (better.departure_time > candidate.departure_time
+            || better.arrival_time < candidate.arrival_time
+            || better.transfer_count < candidate.transfer_count
+            || better.walking_distance_meters < candidate.walking_distance_meters)
+}
+
+fn journey_dominates(
+    better: &Journey,
+    candidate: &Journey,
+    carrier_keys: &HashMap<String, String>,
+    configuration: &RoutingAlgorithmConfig,
+) -> bool {
+    if configuration.dominate_only_same_carrier {
+        let better_carrier = journey_carrier_signature(better, carrier_keys);
+        let candidate_carrier = journey_carrier_signature(candidate, carrier_keys);
+        if better_carrier.is_none() || better_carrier != candidate_carrier {
+            return false;
+        }
+    }
+    time_dominates(better, candidate)
+}
+
+fn evenly_spaced_journey_refs<'a>(journeys: &[&'a Journey], limit: usize) -> Vec<&'a Journey> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if journeys.len() <= limit {
+        return journeys.to_vec();
+    }
+    if limit <= 1 {
+        return journeys.first().copied().into_iter().collect();
+    }
+    (0..limit)
+        .map(|sample_index| {
+            let journey_index = sample_index * (journeys.len() - 1) / (limit - 1);
+            journeys[journey_index]
+        })
         .collect()
 }
 
@@ -7808,6 +8401,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             FROM stops AS stop
             WHERE stop.is_active = true
               AND (stop.id = $1 OR stop.parent_station_id = $1)
+              AND stop.normalized_name = $2
               AND (
                 stop.source_feed_id IS NULL
                 OR EXISTS (
@@ -7828,6 +8422,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             "#,
         )
         .bind(parent_station_id)
+        .bind(pid_source_stop_query(&stop.normalized_name))
         .fetch_all(pool)
         .await?;
         ids.append(&mut station_ids);
@@ -7840,6 +8435,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             FROM stops AS stop
             WHERE stop.is_active = true
               AND stop.stop_area_id = $1
+              AND stop.normalized_name = $2
               AND (
                 stop.source_feed_id IS NULL
                 OR EXISTS (
@@ -7860,6 +8456,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             "#,
         )
         .bind(stop_area_id)
+        .bind(pid_source_stop_query(&stop.normalized_name))
         .fetch_all(pool)
         .await?;
         ids.append(&mut area_ids);
@@ -7873,6 +8470,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             FROM stops AS stop
             WHERE stop.is_active = true
               AND (stop.id = $1 OR stop.id LIKE $2 ESCAPE '\')
+              AND stop.normalized_name = $3
               AND (
                 stop.source_feed_id IS NULL
                 OR EXISTS (
@@ -7894,6 +8492,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         )
         .bind(&station_base)
         .bind(station_prefix)
+        .bind(pid_source_stop_query(&stop.normalized_name))
         .fetch_all(pool)
         .await?;
         ids.extend(
@@ -7903,21 +8502,13 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         );
     }
 
-    if let Some(complex_id) = pid_stop_complex_id(&stop.id) {
-        let complex_members = pid_stop_complex_members_db(pool, &[complex_id]).await?;
-        ids.extend(
-            pid_interchange_alias_members(stop, &complex_members)
-                .into_iter()
-                .map(|member| member.id.clone()),
-        );
-    }
-
     if stop.lat.is_some() && stop.lon.is_some() {
         let sibling_rows = sqlx::query(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, location_type, parent_station_id, wheelchair_boarding,
+                   platform_code, location_type, parent_station_id, station_id, complex_id,
+                   has_station_layout, station_layout_version, wheelchair_boarding,
                    modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
@@ -7942,7 +8533,7 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             LIMIT 250
             "#,
         )
-        .bind(&stop.normalized_name)
+        .bind(pid_source_stop_query(&stop.normalized_name))
         .fetch_all(pool)
         .await?;
         for sibling in sibling_rows {
@@ -8029,7 +8620,6 @@ async fn direct_journeys_db(
           JOIN trips t ON t.id = st_from.trip_id
           JOIN source_feeds feed
             ON feed.id = t.source_feed_id
-           AND feed.id = 'pid_gtfs'
            AND feed.enabled = true
           LEFT JOIN latest_import_runs lir
             ON lir.source_feed_id = t.source_feed_id
@@ -8723,7 +9313,8 @@ async fn journey_related_data_db(
             r#"
             SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                    lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-                   platform_code, location_type, parent_station_id, wheelchair_boarding,
+                   platform_code, location_type, parent_station_id, station_id, complex_id,
+                   has_station_layout, station_layout_version, wheelchair_boarding,
                    modes, source_priority, is_active
             FROM stops
             WHERE id = ANY($1)
@@ -8757,11 +9348,23 @@ async fn journey_related_data_db(
         }
         sqlx::query(
             r#"
-            SELECT id, source_feed_id, source_id, route_id, service_id, headsign,
-                   direction_id, shape_id, restrictions, raw_source_metadata, source_priority
-            FROM trips
-            WHERE id = ANY($1)
-            ORDER BY source_priority ASC, id ASC
+            SELECT trip.id, trip.source_feed_id, trip.source_id, trip.route_id,
+                   trip.service_id, trip.headsign, trip.direction_id, trip.shape_id,
+                   trip.restrictions, trip.raw_source_metadata, trip.source_priority,
+                   terminal.stop_id AS terminal_stop_id,
+                   terminal_stop.name AS terminal_stop_name,
+                   terminal_stop.platform_code AS terminal_stop_platform
+            FROM trips trip
+            LEFT JOIN LATERAL (
+              SELECT stop_time.stop_id
+              FROM stop_times stop_time
+              WHERE stop_time.trip_id = trip.id
+              ORDER BY stop_time.stop_sequence DESC
+              LIMIT 1
+            ) terminal ON true
+            LEFT JOIN stops terminal_stop ON terminal_stop.id = terminal.stop_id
+            WHERE trip.id = ANY($1)
+            ORDER BY trip.source_priority ASC, trip.id ASC
             "#,
         )
         .bind(&trip_ids)
@@ -8775,7 +9378,7 @@ async fn journey_related_data_db(
         sqlx::query(
             r#"
             SELECT trip_id, stop_id, stop_sequence, arrival_time, departure_time,
-                   pickup_type, drop_off_type, timepoint, platform, raw_notes,
+                   pickup_type, drop_off_type, timepoint, stop_headsign, platform, raw_notes,
                    source_feed_id, source_priority
             FROM stop_times
             WHERE trip_id = ANY($1)
@@ -8841,7 +9444,17 @@ async fn journey_related_data_db(
             if let Some(feed_id) = row.get::<Option<String>, _>("source_feed_id") {
                 source_feed_ids.insert(feed_id);
             }
-            trip_row_json(&row)
+            let mut trip = trip_row_json(&row);
+            let terminal_stop_id = row.get::<Option<String>, _>("terminal_stop_id");
+            let terminal_source_name = row.get::<Option<String>, _>("terminal_stop_name");
+            let terminal_platform = row.get::<Option<String>, _>("terminal_stop_platform");
+            let terminal_stop_name = terminal_stop_id
+                .as_deref()
+                .zip(terminal_source_name.as_deref())
+                .map(|(id, name)| pid_public_stop_name(id, name, terminal_platform.as_deref()));
+            trip["terminal_stop_id"] = terminal_stop_id.map_or(Value::Null, Value::String);
+            trip["terminal_stop_name"] = terminal_stop_name.map_or(Value::Null, Value::String);
+            trip
         })
         .collect::<Vec<_>>();
     let stop_times = stop_time_rows
@@ -9020,7 +9633,8 @@ async fn journey_stop_calls_db(
         SELECT st.trip_id, st.stop_id, st.stop_sequence, st.arrival_time,
                st.departure_time, st.pickup_type, st.drop_off_type, st.timepoint,
                st.platform AS stop_time_platform, s.name AS stop_name,
-               s.municipality, s.lat, s.lon, s.platform_code
+               s.municipality, s.lat, s.lon, s.platform_code,
+               s.station_id, s.complex_id, s.has_station_layout, s.station_layout_version
         FROM stop_times st
         JOIN stops s ON s.id = st.stop_id
         WHERE st.trip_id = ANY($1)
@@ -9048,6 +9662,10 @@ async fn journey_stop_calls_db(
             lat: row.get("lat"),
             lon: row.get("lon"),
             platform_code: row.get("platform_code"),
+            station_id: row.get("station_id"),
+            complex_id: row.get("complex_id"),
+            has_station_layout: row.get("has_station_layout"),
+            station_layout_version: row.get("station_layout_version"),
         };
         calls.entry(call.trip_id.clone()).or_default().push(call);
     }
@@ -9134,6 +9752,10 @@ fn attach_stop_calls(
                         "lat": call.lat,
                         "lon": call.lon,
                         "platform": call.stop_time_platform.as_ref().or(call.platform_code.as_ref()),
+                        "station_id": call.station_id,
+                        "complex_id": call.complex_id,
+                        "has_station_layout": call.has_station_layout,
+                        "station_layout_version": call.station_layout_version,
                         "scheduled_arrival_seconds": scheduled_arrival,
                         "scheduled_departure_seconds": scheduled_departure,
                         "scheduled_arrival": transit_model::seconds_to_time(scheduled_arrival),
@@ -9312,6 +9934,7 @@ fn attach_journey_display_metadata(journeys: &mut [Value], related: &Value) {
         .flatten()
         .filter_map(|stop| Some((stop["id"].as_str()?.to_string(), stop)))
         .collect::<HashMap<_, _>>();
+    let stop_times = related["stop_times"].as_array();
 
     for journey in journeys {
         let Some(legs) = journey["legs"].as_array_mut() else {
@@ -9337,26 +9960,51 @@ fn attach_journey_display_metadata(journeys: &mut [Value], related: &Value) {
                 .and_then(|route| nonempty_json_string(&route["long_name"]))
                 .map(str::to_string)
                 .or_else(|| line.clone());
-            let destination = trip
-                .and_then(|trip| nonempty_json_string(&trip["headsign"]))
-                .map(str::to_string)
-                .or_else(|| to_name.map(str::to_string));
+            let stop_headsign = (|| {
+                let trip_id = leg["trip_id"].as_str()?;
+                let from_stop_id = leg["from_stop_id"].as_str()?;
+                let departure_time = leg["departure_time"].as_u64()? as u32;
+                stop_times
+                    .into_iter()
+                    .flatten()
+                    .find(|stop_time| {
+                        stop_time["trip_id"].as_str() == Some(trip_id)
+                            && stop_time["stop_id"].as_str() == Some(from_stop_id)
+                            && stop_time["departure_time"].as_i64().is_some_and(|time| {
+                                service_time_matches(time as i32, departure_time)
+                            })
+                    })
+                    .and_then(|stop_time| nonempty_json_string(&stop_time["stop_headsign"]))
+            })();
+            let direction = trip.and_then(|trip| {
+                stop_headsign
+                    .or_else(|| nonempty_json_string(&trip["headsign"]))
+                    .or_else(|| nonempty_json_string(&trip["terminal_stop_name"]))
+                    .map(str::to_string)
+            });
+            let destination = direction.clone().or_else(|| {
+                trip.is_none()
+                    .then(|| to_name.map(str::to_string))
+                    .flatten()
+            });
             let mode_name = leg["mode"].as_str().and_then(human_transport_mode_name);
-            let display_name = match (mode_name, line.as_deref(), destination.as_deref()) {
-                (Some(mode), Some(line), Some(destination)) => {
-                    format!("{mode} {line} směr {destination}")
+            let display_name = match (mode_name, line.as_deref(), direction.as_deref()) {
+                (Some(mode), Some(line), Some(direction)) => {
+                    format!("{mode} {line} směr {direction}")
                 }
                 (Some(mode), Some(line), None) => format!("{mode} {line}"),
-                (Some(mode), None, Some(destination)) => format!("{mode} směr {destination}"),
+                (Some(mode), None, Some(direction)) => format!("{mode} směr {direction}"),
                 (Some(mode), None, None) => mode.to_string(),
-                (None, _, Some(destination)) => format!("Pěšky do {destination}"),
-                (None, _, None) => "Pěšky".to_string(),
+                (None, _, _) => to_name
+                    .map(|destination| format!("Pěšky do {destination}"))
+                    .unwrap_or_else(|| "Pěšky".to_string()),
             };
 
             leg["line"] = line.map_or(Value::Null, Value::String);
             leg["mode_name"] = mode_name.map_or(Value::Null, |name| json!(name));
             leg["route_name"] = route_name.map_or(Value::Null, Value::String);
             leg["destination"] = destination.map_or(Value::Null, Value::String);
+            leg["direction"] = direction.map_or(Value::Null, Value::String);
             leg["display_name"] = Value::String(display_name);
             leg["from_stop_name"] = from_name.map_or(Value::Null, |name| json!(name));
             leg["to_stop_name"] = to_name.map_or(Value::Null, |name| json!(name));
@@ -9434,20 +10082,9 @@ async fn stop_search_related_data_db(pool: &PgPool, stops: &[Stop]) -> Result<Va
         }));
     }
 
-    let source_ids_query = sqlx::query(
-        r#"
-        SELECT stop_id, source_feed_id, original_source_id, import_run_id, priority,
-               confidence, suppressed_as_duplicate
-        FROM stop_source_ids AS source_id
-        JOIN source_feeds AS source_feed
-          ON source_feed.id = source_id.source_feed_id
-         AND source_feed.enabled = true
-        WHERE stop_id = ANY($1)
-        ORDER BY stop_id ASC, priority ASC, source_feed_id ASC
-        "#,
-    )
-    .bind(&stop_ids)
-    .fetch_all(pool);
+    let source_ids_query = sqlx::query(STOP_SEARCH_SOURCE_IDS_QUERY)
+        .bind(&stop_ids)
+        .fetch_all(pool);
 
     let stop_areas_query = async {
         if stop_area_ids.is_empty() {
@@ -9543,7 +10180,7 @@ async fn search_stops_db(
     normalized_query: &str,
     limit: usize,
 ) -> Result<Vec<Stop>, sqlx::Error> {
-    let normalized = normalize_czech_name(raw_query);
+    let normalized = pid_source_stop_query(&normalize_czech_name(raw_query));
     let candidate_limit = stop_search_candidate_limit(limit);
     let raw_candidate_limit = (candidate_limit * 4).min(400);
     if normalized.is_empty() {
@@ -9566,7 +10203,8 @@ async fn search_stops_db(
                    stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
                    stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
                    stop.platform_code, stop.location_type, stop.parent_station_id,
-                   stop.wheelchair_boarding, stop.modes,
+                   stop.station_id, stop.complex_id, stop.has_station_layout,
+                   stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
                    COALESCE(preferred.priority, stop.source_priority) AS source_priority,
                    stop.is_active
             FROM candidates AS candidate
@@ -9612,7 +10250,9 @@ async fn search_stops_db(
                stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
                stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
                stop.platform_code, stop.location_type, stop.parent_station_id,
-               stop.wheelchair_boarding, stop.modes, stop.source_priority, stop.is_active
+               stop.station_id, stop.complex_id, stop.has_station_layout,
+               stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
+               stop.source_priority, stop.is_active
         FROM stops AS stop
         LEFT JOIN source_feeds AS direct_feed
           ON direct_feed.id = stop.source_feed_id
@@ -9621,13 +10261,23 @@ async fn search_stops_db(
           AND stop.name <> ''
           AND stop.normalized_name <> ''
           AND stop.location_type IN ('stop', 'station')
-          AND stop.normalized_name LIKE $1
+          AND (
+            stop.normalized_name LIKE $1
+            OR (
+              stop.location_type = 'station'
+              AND stop.normalized_name LIKE '%' || $3
+            )
+          )
           AND (stop.source_feed_id IS NULL OR direct_feed.id IS NOT NULL)
+        ORDER BY (stop.normalized_name LIKE $1) DESC,
+                 similarity(stop.normalized_name, $3) DESC,
+                 stop.source_priority ASC, stop.name ASC, stop.id ASC
         LIMIT $2
         "#,
     )
     .bind(&prefix)
     .bind(candidate_limit)
+    .bind(&normalized)
     .fetch_all(pool)
     .await?;
     if !direct_prefix_rows.is_empty() {
@@ -9682,7 +10332,8 @@ async fn search_stops_db(
                stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
                stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
                stop.platform_code, stop.location_type, stop.parent_station_id,
-               stop.wheelchair_boarding, stop.modes,
+               stop.station_id, stop.complex_id, stop.has_station_layout,
+               stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
                COALESCE(preferred.priority, stop.source_priority) AS source_priority,
                stop.is_active
         FROM candidates AS candidate
@@ -9739,7 +10390,10 @@ async fn search_stops_db(
         WITH candidates AS MATERIALIZED (
             SELECT stop.id,
                    CASE WHEN stop.id = $4 THEN 0
-                        WHEN stop.normalized_name = $1 THEN 1 ELSE 2 END AS match_rank,
+                        WHEN stop.normalized_name = $1 THEN 1
+                        WHEN stop.location_type = 'station'
+                         AND stop.normalized_name LIKE '%' || $1 THEN 2
+                        ELSE 3 END AS match_rank,
                    similarity(stop.normalized_name, $1) AS normalized_similarity,
                    similarity(stop.name, $6) AS name_similarity,
                    stop.platform_code, stop.source_priority, stop.name
@@ -9767,7 +10421,8 @@ async fn search_stops_db(
                stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
                stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
                stop.platform_code, stop.location_type, stop.parent_station_id,
-               stop.wheelchair_boarding, stop.modes,
+               stop.station_id, stop.complex_id, stop.has_station_layout,
+               stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
                COALESCE(preferred.priority, stop.source_priority) AS source_priority,
                stop.is_active
         FROM candidates AS candidate
@@ -9814,13 +10469,56 @@ async fn search_stops_db(
     ranked_stop_suggestions_db(pool, stops, normalized_query, limit).await
 }
 
+async fn stop_catalog_db(pool: &PgPool) -> Result<Vec<Stop>, sqlx::Error> {
+    sqlx::query(
+        r#"
+        SELECT stop.id,
+               COALESCE(preferred.source_feed_id, stop.source_feed_id) AS source_feed_id,
+               stop.name, stop.normalized_name, stop.municipality, stop.district,
+               stop.region, stop.lat, stop.lon, stop.coordinate_confidence,
+               stop.coordinate_source, stop.stop_area_id, stop.platform_code,
+               stop.location_type, stop.parent_station_id, stop.station_id, stop.complex_id,
+               stop.has_station_layout, stop.station_layout_version,
+               stop.wheelchair_boarding, stop.modes,
+               COALESCE(preferred.priority, stop.source_priority) AS source_priority,
+               stop.is_active
+        FROM stops AS stop
+        LEFT JOIN source_feeds AS direct_feed
+          ON direct_feed.id = stop.source_feed_id AND direct_feed.enabled = true
+        LEFT JOIN LATERAL (
+            SELECT source_id.source_feed_id, source_id.priority
+            FROM stop_source_ids AS source_id
+            JOIN source_feeds AS feed
+              ON feed.id = source_id.source_feed_id AND feed.enabled = true
+            WHERE source_id.stop_id = stop.id
+              AND direct_feed.id IS NULL
+              AND stop.source_feed_id IS NOT NULL
+            ORDER BY source_id.priority ASC, source_id.source_feed_id ASC
+            LIMIT 1
+        ) AS preferred ON true
+        WHERE stop.is_active = true
+          AND stop.name <> ''
+          AND stop.normalized_name <> ''
+          AND stop.location_type IN ('stop', 'station')
+          AND (stop.source_feed_id IS NULL OR direct_feed.id IS NOT NULL
+               OR preferred.source_feed_id IS NOT NULL)
+        ORDER BY stop.id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(stop_from_row)
+    .collect()
+}
+
 fn stop_search_candidate_limit(limit: usize) -> i64 {
     (limit.max(1) * 6).clamp(20, 100) as i64
 }
 
 async fn ranked_stop_suggestions_db(
     pool: &PgPool,
-    stops: Vec<Stop>,
+    mut stops: Vec<Stop>,
     normalized_query: &str,
     limit: usize,
 ) -> Result<Vec<Stop>, sqlx::Error> {
@@ -9830,14 +10528,6 @@ async fn ranked_stop_suggestions_db(
         .collect::<Vec<_>>();
     complex_ids.sort();
     complex_ids.dedup();
-    if complex_ids.is_empty() {
-        return Ok(ranked_stop_suggestions(
-            stops.iter(),
-            normalized_query,
-            limit,
-        ));
-    }
-
     let complex_members = pid_stop_complex_members_db(pool, &complex_ids).await?;
     let mut members_by_complex = HashMap::<String, Vec<Stop>>::new();
     for member in complex_members {
@@ -9848,15 +10538,13 @@ async fn ranked_stop_suggestions_db(
                 .push(member);
         }
     }
-    let stops = stops
-        .into_iter()
-        .map(|stop| {
-            pid_stop_complex_id(&stop.id)
-                .and_then(|complex_id| members_by_complex.get(&complex_id))
-                .and_then(|members| pid_interchange_alias_suggestion(&stop, members))
-                .unwrap_or(stop)
-        })
-        .collect::<Vec<_>>();
+    for stop in &mut stops {
+        if let Some(members) =
+            pid_stop_complex_id(&stop.id).and_then(|complex_id| members_by_complex.get(&complex_id))
+        {
+            merge_interchange_modes(stop, members);
+        }
+    }
     Ok(ranked_stop_suggestions(
         stops.iter(),
         normalized_query,
@@ -9871,29 +10559,41 @@ async fn pid_stop_complex_members_db(
     if complex_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let patterns = complex_ids
-        .iter()
-        .flat_map(|complex_id| [format!("{complex_id}S%"), format!("{complex_id}Z%")])
-        .collect::<Vec<_>>();
     sqlx::query(
         r#"
         SELECT stop.id, stop.source_feed_id, stop.name, stop.normalized_name,
                stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
                stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
                stop.platform_code, stop.location_type, stop.parent_station_id,
-               stop.wheelchair_boarding, stop.modes, stop.source_priority, stop.is_active
-        FROM stops AS stop
+               stop.station_id, stop.complex_id, stop.has_station_layout,
+               stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
+               stop.source_priority, stop.is_active
+        FROM unnest($1::text[]) AS complex(id)
+        CROSS JOIN LATERAL (
+            SELECT stop.id, stop.source_feed_id, stop.name, stop.normalized_name,
+                   stop.municipality, stop.district, stop.region, stop.lat, stop.lon,
+                   stop.coordinate_confidence, stop.coordinate_source, stop.stop_area_id,
+                   stop.platform_code, stop.location_type, stop.parent_station_id,
+                   stop.station_id, stop.complex_id, stop.has_station_layout,
+                   stop.station_layout_version, stop.wheelchair_boarding, stop.modes,
+                   stop.source_priority, stop.is_active
+            FROM stops AS stop
+            WHERE stop.id >= complex.id
+              AND stop.id < complex.id || 'Z~'
+              AND (stop.id LIKE complex.id || 'S%' OR stop.id LIKE complex.id || 'Z%')
+              AND stop.is_active = true
+              AND stop.location_type IN ('stop', 'station')
+            ORDER BY stop.id
+            LIMIT 1000
+        ) AS stop
         JOIN source_feeds AS source_feed
           ON source_feed.id = stop.source_feed_id
          AND source_feed.enabled = true
-        WHERE stop.is_active = true
-          AND stop.location_type IN ('stop', 'station')
-          AND stop.id LIKE ANY($1)
         ORDER BY stop.source_priority ASC, stop.platform_code ASC NULLS FIRST, stop.id ASC
         LIMIT 1000
         "#,
     )
-    .bind(patterns)
+    .bind(complex_ids)
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -9966,7 +10666,8 @@ async fn nearby_stops_db(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               platform_code, location_type, parent_station_id, station_id, complex_id,
+               has_station_layout, station_layout_version, wheelchair_boarding,
                modes, source_priority, is_active
         FROM enabled_source_stops
         WHERE is_active = true
@@ -9997,7 +10698,8 @@ async fn stops_in_bounds_db(
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               platform_code, location_type, parent_station_id, station_id, complex_id,
+               has_station_layout, station_layout_version, wheelchair_boarding,
                modes, source_priority, is_active
         FROM enabled_source_stops
         WHERE is_active = true
@@ -10029,7 +10731,8 @@ async fn get_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sqlx::Erro
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               platform_code, location_type, parent_station_id, station_id, complex_id,
+               has_station_layout, station_layout_version, wheelchair_boarding,
                modes, source_priority, is_active
         FROM enabled_source_stops
         WHERE id = $1 AND is_active = true
@@ -10047,7 +10750,8 @@ async fn get_routing_stop_db(pool: &PgPool, id: &str) -> Result<Option<Stop>, sq
         r#"
         SELECT id, source_feed_id, name, normalized_name, municipality, district, region,
                lat, lon, coordinate_confidence, coordinate_source, stop_area_id,
-               platform_code, location_type, parent_station_id, wheelchair_boarding,
+               platform_code, location_type, parent_station_id, station_id, complex_id,
+               has_station_layout, station_layout_version, wheelchair_boarding,
                modes, source_priority, is_active
         FROM stops
         WHERE id = $1
@@ -10080,11 +10784,43 @@ async fn departures_db(
     stop_id: &str,
     earliest_seconds: u32,
     limit: usize,
+    service_date: chrono::NaiveDate,
 ) -> Result<Vec<Value>, sqlx::Error> {
+    let suggestion_stop_ids = match get_routing_stop_db(pool, stop_id).await? {
+        Some(stop) => equivalent_stop_ids_db(pool, &stop).await?,
+        None => vec![stop_id.to_string()],
+    };
     let rows = sqlx::query(
         r#"
+        WITH selected_stop AS (
+          SELECT id, parent_station_id, stop_area_id
+          FROM stops
+          WHERE id = $1
+          LIMIT 1
+        ),
+        matching_stops AS (
+          SELECT candidate.id
+          FROM stops candidate
+          CROSS JOIN selected_stop selected
+          WHERE candidate.is_active = true
+            AND (
+              candidate.id = ANY($2)
+              OR candidate.id = selected.id
+              OR candidate.parent_station_id = COALESCE(selected.parent_station_id, selected.id)
+              OR (
+                selected.parent_station_id IS NOT NULL
+                AND candidate.id = selected.parent_station_id
+              )
+              OR (
+                selected.stop_area_id IS NOT NULL
+                AND candidate.stop_area_id = selected.stop_area_id
+              )
+            )
+        )
         SELECT
           st.trip_id,
+          st.stop_id,
+          st.stop_sequence,
           st.departure_time,
           st.arrival_time,
           t.headsign,
@@ -10100,7 +10836,12 @@ async fn departures_db(
           realtime.source AS realtime_source,
           realtime.fetched_at AS realtime_fetched_at,
           realtime.valid_until AS realtime_valid_until
+          , boarding_stop.station_id
+          , boarding_stop.complex_id
+          , boarding_stop.has_station_layout
+          , boarding_stop.station_layout_version
         FROM stop_times st
+        JOIN stops boarding_stop ON boarding_stop.id = st.stop_id
         JOIN trips t ON t.id = st.trip_id
         JOIN routes r ON r.id = t.route_id
         JOIN source_feeds feed ON feed.id = t.source_feed_id AND feed.enabled = true
@@ -10115,14 +10856,15 @@ async fn departures_db(
           ORDER BY (realtime.stop_id = st.stop_id) DESC, realtime.fetched_at DESC
           LIMIT 1
         ) realtime ON true
-        WHERE st.stop_id = $1
-          AND st.departure_time >= $2
+        WHERE st.stop_id IN (SELECT id FROM matching_stops)
+          AND st.departure_time >= $3
           AND COALESCE(st.pickup_type, 0) IN (0, 2, 3)
         ORDER BY st.departure_time ASC
-        LIMIT $3
+        LIMIT $4
         "#,
     )
     .bind(stop_id)
+    .bind(&suggestion_stop_ids)
     .bind(earliest_seconds as i32)
     .bind(limit as i64)
     .fetch_all(pool)
@@ -10131,11 +10873,23 @@ async fn departures_db(
     Ok(rows
         .into_iter()
         .map(|row| {
+            let trip_id = row.get::<String, _>("trip_id");
+            let stop_id = row.get::<String, _>("stop_id");
+            let stop_sequence = row.get::<i32, _>("stop_sequence") as i64;
+            let run_id = operational_run_id(&trip_id, service_date);
+            let call_id = operational_call_id(&run_id, &stop_id, stop_sequence);
             let departure_time = row.get::<i32, _>("departure_time") as u32;
             let delay_seconds = row.get::<Option<i32>, _>("delay_seconds");
             let cancellation_status = row.get::<Option<String>, _>("cancellation_status");
             json!({
-                "trip_id": row.get::<String, _>("trip_id"),
+                "trip_id": trip_id,
+                "run_id": run_id,
+                "call_id": call_id,
+                "stop_id": stop_id,
+                "station_id": row.get::<Option<String>, _>("station_id"),
+                "complex_id": row.get::<Option<String>, _>("complex_id"),
+                "has_station_layout": row.get::<bool, _>("has_station_layout"),
+                "station_layout_version": row.get::<Option<String>, _>("station_layout_version"),
                 "route_id": row.get::<String, _>("route_id"),
                 "line": row.get::<Option<String>, _>("short_name")
                     .or_else(|| row.get::<Option<String>, _>("long_name"))
@@ -10172,6 +10926,9 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
         .unwrap_or_else(|| "database".to_string());
     let source_priority = row.get::<i32, _>("source_priority");
     let id = row.get::<String, _>("id");
+    let source_name = row.get::<String, _>("name");
+    let platform_code = row.get::<Option<String>, _>("platform_code");
+    let name = pid_public_stop_name(&id, &source_name, platform_code.as_deref());
     Ok(Stop {
         id: id.clone(),
         source_ids: vec![transit_model::SourceRef {
@@ -10182,8 +10939,8 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
             confidence: None,
             suppressed_as_duplicate: false,
         }],
-        name: row.get("name"),
-        normalized_name: row.get("normalized_name"),
+        normalized_name: normalize_czech_name(&name),
+        name,
         municipality: row.get("municipality"),
         district: row.get("district"),
         region: row.get("region"),
@@ -10197,13 +10954,25 @@ fn stop_from_row(row: sqlx::postgres::PgRow) -> Result<Stop, sqlx::Error> {
         ),
         coordinate_source: row.get("coordinate_source"),
         stop_area_id: row.get("stop_area_id"),
-        platform_code: row.get("platform_code"),
+        platform_code,
         location_type: row
             .try_get::<String, _>("location_type")
             .map(|value| db_stop_location_type_to_model(&value))
             .unwrap_or(StopLocationType::Stop),
         parent_station_id: row
             .try_get::<Option<String>, _>("parent_station_id")
+            .unwrap_or(None),
+        station_id: row
+            .try_get::<Option<String>, _>("station_id")
+            .unwrap_or(None),
+        complex_id: row
+            .try_get::<Option<String>, _>("complex_id")
+            .unwrap_or(None),
+        has_station_layout: row
+            .try_get::<bool, _>("has_station_layout")
+            .unwrap_or(false),
+        station_layout_version: row
+            .try_get::<Option<String>, _>("station_layout_version")
             .unwrap_or(None),
         wheelchair_boarding: row
             .try_get::<String, _>("wheelchair_boarding")
@@ -10280,6 +11049,7 @@ fn stop_time_row_json(row: &sqlx::postgres::PgRow) -> Value {
         "pickup_type": row.get::<Option<i16>, _>("pickup_type"),
         "drop_off_type": row.get::<Option<i16>, _>("drop_off_type"),
         "timepoint": row.get::<Option<bool>, _>("timepoint"),
+        "stop_headsign": row.get::<Option<String>, _>("stop_headsign"),
         "platform": row.get::<Option<String>, _>("platform"),
         "raw_notes": row.get::<Option<String>, _>("raw_notes"),
         "source_feed_id": row.get::<Option<String>, _>("source_feed_id"),
@@ -10541,7 +11311,21 @@ fn stop_search_score(stop: &Stop, query: &str) -> Option<i32> {
     let score = stop_search_score_for_query(stop, query);
     let railway_alias_score = railway_station_query_base(stop, query)
         .and_then(|query| stop_search_score_for_query(stop, query));
-    score.max(railway_alias_score)
+    score
+        .max(railway_alias_score)
+        .max(railway_station_locality_omission_score(stop, query))
+}
+
+fn railway_station_locality_omission_score(stop: &Stop, query: &str) -> Option<i32> {
+    if !stop.modes.contains(&TransportMode::Train)
+        || query.split_whitespace().count() < 2
+        || !query.contains("nadrazi")
+    {
+        return None;
+    }
+    let name = normalize_search_text(&stop.name);
+    (name != query && name.ends_with(query))
+        .then_some(9_500 - (name.len() as i32 - query.len() as i32).max(0))
 }
 
 fn railway_station_query_base<'a>(stop: &Stop, query: &'a str) -> Option<&'a str> {
@@ -10723,6 +11507,36 @@ fn stop_search_json(stop: &Stop) -> Value {
     value
 }
 
+fn stop_catalog_json(stop: &Stop) -> Value {
+    let aliases = stop
+        .name
+        .split(" / ")
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .collect::<Vec<_>>();
+    json!({
+        "id": stop.id,
+        "name": stop.name,
+        "normalized_name": stop.normalized_name,
+        "canonical_name": aliases.first().copied().unwrap_or(&stop.name),
+        "aliases": aliases,
+        "municipality": stop.municipality,
+        "region": stop.region,
+        "lat": stop.lat,
+        "lon": stop.lon,
+        "modes": stop.modes,
+        "platform_code": stop.platform_code,
+        "location_type": stop.location_type,
+        "place_type": stop_place_type(stop),
+        "parent_stop_area_id": stop.stop_area_id.as_ref().or(stop.parent_station_id.as_ref()),
+        "station_id": stop.station_id,
+        "complex_id": stop.complex_id,
+        "has_station_layout": stop.has_station_layout,
+        "station_layout_version": stop.station_layout_version,
+        "source_feed_id": stop.source_ids.first().map(|source| source.feed_id.as_str())
+    })
+}
+
 fn stop_place_type(stop: &Stop) -> &'static str {
     match stop.location_type {
         StopLocationType::EntranceExit => return "station_entrance",
@@ -10779,7 +11593,27 @@ fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
     if left.id == right.id {
         return true;
     }
+    if canonical_stop_name(left) != canonical_stop_name(right) {
+        return false;
+    }
+    if stop_modes_require_separate_suggestions(left, right) {
+        return false;
+    }
+    // PID uses one U-number for every station/interchange complex, while the
+    // following S/Z suffix identifies individual stations and directional
+    // platforms. Some large interchanges span more than the generic proximity
+    // threshold, but they must still be a single autocomplete suggestion.
+    if let (Some(left_complex), Some(right_complex)) = (
+        pid_stop_complex_id(&left.id),
+        pid_stop_complex_id(&right.id),
+    ) && left_complex == right_complex
+    {
+        return true;
+    }
     if left.stop_area_id.is_some() && left.stop_area_id == right.stop_area_id {
+        return true;
+    }
+    if left.parent_station_id.is_some() && left.parent_station_id == right.parent_station_id {
         return true;
     }
     if let (Some(left_base), Some(right_base)) = (
@@ -10789,10 +11623,6 @@ fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
     {
         return true;
     }
-    if canonical_stop_name(left) != canonical_stop_name(right) {
-        return false;
-    }
-
     let left_municipality = left.municipality.as_deref().map(normalize_search_text);
     let right_municipality = right.municipality.as_deref().map(normalize_search_text);
     if matches!((&left_municipality, &right_municipality), (Some(left), Some(right)) if left != right)
@@ -10806,6 +11636,33 @@ fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
         }
         _ => left_municipality.is_some() && left_municipality == right_municipality,
     }
+}
+
+fn stop_modes_require_separate_suggestions(left: &Stop, right: &Stop) -> bool {
+    let modal_kind = |stop: &Stop| {
+        let railway = stop.modes.contains(&TransportMode::Train);
+        let urban = stop.modes.iter().any(|mode| {
+            matches!(
+                mode,
+                TransportMode::Metro
+                    | TransportMode::Tram
+                    | TransportMode::Trolleybus
+                    | TransportMode::Bus
+            )
+        });
+        let ferry = stop.modes.contains(&TransportMode::Ferry);
+        let non_ferry = stop
+            .modes
+            .iter()
+            .any(|mode| !matches!(mode, TransportMode::Ferry | TransportMode::Unknown));
+        (railway, urban, ferry, non_ferry)
+    };
+    let (left_railway, left_urban, left_ferry, left_non_ferry) = modal_kind(left);
+    let (right_railway, right_urban, right_ferry, right_non_ferry) = modal_kind(right);
+    (left_railway && !left_urban && right_urban && !right_railway)
+        || (right_railway && !right_urban && left_urban && !left_railway)
+        || (left_ferry && !left_non_ferry && right_non_ferry && !right_ferry)
+        || (right_ferry && !right_non_ferry && left_non_ferry && !left_ferry)
 }
 
 fn merge_stop_suggestion(canonical: &mut Stop, sibling: &Stop) {
@@ -10822,6 +11679,16 @@ fn merge_stop_suggestion(canonical: &mut Stop, sibling: &Stop) {
     canonical.modes.sort_by_key(stop_search_mode_rank);
 }
 
+fn merge_interchange_modes(stop: &mut Stop, members: &[Stop]) {
+    for member in members {
+        if canonical_stop_name(stop) == canonical_stop_name(member)
+            && !stop_modes_require_separate_suggestions(stop, member)
+        {
+            merge_stop_suggestion(stop, member);
+        }
+    }
+}
+
 fn pid_stop_complex_id(stop_id: &str) -> Option<String> {
     let remainder = stop_id.strip_prefix("pid_gtfs:U")?;
     let digit_count = remainder
@@ -10834,138 +11701,22 @@ fn pid_stop_complex_id(stop_id: &str) -> Option<String> {
     Some(format!("pid_gtfs:U{}", &remainder[..digit_count]))
 }
 
-fn pid_interchange_alias_suggestion(anchor: &Stop, members: &[Stop]) -> Option<Stop> {
-    let alias_members = pid_interchange_alias_members(anchor, members);
-    if alias_members.is_empty() {
-        return None;
-    }
-
-    let canonical = alias_members
-        .iter()
-        .copied()
-        .filter(|member| member.location_type == StopLocationType::Station)
-        .min_by(|left, right| left.id.cmp(&right.id))
-        .or_else(|| {
-            alias_members
-                .iter()
-                .copied()
-                .filter(|member| member.platform_code.is_none())
-                .min_by(|left, right| left.id.cmp(&right.id))
-        })
-        .unwrap_or(anchor);
-    let mut suggestion = canonical.clone();
-    for member in &alias_members {
-        merge_stop_suggestion(&mut suggestion, member);
-    }
-
-    let anchor_name_key = canonical_stop_name(anchor);
-    let canonical_name_key = canonical_stop_name(canonical);
-    let mut names_by_key = HashMap::<String, String>::new();
-    for member in alias_members {
-        names_by_key
-            .entry(canonical_stop_name(member))
-            .or_insert_with(|| member.name.clone());
-    }
-    let mut names = Vec::new();
-    if let Some(name) = names_by_key.remove(&anchor_name_key) {
-        names.push(name);
-    }
-    if canonical_name_key != anchor_name_key
-        && let Some(name) = names_by_key.remove(&canonical_name_key)
+fn pid_public_stop_name(stop_id: &str, source_name: &str, platform_code: Option<&str>) -> String {
+    if pid_stop_complex_id(stop_id).as_deref() == Some("pid_gtfs:U237")
+        && normalize_search_text(source_name) == "palackeho namesti"
+        && matches!(platform_code, Some("I" | "J"))
     {
-        names.push(name);
+        "Palackého náměstí (nábřeží)".to_string()
+    } else {
+        source_name.to_string()
     }
-    let mut other_names = names_by_key.into_iter().collect::<Vec<_>>();
-    other_names.sort_by(|(left, _), (right, _)| left.cmp(right));
-    names.extend(other_names.into_iter().map(|(_, name)| name));
-    suggestion.name = names.join(" / ");
-    suggestion.normalized_name = normalize_czech_name(&suggestion.name);
-    Some(suggestion)
 }
 
-fn pid_interchange_alias_members<'a>(anchor: &Stop, members: &'a [Stop]) -> Vec<&'a Stop> {
-    let Some(complex_id) = pid_stop_complex_id(&anchor.id) else {
-        return Vec::new();
-    };
-    let complex_members = members
-        .iter()
-        .filter(|member| pid_stop_complex_id(&member.id).as_deref() == Some(complex_id.as_str()))
-        .collect::<Vec<_>>();
-    let mut members_by_name = HashMap::<String, Vec<&Stop>>::new();
-    for member in &complex_members {
-        members_by_name
-            .entry(canonical_stop_name(member))
-            .or_default()
-            .push(*member);
-    }
-    let anchor_name = canonical_stop_name(anchor);
-    if !members_by_name
-        .get(&anchor_name)
-        .is_some_and(|name_members| pid_name_group_is_interchange(name_members))
-    {
-        return Vec::new();
-    }
-
-    let center = complex_members
-        .iter()
-        .copied()
-        .filter(|member| member.location_type == StopLocationType::Station)
-        .min_by(|left, right| left.id.cmp(&right.id))
-        .and_then(|station| station.lat.zip(station.lon))
-        .or_else(|| anchor.lat.zip(anchor.lon));
-    let eligible_names = members_by_name
-        .iter()
-        .filter(|(_, name_members)| pid_name_group_is_interchange(name_members))
-        .filter(|(name, name_members)| {
-            *name == &anchor_name
-                || center.is_some_and(|(center_lat, center_lon)| {
-                    name_members.iter().any(|member| {
-                        member.lat.zip(member.lon).is_some_and(|(lat, lon)| {
-                            haversine_m(center_lat, center_lon, lat, lon)
-                                <= PID_INTERCHANGE_ALIAS_RADIUS_M
-                        })
-                    })
-                })
-        })
-        .map(|(name, _)| name.clone())
-        .collect::<HashSet<_>>();
-    if eligible_names.len() < 2 {
-        return Vec::new();
-    }
-    complex_members
-        .into_iter()
-        .filter(|member| eligible_names.contains(&canonical_stop_name(member)))
-        .collect()
-}
-
-fn pid_name_group_is_interchange(members: &[&Stop]) -> bool {
-    if members
-        .iter()
-        .any(|member| member.location_type == StopLocationType::Station)
-        || members
-            .iter()
-            .any(|member| member.modes.contains(&TransportMode::Train))
-    {
-        return true;
-    }
-    members
-        .iter()
-        .flat_map(|member| member.modes.iter())
-        .filter_map(pid_mode_family)
-        .collect::<HashSet<_>>()
-        .len()
-        >= 2
-}
-
-fn pid_mode_family(mode: &TransportMode) -> Option<u8> {
-    match mode {
-        TransportMode::Train => Some(0),
-        TransportMode::Metro => Some(1),
-        TransportMode::Tram => Some(2),
-        TransportMode::Bus | TransportMode::Trolleybus => Some(3),
-        TransportMode::Ferry => Some(4),
-        TransportMode::CableCar => Some(5),
-        TransportMode::Unknown => None,
+fn pid_source_stop_query(normalized_query: &str) -> String {
+    if normalized_query.starts_with("palackeho namesti nabr") {
+        "palackeho namesti".to_string()
+    } else {
+        normalized_query.to_string()
     }
 }
 
@@ -10980,6 +11731,16 @@ fn stop_search_mode_rank(mode: &TransportMode) -> u8 {
         TransportMode::CableCar => 6,
         TransportMode::Unknown => 7,
     }
+}
+
+fn stop_suggestion_mode_rank(stop: &Stop) -> u8 {
+    u8::from(
+        stop.modes.contains(&TransportMode::Ferry)
+            && !stop
+                .modes
+                .iter()
+                .any(|mode| !matches!(mode, TransportMode::Ferry | TransportMode::Unknown)),
+    )
 }
 
 fn searchable_stop_text(stop: &Stop) -> String {
@@ -11245,6 +12006,10 @@ fn fixture_stop(id: &str, name: &str, lat: f64, lon: f64, mode: TransportMode) -
         platform_code: None,
         location_type: StopLocationType::Stop,
         parent_station_id: None,
+        station_id: Some(format!("station:{id}")),
+        complex_id: Some(format!("complex:{id}")),
+        has_station_layout: true,
+        station_layout_version: Some("mock-v1".to_string()),
         wheelchair_boarding: AccessibilityStatus::Unknown,
         modes: vec![mode],
         is_active: true,
@@ -11390,6 +12155,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_search_related_source_query_qualifies_joined_columns() {
+        let query = STOP_SEARCH_SOURCE_IDS_QUERY.to_ascii_lowercase();
+
+        assert!(query.contains("select source_id.stop_id"));
+        assert!(query.contains("source_id.priority"));
+        assert!(query.contains("where source_id.stop_id = any($1)"));
+        assert!(query.contains("order by source_id.stop_id asc, source_id.priority asc"));
+        assert!(!query.contains("select stop_id,"));
+        assert!(!query.contains("order by stop_id asc, priority asc"));
+    }
+
+    #[test]
+    fn operational_run_and_call_ids_are_dated_and_stable() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let run = operational_run_id("pid_gtfs:trip-123", date);
+        let call = operational_call_id(&run, "pid_gtfs:stop", 7);
+
+        assert!(run.starts_with("run:2026-10-01:"));
+        assert_eq!(run, operational_run_id("pid_gtfs:trip-123", date));
+        assert!(call.starts_with("call:"));
+        assert_ne!(call, operational_call_id(&run, "pid_gtfs:stop", 8));
+    }
+
+    #[test]
+    fn accessibility_profile_is_rejected_until_end_to_end_verification_exists() {
+        let body = JourneySearchBody {
+            from: JourneyPoint {
+                point_type: "stop".into(),
+                id: Some("a".into()),
+                lat: None,
+                lon: None,
+            },
+            to: JourneyPoint {
+                point_type: "stop".into(),
+                id: Some("b".into()),
+                lat: None,
+                lon: None,
+            },
+            datetime: "2026-10-01T08:00:00+02:00".into(),
+            mode: "depart_at".into(),
+            transport_modes: vec![TransportMode::Train],
+            max_transfers: 1,
+            walking_speed: "normal".into(),
+            prefer_reliable_transfers: true,
+            offline_compatible: true,
+            include_intermediate_stops: true,
+            journey_preferences: Some(JourneyPreferences {
+                profile: "wheelchair".into(),
+                step_free: true,
+                prefer_fewer_stairs: true,
+                minimum_transfer_buffer_seconds: 600,
+            }),
+        };
+
+        let error = validate_journey_preferences(&body).unwrap_err();
+        assert_eq!(error.code, "journey_accessibility_unverified");
+    }
+
+    #[test]
+    fn mock_layout_preserves_requested_station_identity_and_level() {
+        let layout = mock_station_layout("station:test", Some("mock-platform")).unwrap();
+        assert_eq!(layout["stationId"], "station:test");
+        assert_eq!(layout["mock"], true);
+        assert!(mock_station_layout("station:test", Some("missing")).is_err());
+    }
+
+    #[test]
     fn routing_realtime_query_uses_the_validity_indexable_path() {
         let query = JOURNEY_ROUTING_REALTIME_QUERY.to_ascii_lowercase();
 
@@ -11411,7 +12243,7 @@ mod tests {
 
         assert_eq!(
             path,
-            PathBuf::from("routing/raptor-v12-2026-07-08-1783479136328-0123456789abcdef.json")
+            PathBuf::from("routing/raptor-v13-2026-07-08-1783479136328-0123456789abcdef.json")
         );
     }
 
@@ -11429,7 +12261,7 @@ mod tests {
             "raptor-v7-2026-07-08-old.json",
             "raptor-v8-2026-07-08-old.json",
             "raptor-v9-2026-07-08-current.json",
-            "raptor-v12-2026-07-08-newer.json",
+            "raptor-v13-2026-07-08-newer.json",
             "notes.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
@@ -11447,7 +12279,7 @@ mod tests {
         assert!(!directory.join("raptor-v7-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v8-2026-07-08-old.json").exists());
         assert!(!directory.join("raptor-v9-2026-07-08-current.json").exists());
-        assert!(directory.join("raptor-v12-2026-07-08-newer.json").exists());
+        assert!(directory.join("raptor-v13-2026-07-08-newer.json").exists());
         assert!(directory.join("notes.json").exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -11521,12 +12353,12 @@ mod tests {
             std::env::temp_dir().join(format!("cesta-raptor-retention-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         for file_name in [
-            "raptor-v12-2026-06-01-import-old.json",
-            "raptor-v12-2026-06-01-import-new.json",
-            "raptor-v12-2026-06-02-import.json",
-            "raptor-v12-2026-06-03-import.json",
-            "raptor-v12-2026-06-04-import.json",
-            "raptor-v12-2026-06-05-import.json",
+            "raptor-v13-2026-06-01-import-old.json",
+            "raptor-v13-2026-06-01-import-new.json",
+            "raptor-v13-2026-06-02-import.json",
+            "raptor-v13-2026-06-03-import.json",
+            "raptor-v13-2026-06-04-import.json",
+            "raptor-v13-2026-06-05-import.json",
         ] {
             tokio::fs::write(directory.join(file_name), b"test")
                 .await
@@ -11539,10 +12371,10 @@ mod tests {
         assert_eq!(prune_raptor_snapshots(&directory, 8).await.unwrap(), 1);
         assert_ne!(
             directory
-                .join("raptor-v12-2026-06-01-import-old.json")
+                .join("raptor-v13-2026-06-01-import-old.json")
                 .exists(),
             directory
-                .join("raptor-v12-2026-06-01-import-new.json")
+                .join("raptor-v13-2026-06-01-import-new.json")
                 .exists()
         );
         assert_eq!(prune_raptor_snapshots(&directory, 2).await.unwrap(), 3);
@@ -11552,7 +12384,7 @@ mod tests {
             if entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("raptor-v12-"))
+                .is_some_and(|name| name.starts_with("raptor-v13-"))
             {
                 retained_count += 1;
             }
@@ -11588,6 +12420,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_catalog_download_and_revalidation() {
+        let state = app_state().await.unwrap();
+        let app = build_router(state.clone());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = first.headers()[header::ETAG].clone();
+        let body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["count"], state.stops.len());
+        assert_eq!(payload["data_status"]["source"], "mock");
+        assert!(
+            payload["stops"]
+                .as_array()
+                .unwrap()
+                .windows(2)
+                .all(|pair| { pair[0]["id"].as_str().unwrap() < pair[1]["id"].as_str().unwrap() })
+        );
+        assert_eq!(payload["stops"][0]["source_feed_id"], "fixture");
+
+        let compressed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/catalog")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compressed.status(), StatusCode::OK);
+        assert_eq!(compressed.headers()[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(compressed.headers()[header::ETAG], etag);
+        assert!(
+            to_bytes(compressed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len()
+                < body.len()
+        );
+
+        let unchanged = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/catalog")
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[header::ETAG], etag);
+        assert!(
+            to_bytes(unchanged.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut changed_state = state;
+        let mut changed_stops = changed_state.stops.as_ref().clone();
+        changed_stops[0].name.push_str(" nový název");
+        changed_state.stops = Arc::new(changed_stops);
+        let changed = build_router(changed_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stops/catalog")
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], etag);
+    }
+
+    #[tokio::test]
     async fn openapi_documents_city_search_and_journey_points() {
         let app = build_router(app_state().await.unwrap());
         let response = app
@@ -11602,6 +12524,7 @@ mod tests {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["paths"]["/stops/catalog"]["get"].is_object());
         assert!(
             payload["paths"]["/stops/search"]["get"]["parameters"]
                 .as_array()
@@ -11654,6 +12577,13 @@ mod tests {
             false
         );
         assert!(payload["components"]["schemas"]["JourneyStopCall"].is_object());
+        assert!(payload["paths"]["/stations/{stationId}/layout"]["get"].is_object());
+        assert!(payload["paths"]["/runs/{runId}/formation"]["get"].is_object());
+        assert!(
+            payload["paths"]["/journeys/{journeyId}/legs/{legIndex}/boarding-guidance"]["get"]
+                .is_object()
+        );
+        assert!(payload["components"]["schemas"]["JourneyPreferences"].is_object());
         assert!(payload["paths"]["/admin/routing-algorithm"]["put"].is_object());
         assert!(payload["paths"]["/admin/data-quality/repairs"]["get"].is_object());
         assert!(payload["paths"]["/admin/data-quality/repairs/automatic"]["post"].is_object());
@@ -11680,7 +12610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_sources_lists_only_pid_feeds() {
+    async fn metadata_sources_lists_enabled_official_feeds() {
         let app = build_router(app_state().await.unwrap());
         let response = app
             .oneshot(
@@ -11702,7 +12632,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             source_ids,
-            vec!["pid_gtfs", "pid_lines_geodata", "pid_realtime"]
+            vec![
+                "pid_gtfs",
+                "pid_lines_geodata",
+                "pid_realtime",
+                "ids_jmk_gtfs",
+                "ids_jmk_realtime"
+            ]
         );
     }
 
@@ -12126,7 +13062,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_search_merges_modes_from_nearby_same_name_stops_at_limit_one() {
+    fn stop_search_keeps_railway_and_urban_same_name_stops_separate() {
         let mut station = fixture_stop(
             "central-station",
             "Central",
@@ -12157,31 +13093,174 @@ mod tests {
         train.platform_code = Some("1".to_string());
         let stops = [station, metro, bus, train];
 
-        let suggestions = ranked_stop_suggestions(stops.iter(), "central", 1);
+        let suggestions = ranked_stop_suggestions(stops.iter(), "central", 10);
 
-        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions.len(), 2);
         assert_eq!(suggestions[0].id, "central-station");
         assert_eq!(
             suggestions[0].modes,
-            vec![
-                TransportMode::Train,
-                TransportMode::Metro,
-                TransportMode::Bus,
-            ]
+            vec![TransportMode::Metro, TransportMode::Bus]
+        );
+        assert_eq!(suggestions[1].id, "central-train");
+        assert_eq!(suggestions[1].modes, vec![TransportMode::Train]);
+    }
+
+    #[test]
+    fn pid_railway_and_tram_platform_are_separate_suggestions() {
+        let mut railway = fixture_stop(
+            "pid_gtfs:U142S2",
+            "Hlavní nádraží",
+            50.083096,
+            14.436194,
+            TransportMode::Train,
+        );
+        railway.location_type = StopLocationType::Station;
+        railway.platform_code = None;
+        let tram = fixture_stop(
+            "pid_gtfs:U142Z2P",
+            "Hlavní nádraží",
+            50.085292,
+            14.435092,
+            TransportMode::Tram,
+        );
+
+        let suggestions =
+            ranked_stop_suggestions([&railway, &tram].into_iter(), "hlavni nadrazi", 10);
+
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].modes, vec![TransportMode::Train]);
+        assert_eq!(suggestions[1].modes, vec![TransportMode::Tram]);
+    }
+
+    #[test]
+    fn pid_ferry_and_tram_platforms_are_separate_suggestions() {
+        let ferry = fixture_stop(
+            "pid_gtfs:U19Z11P",
+            "Belárie",
+            50.013126,
+            14.397527,
+            TransportMode::Ferry,
+        );
+        let tram_a = fixture_stop(
+            "pid_gtfs:U19Z1P",
+            "Belárie",
+            50.015944,
+            14.397394,
+            TransportMode::Tram,
+        );
+        let tram_b = fixture_stop(
+            "pid_gtfs:U19Z2P",
+            "Belárie",
+            50.015840,
+            14.398274,
+            TransportMode::Tram,
+        );
+
+        let suggestions =
+            ranked_stop_suggestions([&ferry, &tram_a, &tram_b].into_iter(), "belarie", 10);
+
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].id, tram_a.id);
+        assert_eq!(suggestions[0].modes, vec![TransportMode::Tram]);
+        assert_eq!(suggestions[1].id, ferry.id);
+        assert_eq!(suggestions[1].modes, vec![TransportMode::Ferry]);
+    }
+
+    #[test]
+    fn stop_search_collapses_distant_platforms_in_the_same_pid_complex() {
+        let mut station = fixture_stop(
+            "pid_gtfs:U1141S1",
+            "Zličín",
+            50.053264,
+            14.291140,
+            TransportMode::Metro,
+        );
+        station.location_type = StopLocationType::Station;
+        station.platform_code = None;
+        let mut directional_platform = fixture_stop(
+            "pid_gtfs:U1141Z9P",
+            "Zličín",
+            50.055874,
+            14.288173,
+            TransportMode::Bus,
+        );
+        directional_platform.platform_code = Some("9".to_string());
+
+        assert!(
+            haversine_m(
+                station.lat.unwrap(),
+                station.lon.unwrap(),
+                directional_platform.lat.unwrap(),
+                directional_platform.lon.unwrap()
+            ) > 300.0
+        );
+
+        let suggestions =
+            ranked_stop_suggestions([&station, &directional_platform].into_iter(), "zlicin", 10);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].id, "pid_gtfs:U1141S1");
+        assert_eq!(
+            suggestions[0].modes,
+            vec![TransportMode::Metro, TransportMode::Bus]
         );
     }
 
     #[test]
-    fn pid_interchange_alias_merges_karlovo_and_palackeho_but_not_moran() {
-        let mut station = fixture_stop(
-            "pid_gtfs:U237S1",
-            "Karlovo náměstí",
-            50.074590,
-            14.416980,
-            TransportMode::Unknown,
+    fn stop_search_collapses_same_name_platforms_with_one_parent_station() {
+        let mut line_a = fixture_stop(
+            "metro-a-platform",
+            "Můstek",
+            50.0838,
+            14.4242,
+            TransportMode::Metro,
         );
-        station.location_type = StopLocationType::Station;
-        station.modes.clear();
+        line_a.parent_station_id = Some("mustek-interchange".to_string());
+        line_a.platform_code = Some("A".to_string());
+        let mut line_b = fixture_stop(
+            "metro-b-platform",
+            "Můstek",
+            50.0870,
+            14.4242,
+            TransportMode::Metro,
+        );
+        line_b.parent_station_id = Some("mustek-interchange".to_string());
+        line_b.platform_code = Some("B".to_string());
+
+        let suggestions = ranked_stop_suggestions([&line_a, &line_b].into_iter(), "mustek", 10);
+
+        assert_eq!(suggestions.len(), 1);
+    }
+
+    #[test]
+    fn pid_public_stop_names_keep_interchange_boarding_points_distinct() {
+        assert_eq!(
+            pid_public_stop_name("pid_gtfs:U237Z6P", "Palackého náměstí", Some("K")),
+            "Palackého náměstí"
+        );
+        assert_eq!(
+            pid_public_stop_name("pid_gtfs:U237Z7P", "Palackého náměstí", Some("I")),
+            "Palackého náměstí (nábřeží)"
+        );
+        assert_eq!(
+            pid_public_stop_name("pid_gtfs:U237S1", "Karlovo náměstí", None),
+            "Karlovo náměstí"
+        );
+        assert_eq!(
+            pid_source_stop_query("palackeho namesti nabrezi"),
+            "palackeho namesti"
+        );
+    }
+
+    #[test]
+    fn pid_interchange_modes_never_cross_public_stop_names() {
+        let mut palackeho = fixture_stop(
+            "pid_gtfs:U237Z5P",
+            "Palackého náměstí",
+            50.073231,
+            14.415247,
+            TransportMode::Tram,
+        );
         let metro = fixture_stop(
             "pid_gtfs:U237Z101P",
             "Karlovo náměstí",
@@ -12189,97 +13268,44 @@ mod tests {
             14.416855,
             TransportMode::Metro,
         );
-        let mut palackeho = fixture_stop(
+        let trolleybus = fixture_stop(
             "pid_gtfs:U237Z6P",
             "Palackého náměstí",
             50.073265,
             14.414462,
-            TransportMode::Tram,
-        );
-        palackeho.modes = vec![
-            TransportMode::Tram,
             TransportMode::Trolleybus,
-            TransportMode::Bus,
-        ];
-        let moran = fixture_stop(
-            "pid_gtfs:U237Z4P",
-            "Moráň",
-            50.074024,
-            14.418731,
-            TransportMode::Tram,
         );
-        let members = [station, metro, palackeho.clone(), moran];
 
-        let suggestion = pid_interchange_alias_suggestion(&palackeho, &members).unwrap();
+        merge_interchange_modes(&mut palackeho, &[metro, trolleybus]);
 
-        assert_eq!(suggestion.id, "pid_gtfs:U237S1");
-        assert_eq!(suggestion.name, "Palackého náměstí / Karlovo náměstí");
+        assert_eq!(palackeho.id, "pid_gtfs:U237Z5P");
+        assert_eq!(palackeho.name, "Palackého náměstí");
         assert_eq!(
-            suggestion.modes,
-            vec![
-                TransportMode::Metro,
-                TransportMode::Tram,
-                TransportMode::Trolleybus,
-                TransportMode::Bus,
-            ]
+            palackeho.modes,
+            vec![TransportMode::Tram, TransportMode::Trolleybus]
         );
-        assert!(!suggestion.name.contains("Moráň"));
     }
 
     #[test]
-    fn pid_interchange_alias_includes_connected_rail_name() {
-        let mut station = fixture_stop(
-            "pid_gtfs:U480S1",
-            "Náměstí Republiky",
-            50.088804,
-            14.430556,
-            TransportMode::Unknown,
-        );
-        station.location_type = StopLocationType::Station;
-        station.modes.clear();
-        let metro = fixture_stop(
-            "pid_gtfs:U480Z101P",
-            "Náměstí Republiky",
-            50.088880,
-            14.430477,
+    fn shared_stop_area_never_merges_different_public_names() {
+        let mut karlovo = fixture_stop(
+            "pid_gtfs:U237Z101P",
+            "Karlovo náměstí",
+            50.074664,
+            14.416855,
             TransportMode::Metro,
         );
-        let mut surface = fixture_stop(
-            "pid_gtfs:U480Z3P",
-            "Masarykovo nádraží",
-            50.087685,
-            14.432513,
+        let mut palackeho = fixture_stop(
+            "pid_gtfs:U237Z5P",
+            "Palackého náměstí",
+            50.073231,
+            14.415247,
             TransportMode::Tram,
         );
-        surface.modes.push(TransportMode::Bus);
-        let train = fixture_stop(
-            "pid_gtfs:U480Z301",
-            "Praha Masarykovo nádraží",
-            50.087936,
-            14.433740,
-            TransportMode::Train,
-        );
-        let members = [station, metro, surface, train.clone()];
+        karlovo.stop_area_id = Some("pid_gtfs:U237".to_string());
+        palackeho.stop_area_id = Some("pid_gtfs:U237".to_string());
 
-        let suggestion = pid_interchange_alias_suggestion(&train, &members).unwrap();
-
-        assert_eq!(suggestion.id, "pid_gtfs:U480S1");
-        for alias in [
-            "Praha Masarykovo nádraží",
-            "Náměstí Republiky",
-            "Masarykovo nádraží",
-        ] {
-            assert!(suggestion.name.contains(alias));
-        }
-        assert_eq!(
-            suggestion.modes,
-            vec![
-                TransportMode::Train,
-                TransportMode::Metro,
-                TransportMode::Tram,
-                TransportMode::Bus,
-            ]
-        );
+        assert!(!stops_are_same_suggestion(&karlovo, &palackeho));
     }
 
     #[test]
@@ -12550,6 +13576,50 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn latency_percentiles_use_nearest_rank_and_handle_empty_samples() {
+        assert_eq!(latency_percentile(&[], 95), None);
+        assert_eq!(latency_percentile(&[240], 50), Some(240));
+        let values = (1..=20).collect::<Vec<u64>>();
+        assert_eq!(latency_percentile(&values, 50), Some(10));
+        assert_eq!(latency_percentile(&values, 95), Some(19));
+        assert_eq!(latency_percentile(&values, 100), Some(20));
+    }
+
+    #[tokio::test]
+    async fn journey_search_rejects_arrival_and_unknown_modes_before_routing() {
+        let app = build_router(app_state().await.unwrap());
+        for mode in ["arrive_by", "unexpected"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/journeys/search")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "from": {"type":"stop", "id":"stop-praha-hl-n"},
+                                "to": {"type":"stop", "id":"stop-brno-hl-n"},
+                                "datetime":"2026-07-06T07:05:00+02:00", "mode":mode,
+                                "transport_modes":["train"], "max_transfers":4,
+                                "walking_speed":"normal", "prefer_reliable_transfers":true,
+                                "offline_compatible":false
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["code"], "unsupported_search_mode");
+            assert!(payload.get("journeys").is_none());
+        }
+    }
+
     fn journey_search_request(
         from_type: &str,
         from_id: &str,
@@ -12792,7 +13862,7 @@ mod tests {
             Some("metro"),
             &["metro".to_string()],
         );
-        assert_eq!(first.as_deref(), Some("source:pid_gtfs:U142:kacerov"));
+        assert_eq!(first.as_deref(), Some("source:pid_gtfs:U142"));
         assert_eq!(first, second);
     }
 
@@ -12859,6 +13929,82 @@ mod tests {
                 .is_some_and(|suggestion| suggestion.id == station.id)
         );
         assert!(stop_search_score(&ordinary_stop, "vsetin hl n").is_none());
+    }
+
+    #[test]
+    fn short_main_station_query_keeps_city_qualified_railway_match() {
+        let railway = fixture_stop(
+            "pid_gtfs:U142S2",
+            "Praha hlavní nádraží",
+            50.083096,
+            14.436194,
+            TransportMode::Train,
+        );
+        let tram = fixture_stop(
+            "pid_gtfs:U142Z2P",
+            "Hlavní nádraží",
+            50.085292,
+            14.435092,
+            TransportMode::Tram,
+        );
+
+        let suggestions =
+            ranked_stop_suggestions([&railway, &tram].into_iter(), "hlavni nadrazi", 10);
+
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions.iter().any(|stop| stop.id == railway.id));
+        assert!(suggestions.iter().any(|stop| stop.id == tram.id));
+    }
+
+    #[test]
+    fn selected_stops_and_coordinates_use_nearby_access_but_cities_do_not() {
+        let point = |point_type: &str| JourneyPoint {
+            point_type: point_type.to_string(),
+            id: Some("test".to_string()),
+            lat: Some(50.0),
+            lon: Some(14.0),
+        };
+
+        assert!(journey_point_uses_nearby_access(&point("stop")));
+        assert!(journey_point_uses_nearby_access(&point("coordinate")));
+        assert!(!journey_point_uses_nearby_access(&point("city")));
+    }
+
+    #[test]
+    fn endpoint_access_does_not_short_circuit_transit_with_an_unreturned_direct_walk() {
+        let transfer = |from: &str, to: &str| Transfer {
+            from_stop_id: from.to_string(),
+            to_stop_id: to.to_string(),
+            min_transfer_seconds: 300,
+            distance_meters: Some(400),
+            walking_geometry: None,
+            confidence: CoordinateConfidence::High,
+            accessibility_level: None,
+            source: "test_endpoint_access".to_string(),
+        };
+        let mut transfers = vec![
+            transfer("railway", "tram"),
+            transfer("railway", "destination"),
+            transfer("bus", "destination"),
+        ];
+
+        remove_direct_endpoint_walks(
+            &mut transfers,
+            &["railway".to_string()],
+            &["destination".to_string()],
+        );
+
+        assert_eq!(transfers.len(), 2);
+        assert!(
+            transfers
+                .iter()
+                .any(|transfer| transfer.to_stop_id == "tram")
+        );
+        assert!(
+            transfers
+                .iter()
+                .any(|transfer| transfer.from_stop_id == "bus")
+        );
     }
 
     #[test]
@@ -13119,7 +14265,218 @@ mod tests {
     }
 
     #[test]
-    fn carrier_diversity_does_not_restore_an_objectively_dominated_option() {
+    fn ranked_journeys_keep_direct_departures_when_faster_routes_need_transfers() {
+        let mut journeys = (0..4)
+            .map(|index| {
+                let mut direct = test_journey(
+                    &format!("direct-6-{index}"),
+                    0,
+                    10 * 3600 + index * 8 * 60,
+                    10 * 3600 + 16 * 60 + index * 8 * 60,
+                );
+                direct.legs[0].route_id = Some("tram-6".to_string());
+                direct
+            })
+            .collect::<Vec<_>>();
+        journeys.extend((0..4).map(|index| {
+            test_journey(
+                &format!("faster-transfer-{index}"),
+                1,
+                10 * 3600 + 60 + index * 8 * 60,
+                10 * 3600 + 15 * 60 + index * 8 * 60,
+            )
+        }));
+        let configuration = RoutingAlgorithmConfig {
+            preserve_simplest: false,
+            preserve_each_transfer_count: false,
+            preserve_carrier_diversity: false,
+            ..RoutingAlgorithmConfig::default()
+        };
+
+        let ranked =
+            ranked_journey_results_with_carriers(journeys, &HashMap::new(), &configuration);
+
+        assert_eq!(ranked.len(), 8);
+        assert_eq!(
+            ranked
+                .iter()
+                .filter(|journey| journey.transfer_count == 0)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn ranked_journeys_preserve_direct_tram_against_faster_walked_tram() {
+        let mut journeys = (0..25)
+            .map(|index| {
+                let mut walked = test_journey(
+                    &format!("walked-17-{index}"),
+                    0,
+                    10 * 3600 + index * 60,
+                    10 * 3600 + 10 * 60 + index * 60,
+                );
+                walked.legs[0].route_id = Some("tram-17".to_string());
+                walked.walking_distance_meters = 700;
+                walked
+            })
+            .collect::<Vec<_>>();
+        let mut direct = test_journey("direct-6", 0, 10 * 3600 + 60, 10 * 3600 + 17 * 60);
+        direct.legs[0].route_id = Some("tram-6".to_string());
+        journeys.push(direct);
+
+        let ranked = ranked_journey_results(journeys);
+        let direct = ranked
+            .iter()
+            .find(|journey| journey.legs[0].route_id.as_deref() == Some("tram-6"))
+            .expect("a direct tram must survive a frontier of faster walking alternatives");
+
+        assert!(direct.labels.iter().any(|label| label == "nejjednodussi"));
+        assert_eq!(ranked[0].walking_distance_meters, 700);
+        assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn ranked_journeys_one_result_limit_keeps_primary_rank() {
+        let faster = test_journey("faster-transfer", 1, 10 * 3600, 11 * 3600);
+        let simpler = test_journey("slower-direct", 0, 10 * 3600, 12 * 3600);
+        let configuration = RoutingAlgorithmConfig {
+            max_results: 1,
+            ..RoutingAlgorithmConfig::default()
+        };
+
+        let ranked = ranked_journey_results_with_carriers(
+            vec![simpler, faster],
+            &HashMap::new(),
+            &configuration,
+        );
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].arrival_time, 11 * 3600);
+        assert_eq!(ranked[0].transfer_count, 1);
+    }
+
+    #[test]
+    fn ranked_journeys_bound_route_reservations_to_preserve_departure_range() {
+        let journeys = (0..20)
+            .map(|index| {
+                test_journey(
+                    &format!("route-{index}"),
+                    0,
+                    10 * 3600 + index * 60,
+                    10 * 3600 + 10 * 60 + index * 60,
+                )
+            })
+            .collect::<Vec<_>>();
+        let configuration = RoutingAlgorithmConfig {
+            max_results: 6,
+            preserve_carrier_diversity: false,
+            ..RoutingAlgorithmConfig::default()
+        };
+
+        let ranked =
+            ranked_journey_results_with_carriers(journeys, &HashMap::new(), &configuration);
+
+        assert_eq!(ranked.len(), 6);
+        assert_eq!(ranked[0].departure_time, 10 * 3600);
+        assert!(
+            ranked
+                .iter()
+                .any(|journey| journey.departure_time == 10 * 3600 + 19 * 60)
+        );
+    }
+
+    #[test]
+    fn journey_dominance_requires_all_travel_criteria_to_improve() {
+        let direct = test_journey("direct", 0, 10 * 3600, 11 * 3600);
+        let transfer = test_journey("transfer", 1, 10 * 3600, 11 * 3600);
+        let mut walked = direct.clone();
+        walked.walking_distance_meters = 300;
+        let identical = direct.clone();
+
+        assert!(time_dominates(&direct, &transfer));
+        assert!(!time_dominates(&transfer, &direct));
+        assert!(time_dominates(&direct, &walked));
+        assert!(!time_dominates(&walked, &direct));
+        assert!(!time_dominates(&direct, &identical));
+    }
+
+    #[test]
+    fn journey_dominance_honors_same_carrier_configuration() {
+        let faster = test_journey("faster", 0, 10 * 3600, 11 * 3600);
+        let slower = test_journey("slower", 0, 10 * 3600, 12 * 3600);
+        let configuration = RoutingAlgorithmConfig {
+            dominate_only_same_carrier: true,
+            preserve_simplest: false,
+            preserve_each_transfer_count: false,
+            preserve_carrier_diversity: false,
+            ..RoutingAlgorithmConfig::default()
+        };
+        let mut carriers = HashMap::from([
+            ("route-faster".to_string(), "operator-a".to_string()),
+            ("route-slower".to_string(), "operator-b".to_string()),
+        ]);
+
+        assert_eq!(
+            remove_dominated_journeys(
+                vec![faster.clone(), slower.clone()],
+                &carriers,
+                &configuration
+            )
+            .len(),
+            2
+        );
+        carriers.insert("route-slower".to_string(), "operator-a".to_string());
+        assert_eq!(
+            remove_dominated_journeys(
+                vec![faster.clone(), slower.clone()],
+                &carriers,
+                &configuration
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            remove_dominated_journeys(vec![faster, slower], &HashMap::new(), &configuration).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn ranked_journeys_represent_the_full_departure_arrival_frontier() {
+        let journeys = (0..5)
+            .map(|index| {
+                test_journey(
+                    &format!("frontier-{index}"),
+                    0,
+                    8 * 3600 + index * 10 * 60,
+                    9 * 3600 + index * 10 * 60,
+                )
+            })
+            .collect::<Vec<_>>();
+        let configuration = RoutingAlgorithmConfig {
+            max_results: 3,
+            preserve_simplest: false,
+            preserve_each_transfer_count: false,
+            preserve_carrier_diversity: false,
+            ..RoutingAlgorithmConfig::default()
+        };
+
+        let ranked =
+            ranked_journey_results_with_carriers(journeys, &HashMap::new(), &configuration);
+        let departure_times = ranked
+            .iter()
+            .map(|journey| journey.departure_time)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            departure_times,
+            vec![8 * 3600, 8 * 3600 + 20 * 60, 8 * 3600 + 40 * 60]
+        );
+    }
+
+    #[test]
+    fn carrier_diversity_keeps_one_potential_fare_exception() {
         let mut journeys = (0..6)
             .map(|index| {
                 test_journey(
@@ -13152,8 +14509,8 @@ mod tests {
             &RoutingAlgorithmConfig::default(),
         );
 
-        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
-        assert!(!ranked.iter().any(|journey| {
+        assert_eq!(ranked.len(), 7);
+        assert!(ranked.iter().any(|journey| {
             journey
                 .legs
                 .iter()
@@ -13190,7 +14547,7 @@ mod tests {
             .map(journey_route_signature)
             .collect::<HashSet<_>>();
 
-        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
+        assert_eq!(ranked.len(), 5);
         assert!(!signatures.contains("route:route-15|route:route-8"));
         assert!(!signatures.contains("route:route-c|route:route-34"));
     }
@@ -13388,6 +14745,257 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adaptive_search_keeps_exact_direct_route_when_walked_route_arrives_first() {
+        let time = |minutes: u32| 10 * 3600 + minutes * 60;
+        let trip =
+            |id: &str, route: &str, mode, from: &str, to: &str, departure, arrival| RaptorTrip {
+                trip_id: id.to_string(),
+                route_id: route.to_string(),
+                mode,
+                service_verified: true,
+                stop_times: vec![
+                    RaptorStopTime {
+                        stop_id: from.to_string(),
+                        arrival_time: departure,
+                        departure_time: departure,
+                        pickup_allowed: true,
+                        drop_off_allowed: true,
+                    },
+                    RaptorStopTime {
+                        stop_id: to.to_string(),
+                        arrival_time: arrival,
+                        departure_time: arrival,
+                        pickup_allowed: true,
+                        drop_off_allowed: true,
+                    },
+                ],
+            };
+        let timetable = Arc::new(RaptorTimetable::new(
+            vec![
+                trip(
+                    "direct-6",
+                    "6",
+                    TransportMode::Tram,
+                    "karlovo",
+                    "stross",
+                    time(7),
+                    time(23),
+                ),
+                trip(
+                    "walked-17",
+                    "17",
+                    TransportMode::Tram,
+                    "palackeho",
+                    "stross",
+                    time(6),
+                    time(20),
+                ),
+                trip(
+                    "metro-b",
+                    "B",
+                    TransportMode::Metro,
+                    "karlovo",
+                    "transfer",
+                    time(5),
+                    time(8),
+                ),
+                trip(
+                    "connecting-6",
+                    "6",
+                    TransportMode::Tram,
+                    "transfer",
+                    "stross",
+                    time(10),
+                    time(14),
+                ),
+            ],
+            Vec::new(),
+        ));
+        let access = vec![Transfer {
+            from_stop_id: "karlovo".to_string(),
+            to_stop_id: "palackeho".to_string(),
+            min_transfer_seconds: 280,
+            distance_meters: Some(349),
+            walking_geometry: None,
+            confidence: CoordinateConfidence::Exact,
+            accessibility_level: None,
+            source: "verified-pedestrian-router".to_string(),
+        }];
+        let configuration = RoutingAlgorithmConfig {
+            max_results: 3,
+            max_range_departures: 1,
+            range_search_window_seconds: 90 * 60,
+            ..RoutingAlgorithmConfig::default()
+        };
+        let result = run_adaptive_raptor_searches(
+            timetable,
+            &["karlovo".to_string()],
+            &["stross".to_string()],
+            &access,
+            time(0),
+            4,
+            60,
+            0,
+            &[TransportMode::Tram, TransportMode::Metro],
+            false,
+            &configuration,
+            Arc::new(RaptorRealtimeData::default()),
+        )
+        .await
+        .unwrap();
+        let ranked =
+            ranked_journey_results_with_carriers(result.journeys, &HashMap::new(), &configuration);
+        assert_eq!(ranked[0].arrival_time, time(14));
+        assert!(
+            ranked.iter().any(|journey| {
+                journey.legs.len() == 1
+                    && journey.legs[0].trip_id.as_deref() == Some("direct-6")
+                    && journey.transfer_count == 0
+                    && journey.walking_distance_meters == 0
+            }),
+            "a direct tram must remain available alongside the faster metro interchange and walked tram"
+        );
+    }
+
+    #[test]
+    fn geometry_shortlist_keeps_valid_fallback_until_dominator_is_validated() {
+        let invalid = test_journey("invalid-geometry", 0, 8 * 3600 + 60, 9 * 3600);
+        let valid = test_journey("valid-geometry", 0, 8 * 3600, 9 * 3600 + 60);
+        let configuration = RoutingAlgorithmConfig {
+            max_results: 1,
+            ..RoutingAlgorithmConfig::default()
+        };
+        let mut shortlist = ranked_journey_results_with_carriers(
+            vec![invalid, valid],
+            &HashMap::new(),
+            &geometry_preselection_config(&configuration),
+        );
+        assert_eq!(shortlist.len(), 2);
+        // Simulate the geometry validator rejecting the faster timetable candidate.
+        shortlist
+            .retain(|journey| journey.legs[0].trip_id.as_deref() != Some("trip-invalid-geometry"));
+        let ranked =
+            ranked_journey_results_with_carriers(shortlist, &HashMap::new(), &configuration);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            ranked[0].legs[0].trip_id.as_deref(),
+            Some("trip-valid-geometry")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit real-data regression; requires CESTA_ROUTING_REGRESSION_SNAPSHOT"]
+    async fn real_pid_snapshot_keeps_direct_trams_in_multimode_search() {
+        let path = std::env::var("CESTA_ROUTING_REGRESSION_SNAPSHOT")
+            .expect("set CESTA_ROUTING_REGRESSION_SNAPSHOT to the documented 2026-10-05 snapshot");
+        let snapshot: RaptorTimetableSnapshot =
+            serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                .unwrap();
+        assert_eq!(
+            snapshot.service_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap()
+        );
+        let timetable = Arc::new(snapshot.timetable);
+        let karlovo = [
+            "U237S1",
+            "U237Z101P",
+            "U237Z102P",
+            "U237Z10P",
+            "U237Z1P",
+            "U237Z2P",
+            "U237Z3P",
+            "U237Z9P",
+        ]
+        .map(|id| format!("pid_gtfs:{id}"));
+        let stross =
+            ["U717Z1P", "U717Z2P", "U717Z4P", "U717Z5P"].map(|id| format!("pid_gtfs:{id}"));
+        let configuration = RoutingAlgorithmConfig::default();
+        for (from, to) in [(&karlovo[..], &stross[..]), (&stross[..], &karlovo[..])] {
+            for hour in [8, 10, 12, 14] {
+                for modes in [Vec::new(), vec![TransportMode::Tram]] {
+                    let departure = hour * 3600;
+                    let request = RaptorRequest {
+                        from_stop_ids: from.to_vec(),
+                        to_stop_ids: to.to_vec(),
+                        extra_transfers: Vec::new(),
+                        departure_time: departure,
+                        max_transfers: 0,
+                        min_transfer_seconds: 300,
+                        transfer_buffer_seconds: 0,
+                        modes: modes.clone(),
+                        allow_unverified_services: false,
+                        realtime: Arc::new(RaptorRealtimeData::default()),
+                    };
+                    let expected = direct_journeys(&timetable, &request, 90 * 60, 20)
+                        .into_iter()
+                        .find(|journey| journey.legs[0].route_id.as_deref() == Some("pid_gtfs:L6"))
+                        .expect("the reference timetable must contain a direct line 6");
+                    for max_transfers in [0, 4] {
+                        let started = std::time::Instant::now();
+                        let result = run_adaptive_raptor_searches(
+                            timetable.clone(),
+                            from,
+                            to,
+                            &[],
+                            departure,
+                            max_transfers,
+                            300,
+                            0,
+                            &modes,
+                            false,
+                            &configuration,
+                            Arc::new(RaptorRealtimeData::default()),
+                        )
+                        .await
+                        .unwrap();
+                        let earliest_arrival = result
+                            .journeys
+                            .iter()
+                            .map(|journey| journey.arrival_time)
+                            .min()
+                            .unwrap();
+                        let ranked = ranked_journey_results_with_carriers(
+                            result.journeys,
+                            &HashMap::new(),
+                            &configuration,
+                        );
+                        let direct_rank = ranked.iter().position(|journey| {
+                            journey.legs.len() == 1 && journey.legs[0].trip_id == expected.legs[0].trip_id
+                                && journey.legs[0].from_stop_id == expected.legs[0].from_stop_id
+                                && journey.legs[0].to_stop_id == expected.legs[0].to_stop_id
+                        }).expect("earliest exact direct tram must survive multimode routing and ranking");
+                        assert_eq!(ranked[0].arrival_time, earliest_arrival);
+                        assert!(
+                            ranked
+                                .iter()
+                                .all(|journey| journey.departure_time >= departure
+                                    && journey.transfer_count <= max_transfers)
+                        );
+                        assert!(ranked.len() <= configuration.max_results as usize);
+                        assert_eq!(
+                            ranked
+                                .iter()
+                                .map(journey_identity_key)
+                                .collect::<HashSet<_>>()
+                                .len(),
+                            ranked.len()
+                        );
+                        eprintln!(
+                            "real PID: {} -> {}, {hour}:00, {:?}, max_transfers={max_transfers}, direct6_rank={}, direct6_duration={}, elapsed={:?}",
+                            from[0],
+                            to[0],
+                            modes,
+                            direct_rank + 1,
+                            expected.duration_seconds,
+                            started.elapsed()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "explicit large-network performance regression"]
     async fn adaptive_large_timetable_search_stays_below_latency_budget() {
         let route_count = 5_000;
@@ -13430,6 +15038,7 @@ mod tests {
             7 * 3600,
             3,
             300,
+            0,
             &[TransportMode::Train],
             false,
             &RoutingAlgorithmConfig::default(),
@@ -13469,7 +15078,7 @@ mod tests {
 
         let ranked = ranked_journey_results(journeys);
 
-        assert_eq!(ranked.len(), MAX_JOURNEY_RESULTS);
+        assert_eq!(ranked.len(), 7);
         assert!(ranked.iter().any(|journey| journey.transfer_count == 0));
         let direct = ranked
             .iter()
@@ -13478,6 +15087,34 @@ mod tests {
         assert!(direct.labels.iter().any(|label| label == "nejjednodussi"));
         assert_eq!(ranked[0].transfer_count, 1);
         assert!(ranked[0].labels.iter().any(|label| label == "nejrychlejsi"));
+    }
+
+    #[test]
+    fn ranked_journeys_reserve_simplest_slot_when_frontier_fills_limit() {
+        let mut journeys = (0..25)
+            .map(|index| {
+                test_journey(
+                    &format!("frontier-transfer-{index}"),
+                    1,
+                    5 * 3600 + index * 60,
+                    7 * 3600 + index * 60,
+                )
+            })
+            .collect::<Vec<_>>();
+        journeys.push(test_journey("direct", 0, 4 * 3600, 9 * 3600));
+
+        let ranked = ranked_journey_results(journeys);
+
+        assert_eq!(
+            ranked.len(),
+            RoutingAlgorithmConfig::default().max_results as usize
+        );
+        let direct = ranked
+            .iter()
+            .find(|journey| journey.transfer_count == 0)
+            .expect("the configured simplest alternative must reserve a result slot");
+        assert!(direct.labels.iter().any(|label| label == "nejjednodussi"));
+        assert_eq!(ranked[0].transfer_count, 1);
     }
 
     #[test]
@@ -13589,6 +15226,7 @@ mod tests {
                 "to_stop_id": "pid_gtfs:U2Z1P",
                 "route_id": "pid_gtfs:L991",
                 "trip_id": "pid_gtfs:trip-1",
+                "departure_time": 3600,
                 "mode": "bus"
             }]
         })];
@@ -13603,7 +15241,13 @@ mod tests {
                 "short_name": "991",
                 "long_name": "Praha – Nádraží Hostivař"
             }],
-            "trips": [{"id": "pid_gtfs:trip-1", "headsign": "Nádraží Hostivař"}]
+            "trips": [{"id": "pid_gtfs:trip-1", "headsign": "Nádraží Hostivař"}],
+            "stop_times": [{
+                "trip_id": "pid_gtfs:trip-1",
+                "stop_id": "pid_gtfs:U1Z1P",
+                "departure_time": 3600,
+                "stop_headsign": "Centrum přes Jižní Město"
+            }]
         });
 
         attach_journey_display_metadata(&mut journeys, &related);
@@ -13611,10 +15255,46 @@ mod tests {
         let leg = &journeys[0]["legs"][0];
         assert_eq!(leg["line"], "991");
         assert_eq!(leg["mode_name"], "Autobus");
-        assert_eq!(leg["destination"], "Nádraží Hostivař");
-        assert_eq!(leg["display_name"], "Autobus 991 směr Nádraží Hostivař");
+        assert_eq!(leg["direction"], "Centrum přes Jižní Město");
+        assert_eq!(leg["destination"], "Centrum přes Jižní Město");
+        assert_eq!(
+            leg["display_name"],
+            "Autobus 991 směr Centrum přes Jižní Město"
+        );
         assert_eq!(leg["from_stop_name"], "Muzeum");
         assert_eq!(leg["to_stop_name"], "Nádraží Hostivař");
+    }
+
+    #[test]
+    fn journey_direction_falls_back_to_actual_trip_terminal_not_transfer_stop() {
+        let mut journeys = vec![json!({
+            "legs": [{
+                "from_stop_id": "origin",
+                "to_stop_id": "transfer",
+                "route_id": "route",
+                "trip_id": "trip",
+                "departure_time": 3600,
+                "mode": "train"
+            }]
+        })];
+        let related = json!({
+            "stops": [
+                {"id": "origin", "name": "Výchozí"},
+                {"id": "transfer", "name": "Přestupní"}
+            ],
+            "routes": [{"id": "route", "short_name": "R9"}],
+            "trips": [{
+                "id": "trip",
+                "headsign": null,
+                "terminal_stop_name": "Skutečná konečná"
+            }],
+            "stop_times": []
+        });
+
+        attach_journey_display_metadata(&mut journeys, &related);
+
+        assert_eq!(journeys[0]["legs"][0]["direction"], "Skutečná konečná");
+        assert_ne!(journeys[0]["legs"][0]["direction"], "Přestupní");
     }
 
     #[test]
@@ -13810,6 +15490,10 @@ mod tests {
                 lat: None,
                 lon: None,
                 platform_code: None,
+                station_id: Some(format!("station:{stop_id}")),
+                complex_id: Some(format!("complex:{stop_id}")),
+                has_station_layout: false,
+                station_layout_version: None,
             },
         )
         .collect::<Vec<_>>();
@@ -13934,7 +15618,7 @@ mod tests {
     }
 
     #[test]
-    fn namesti_republiky_source_relation_groups_surface_and_metro_nodes() {
+    fn pid_source_complex_groups_distinct_named_boarding_points_for_walking_transfers() {
         let surface = implicit_station_transfer_signature(
             "pid_gtfs:U480Z1P",
             "Náměstí Republiky",
@@ -13970,7 +15654,7 @@ mod tests {
         );
 
         assert_eq!(surface, metro);
-        assert_ne!(surface, other_name);
+        assert_eq!(surface, other_name);
     }
 
     #[test]

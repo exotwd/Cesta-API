@@ -1,11 +1,12 @@
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{HeaderName, HeaderValue},
+    http::{HeaderName, HeaderValue, header},
     middleware,
     routing::{delete, get, patch, post},
 };
 use tower_http::{
+    compression::CompressionLayer,
     cors::{AllowOrigin, Any, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     set_header::SetResponseHeaderLayer,
@@ -24,7 +25,14 @@ pub(crate) fn build(state: AppState) -> Router {
         .merge(admin_routes())
         .merge(public_routes())
         .merge(ticketing::router())
-        .layer(middleware::from_fn_with_state(state.clone(), auth_marker))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::security::protect,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::telemetry::observe,
+        ))
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(TraceLayer::new_for_http().make_span_with(
             move |request: &axum::http::Request<axum::body::Body>| {
@@ -37,7 +45,7 @@ pub(crate) fn build(state: AppState) -> Router {
                     "http_request",
                     request_id,
                     method = %request.method(),
-                    path = %request.uri().path()
+                    path = request.extensions().get::<axum::extract::MatchedPath>().map(|path|path.as_str()).unwrap_or("unmatched")
                 )
             },
         ))
@@ -59,12 +67,14 @@ pub(crate) fn build(state: AppState) -> Router {
             HeaderValue::from_static("no-referrer"),
         ))
         .layer(cors_layer(&config.cors_allowed_origins))
+        .layer(middleware::from_fn(super::security::canonical_request_id))
         .with_state(state)
 }
 
 fn system_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/openapi.json", get(openapi))
         .route("/metadata/data-status", get(data_status))
         .route("/metadata/sources", get(sources))
@@ -78,7 +88,12 @@ fn account_routes() -> Router<AppState> {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(auth_me).patch(update_me).delete(delete_me))
         .route("/auth/change-password", post(change_password))
-        .route("/me/profile", get(profile).patch(profile))
+        .route("/auth/password-reset", post(request_password_reset))
+        .route(
+            "/auth/password-reset/complete",
+            post(complete_password_reset),
+        )
+        .route("/me/profile", get(profile).patch(update_profile))
         .route(
             "/me/saved-places",
             get(list_saved_places).post(create_saved_place),
@@ -101,19 +116,47 @@ fn account_routes() -> Router<AppState> {
             "/me/notification-preferences",
             get(notification_preferences).patch(notification_preferences),
         )
+        .route(
+            "/me/saved-routes",
+            get(list_saved_routes).post(create_saved_route),
+        )
+        .route(
+            "/me/saved-routes/{id}",
+            patch(update_saved_route).delete(delete_saved_route),
+        )
+        .route("/me/devices", get(list_devices).post(register_device))
+        .route("/me/devices/{id}", delete(delete_device))
+        .route(
+            "/me/journey-subscriptions",
+            get(list_journey_subscriptions).post(create_journey_subscription),
+        )
+        .route(
+            "/me/journey-subscriptions/{id}",
+            delete(delete_journey_subscription),
+        )
 }
 
 fn transit_routes() -> Router<AppState> {
     Router::new()
         .route("/stops/search", get(search_stops))
+        .route(
+            "/stops/catalog",
+            get(stop_catalog).layer(CompressionLayer::new()),
+        )
         .route("/stops/nearby", get(nearby_stops))
         .route("/stops/in-bounds", get(stops_in_bounds))
         .route("/stops/{id}", get(stop_detail))
+        .route("/stations/{station_id}/layout", get(station_layout))
         .route("/stop-areas/{id}", get(stop_area))
         .route("/departures", get(departures))
         .route("/departures/board/{stop_id}", get(board_departures))
         .route("/departures/board/{stop_id}/qr", get(board_qr))
         .route("/journeys/search", post(journey_search))
+        .route(
+            "/journeys/{journey_id}/legs/{leg_index}/boarding-guidance",
+            get(boarding_guidance),
+        )
+        .route("/runs/{run_id}/formation", get(train_formation))
         .route("/vehicles", get(realtime_vehicles))
         .route("/realtime/vehicles", get(realtime_vehicles))
         .route("/data-sources/status", get(data_sources_status))
@@ -135,6 +178,9 @@ fn transit_routes() -> Router<AppState> {
 
 fn admin_routes() -> Router<AppState> {
     Router::new()
+        .route("/admin/analytics", get(crate::telemetry::analytics))
+        .route("/admin/metrics", get(crate::telemetry::metrics))
+        .route("/admin/operations", get(crate::operations::status))
         .route("/admin", get(admin_app))
         .route("/admin/", get(admin_app))
         .route("/admin/assets/admin.css", get(admin_css))
@@ -197,4 +243,5 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(Any)
         .allow_headers(Any)
+        .expose_headers([header::ETAG])
 }

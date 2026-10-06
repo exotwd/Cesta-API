@@ -12,6 +12,13 @@ pub(crate) struct AppConfig {
     pub(crate) database_pool: DatabasePoolConfig,
     pub(crate) jwt_secret: String,
     pub(crate) request_body_limit_bytes: usize,
+    pub(crate) read_request_timeout: Duration,
+    pub(crate) max_concurrent_requests: usize,
+    pub(crate) max_concurrent_searches: usize,
+    pub(crate) auth_requests_per_minute: u32,
+    pub(crate) routing_requests_per_minute: u32,
+    pub(crate) public_requests_per_minute: u32,
+    pub(crate) trust_loopback_proxy: bool,
     pub(crate) routing_snapshot_dir: PathBuf,
     pub(crate) routing_snapshot_files_to_keep: usize,
     pub(crate) pedestrian_router_engine: String,
@@ -97,6 +104,19 @@ impl AppConfig {
             },
             jwt_secret,
             request_body_limit_bytes: parse_number("REQUEST_BODY_LIMIT_BYTES", 1024_usize * 1024)?,
+            read_request_timeout: Duration::from_secs(
+                parse_number("READ_REQUEST_TIMEOUT_SECONDS", 15_u64)?.clamp(1, 60),
+            ),
+            max_concurrent_requests: parse_number("MAX_CONCURRENT_REQUESTS", 128_usize)?
+                .clamp(1, 1024),
+            max_concurrent_searches: parse_number("MAX_CONCURRENT_SEARCHES", 8_usize)?.clamp(1, 64),
+            auth_requests_per_minute: parse_number("AUTH_REQUESTS_PER_MINUTE", 30_u32)?
+                .clamp(1, 1000),
+            routing_requests_per_minute: parse_number("ROUTING_REQUESTS_PER_MINUTE", 120_u32)?
+                .clamp(1, 10000),
+            public_requests_per_minute: parse_number("PUBLIC_REQUESTS_PER_MINUTE", 600_u32)?
+                .clamp(1, 100000),
+            trust_loopback_proxy: parse_bool("TRUST_LOOPBACK_PROXY", true)?,
             routing_snapshot_dir: env::var("ROUTING_SNAPSHOT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("storage").join("processed").join("routing")),
@@ -176,6 +196,13 @@ mod tests {
             },
             jwt_secret: DEVELOPMENT_JWT_SECRET.to_string(),
             request_body_limit_bytes: 1024 * 1024,
+            read_request_timeout: Duration::from_secs(15),
+            max_concurrent_requests: 128,
+            max_concurrent_searches: 8,
+            auth_requests_per_minute: 30,
+            routing_requests_per_minute: 120,
+            public_requests_per_minute: 600,
+            trust_loopback_proxy: true,
             routing_snapshot_dir: PathBuf::from("storage").join("processed").join("routing"),
             routing_snapshot_files_to_keep: 2,
             pedestrian_router_engine: "valhalla".to_string(),

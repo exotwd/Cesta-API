@@ -1,6 +1,124 @@
 use crate::*;
 
+pub(crate) struct CachedStopCatalog {
+    loaded_at: std::time::Instant,
+    etag: String,
+    body: axum::body::Bytes,
+}
+
+pub(crate) async fn stop_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Single-flight rebuild, one cached immutable payload, at most 30 seconds of server caching.
+    let mut cache = state.stop_catalog_cache.lock().await;
+    if state.db.is_none()
+        || cache
+            .as_ref()
+            .is_none_or(|entry| entry.loaded_at.elapsed() >= std::time::Duration::from_secs(30))
+    {
+        let (mut stops, data_status) = if let Some(pool) = &state.db {
+            (
+                stop_catalog_db(pool).await.map_err(internal_error)?,
+                database_data_status(),
+            )
+        } else {
+            (
+                state.stops.as_ref().clone(),
+                mock_status(state.use_mock_data),
+            )
+        };
+        stops.retain(|stop| {
+            stop.is_active
+                && !stop.name.trim().is_empty()
+                && !stop.normalized_name.trim().is_empty()
+                && matches!(
+                    stop.location_type,
+                    StopLocationType::Stop | StopLocationType::Station
+                )
+        });
+        stops.sort_by(|left, right| left.id.cmp(&right.id));
+        let cpu_permit = routing_cpu_permits()
+            .acquire_owned()
+            .await
+            .map_err(internal_error)?;
+        let body = tokio::task::spawn_blocking(move || {
+            let _cpu_permit = cpu_permit;
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "count": stops.len(),
+                "stops": stops.iter().map(stop_catalog_json).collect::<Vec<_>>(),
+                "data_status": data_status
+            }))
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+        let etag = format!("W/\"{}\"", hex::encode(Sha256::digest(&body)));
+        *cache = Some(CachedStopCatalog {
+            loaded_at: std::time::Instant::now(),
+            etag,
+            body: body.into(),
+        });
+    }
+    let cached = cache.as_ref().expect("catalog initialized");
+    let mut response = if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || candidate.strip_prefix("W/").unwrap_or(candidate)
+                        == cached.etag.strip_prefix("W/").unwrap_or(&cached.etag)
+            })
+        }) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            axum::body::Body::from(cached.body.clone()),
+        )
+            .into_response()
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&cached.etag).expect("SHA-256 ETag is a valid header value"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
+}
+
 pub(crate) async fn search_stops(
+    State(state): State<AppState>,
+    Query(query): Query<StopSearchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if query
+        .q
+        .as_ref()
+        .is_some_and(|q| q.len() > 200 || q.chars().any(char::is_control))
+    {
+        return Err(ApiError {
+            code: "validation_error".into(),
+            message: "q must contain at most 200 bytes and no control characters".into(),
+        });
+    }
+    if query.limit.is_some_and(|limit| !(1..=50).contains(&limit)) {
+        return Err(ApiError {
+            code: "validation_error".into(),
+            message: "limit must be between 1 and 50".into(),
+        });
+    }
+    let result = search_stops_inner(State(state), Query(query)).await;
+    if result.0["data_status"]["schedule"] == "unknown" {
+        return Err(service_unavailable("stop search unavailable"));
+    }
+    Ok(result)
+}
+
+async fn search_stops_inner(
     State(state): State<AppState>,
     Query(query): Query<StopSearchQuery>,
 ) -> Json<Value> {
@@ -55,7 +173,7 @@ pub(crate) async fn search_stops(
                         stop_search_related_data_db(pool, &visible_stops)
                             .await
                             .unwrap_or_else(|error| {
-                                json!({"warnings": [format!("database stop related data failed: {error}")]})
+                                json!({"warnings": [safe_data_warning(error, "database stop related data unavailable")]})
                             }),
                     )
                 } else {
@@ -85,7 +203,7 @@ pub(crate) async fn search_stops(
             }
             Err(error) => stop_search_failure_response(
                 query.include_cities,
-                format!("database stop search failed: {error}"),
+                safe_data_warning(error, "database stop search unavailable"),
             ),
         };
     }
@@ -194,6 +312,9 @@ pub(crate) fn ranked_stop_suggestions<'a>(
             right_score
                 .cmp(left_score)
                 .then_with(|| left_stop.name.cmp(&right_stop.name))
+                .then_with(|| {
+                    stop_suggestion_mode_rank(left_stop).cmp(&stop_suggestion_mode_rank(right_stop))
+                })
                 .then_with(|| left_index.cmp(right_index))
         },
     );
@@ -223,23 +344,15 @@ pub(crate) fn ranked_stop_suggestions<'a>(
 pub(crate) async fn nearby_stops(
     State(state): State<AppState>,
     Query(query): Query<NearbyQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
+    query.validate()?;
     let radius = query.radius.unwrap_or(1000.0);
     if let Some(pool) = &state.db {
         return match nearby_stops_db(pool, query.lat, query.lon, radius).await {
-            Ok(stops) => Json(
+            Ok(stops) => Ok(Json(
                 json!({"stops": stops, "radius": radius, "data_status": database_data_status()}),
-            ),
-            Err(error) => Json(json!({
-                "stops": [],
-                "radius": radius,
-                "data_status": {
-                    "source": "database",
-                    "schedule": "unknown",
-                    "realtime": "unavailable",
-                    "warnings": [format!("database nearby stop query failed: {error}")]
-                }
-            })),
+            )),
+            Err(error) => Err(service_unavailable(error)),
         };
     }
 
@@ -254,7 +367,9 @@ pub(crate) async fn nearby_stops(
         })
         .cloned()
         .collect::<Vec<_>>();
-    Json(json!({"stops": stops, "radius": radius, "data_status": mock_status(state.use_mock_data)}))
+    Ok(Json(
+        json!({"stops": stops, "radius": radius, "data_status": mock_status(state.use_mock_data)}),
+    ))
 }
 
 pub(crate) async fn stops_in_bounds(
@@ -271,16 +386,7 @@ pub(crate) async fn stops_in_bounds(
                 limit,
                 database_data_status(),
             ))),
-            Err(error) => Ok(Json(json!({
-                "stops": [],
-                "nextCursor": null,
-                "data_status": {
-                    "source": "database",
-                    "schedule": "unknown",
-                    "realtime": "unavailable",
-                    "warnings": [format!("database in-bounds stop query failed: {error}")]
-                }
-            }))),
+            Err(error) => Err(service_unavailable(error)),
         };
     }
 
@@ -349,6 +455,433 @@ pub(crate) async fn stop_detail(
     ))
 }
 
+pub(crate) async fn station_layout(
+    State(state): State<AppState>,
+    Path(station_id): Path<String>,
+    Query(query): Query<StationLayoutQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Some(level) = query.level.as_deref()
+        && level.trim().is_empty()
+    {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "level must not be empty".to_string(),
+        });
+    }
+
+    let payload = if let Some(pool) = &state.db {
+        station_layout_db(pool, &station_id, query.level.as_deref())
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(not_found)?
+    } else if state.use_mock_data {
+        mock_station_layout(&station_id, query.level.as_deref())?
+    } else {
+        return Err(not_found());
+    };
+    json_etag_response(payload, &headers, "public, max-age=60, must-revalidate")
+}
+
+async fn station_layout_db(
+    pool: &PgPool,
+    station_id: &str,
+    level: Option<&str>,
+) -> Result<Option<Value>, sqlx::Error> {
+    let Some(layout) = sqlx::query(
+        r#"
+        SELECT station_id, complex_id, name, version, updated_at, source, attribution
+        FROM station_layouts
+        WHERE station_id = $1 AND active = true
+        LIMIT 1
+        "#,
+    )
+    .bind(station_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let version = layout.get::<String, _>("version");
+    if let Some(level) = level {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM station_layout_levels WHERE station_id = $1 AND layout_version = $2 AND level_id = $3)",
+        )
+        .bind(station_id)
+        .bind(&version)
+        .bind(level)
+        .fetch_one(pool)
+        .await?;
+        if !exists {
+            return Ok(None);
+        }
+    }
+    let levels = sqlx::query(
+        r#"
+        SELECT level_id, name, level_index
+        FROM station_layout_levels
+        WHERE station_id = $1 AND layout_version = $2
+          AND ($3::text IS NULL OR level_id = $3)
+        ORDER BY level_index ASC, level_id ASC
+        "#,
+    )
+    .bind(station_id)
+    .bind(&version)
+    .bind(level)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("level_id"),
+            "name": row.get::<String, _>("name"),
+            "index": row.get::<i32, _>("level_index")
+        })
+    })
+    .collect::<Vec<_>>();
+    let elements = sqlx::query(
+        r#"
+        SELECT element.element_id, element.kind, element.level_id, element.label,
+               element.platform, element.track, element.wheelchair_accessible,
+               COALESCE(status.available, element.default_available) AS available,
+               element.geometry, element.properties
+        FROM station_layout_elements element
+        LEFT JOIN LATERAL (
+          SELECT facility.available
+          FROM station_facility_status facility
+          WHERE facility.station_id = element.station_id
+            AND facility.element_id = element.element_id
+            AND facility.observed_at <= now()
+            AND facility.valid_until >= now()
+          ORDER BY facility.observed_at DESC
+          LIMIT 1
+        ) status ON true
+        WHERE element.station_id = $1 AND element.layout_version = $2
+          AND ($3::text IS NULL OR element.level_id IS NULL OR element.level_id = $3)
+        ORDER BY element.kind ASC, element.element_id ASC
+        "#,
+    )
+    .bind(station_id)
+    .bind(&version)
+    .bind(level)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("element_id"),
+            "kind": row.get::<String, _>("kind"),
+            "level_id": row.get::<Option<String>, _>("level_id"),
+            "label": row.get::<Option<String>, _>("label"),
+            "platform": row.get::<Option<String>, _>("platform"),
+            "track": row.get::<Option<String>, _>("track"),
+            "wheelchair_accessible": row.get::<Option<bool>, _>("wheelchair_accessible"),
+            "available": row.get::<Option<bool>, _>("available"),
+            "geometry": row.get::<Value, _>("geometry"),
+            "properties": row.get::<Value, _>("properties")
+        })
+    })
+    .collect::<Vec<_>>();
+
+    Ok(Some(json!({
+        "stationId": layout.get::<String, _>("station_id"),
+        "complexId": layout.get::<Option<String>, _>("complex_id"),
+        "name": layout.get::<String, _>("name"),
+        "version": version,
+        "updatedAt": layout.get::<DateTime<Utc>, _>("updated_at"),
+        "source": layout.get::<String, _>("source"),
+        "attribution": layout.get::<String, _>("attribution"),
+        "levels": levels,
+        "elements": elements
+    })))
+}
+
+pub(crate) fn mock_station_layout(
+    station_id: &str,
+    level: Option<&str>,
+) -> Result<Value, ApiError> {
+    if level.is_some_and(|level| level != "mock-platform") {
+        return Err(not_found());
+    }
+    Ok(json!({
+        "stationId": station_id,
+        "complexId": format!("complex:{station_id}"),
+        "name": "Ukázková stanice",
+        "version": "mock-v1",
+        "updatedAt": "2026-10-01T08:00:00Z",
+        "source": "Cesta development fixture",
+        "attribution": "UKÁZKOVÁ GEOMETRIE – NENÍ URČENA K NAVIGACI",
+        "mock": true,
+        "levels": [{"id": "mock-platform", "name": "Ukázkové nástupiště", "index": 0}],
+        "elements": [{
+            "id": "mock-lift-1", "kind": "elevator", "level_id": "mock-platform",
+            "label": "Ukázkový výtah", "platform": "1", "track": null,
+            "wheelchair_accessible": true, "available": true,
+            "geometry": {"type": "Point", "coordinates": [14.43, 50.08]},
+            "properties": {"mock": true}
+        }]
+    }))
+}
+
+fn json_etag_response(
+    payload: Value,
+    headers: &HeaderMap,
+    cache_control: &'static str,
+) -> Result<Response, ApiError> {
+    let body = serde_json::to_vec(&payload).map_err(internal_error)?;
+    let etag = format!("W/\"{}\"", hex::encode(Sha256::digest(&body)));
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag));
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            body,
+        )
+            .into_response()
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("SHA-256 ETag is valid"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    Ok(response)
+}
+
+pub(crate) async fn train_formation(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<FormationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(call_id) = query.at_call_id.as_deref()
+        && call_id.trim().is_empty()
+    {
+        return Err(ApiError {
+            code: "validation_error".to_string(),
+            message: "atCallId must not be empty".to_string(),
+        });
+    }
+    if let Some(pool) = &state.db {
+        return train_formation_db(pool, &run_id, query.at_call_id.as_deref())
+            .await
+            .map_err(internal_error)?
+            .map(Json)
+            .ok_or_else(not_found);
+    }
+    if !state.use_mock_data {
+        return Err(not_found());
+    }
+    Ok(Json(json!({
+        "runId": run_id,
+        "atCallId": query.at_call_id,
+        "status": "planned",
+        "orientationKnown": true,
+        "directionLabel": "Ukázkový směr",
+        "updatedAt": "2026-10-01T08:00:00Z",
+        "validUntil": "2099-01-01T00:00:00Z",
+        "source": "Cesta development fixture – ukázka",
+        "mock": true,
+        "vehicles": [
+            {"position": 1, "type": "locomotive", "is_locomotive": true},
+            {"position": 2, "number": "21", "class": "2", "is_locomotive": false,
+             "wheelchair_accessible": true, "features": ["wheelchair", "bicycle", "wifi"]}
+        ]
+    })))
+}
+
+async fn train_formation_db(
+    pool: &PgPool,
+    run_id: &str,
+    at_call_id: Option<&str>,
+) -> Result<Option<Value>, sqlx::Error> {
+    let call_sequence = if let Some(call_id) = at_call_id {
+        let Some(sequence) = sqlx::query_scalar::<_, i32>(
+            "SELECT stop_sequence FROM run_calls WHERE call_id = $1 AND run_id = $2",
+        )
+        .bind(call_id)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        Some(sequence)
+    } else {
+        None
+    };
+    let formations = sqlx::query(
+        r#"
+        SELECT id, status, orientation_known, direction_label, updated_at, valid_until, source,
+               valid_from_call_sequence, valid_to_call_sequence
+        FROM train_formations
+        WHERE run_id = $1
+          AND ($2::integer IS NULL OR valid_from_call_sequence IS NULL OR valid_from_call_sequence <= $2)
+          AND ($2::integer IS NULL OR valid_to_call_sequence IS NULL OR valid_to_call_sequence >= $2)
+        ORDER BY (status = 'confirmed') DESC, updated_at DESC
+        "#,
+    )
+    .bind(run_id)
+    .bind(call_sequence)
+    .fetch_all(pool)
+    .await?;
+    let Some(formation) = formations.first() else {
+        return Ok(None);
+    };
+    let formation_id = formation.get::<Uuid, _>("id");
+    let vehicles = sqlx::query(
+        r#"
+        SELECT position, number, class, vehicle_type, is_locomotive,
+               wheelchair_accessible, features, destination
+        FROM formation_vehicles
+        WHERE formation_id = $1
+        ORDER BY array_index ASC
+        "#,
+    )
+    .bind(formation_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        json!({
+            "position": row.get::<Option<i32>, _>("position"),
+            "number": row.get::<Option<String>, _>("number"),
+            "class": row.get::<Option<String>, _>("class"),
+            "type": row.get::<Option<String>, _>("vehicle_type"),
+            "is_locomotive": row.get::<bool, _>("is_locomotive"),
+            "wheelchair_accessible": row.get::<Option<bool>, _>("wheelchair_accessible"),
+            "features": row.get::<Vec<String>, _>("features"),
+            "destination": row.get::<Option<String>, _>("destination")
+        })
+    })
+    .collect::<Vec<_>>();
+    let valid_until = formation.get::<DateTime<Utc>, _>("valid_until");
+    let covers_whole_run = formation
+        .get::<Option<i32>, _>("valid_from_call_sequence")
+        .is_none()
+        && formation
+            .get::<Option<i32>, _>("valid_to_call_sequence")
+            .is_none();
+    let orientation_known = formation.get::<bool, _>("orientation_known")
+        && valid_until >= Utc::now()
+        && (at_call_id.is_some() || (formations.len() == 1 && covers_whole_run));
+    Ok(Some(json!({
+        "runId": run_id,
+        "atCallId": at_call_id,
+        "status": formation.get::<String, _>("status"),
+        "orientationKnown": orientation_known,
+        "directionLabel": formation.get::<Option<String>, _>("direction_label"),
+        "updatedAt": formation.get::<DateTime<Utc>, _>("updated_at"),
+        "validUntil": valid_until,
+        "source": formation.get::<String, _>("source"),
+        "vehicles": vehicles
+    })))
+}
+
+pub(crate) async fn boarding_guidance(
+    State(state): State<AppState>,
+    Path((journey_id, leg_index)): Path<(String, usize)>,
+    Query(query): Query<BoardingGuidanceQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !matches!(query.profile.as_str(), "fastest" | "wheelchair") {
+        return Err(ApiError {
+            code: "unsupported_boarding_profile".to_string(),
+            message: "profile must be fastest or wheelchair".to_string(),
+        });
+    }
+    if let Some(pool) = &state.db {
+        return boarding_guidance_db(pool, &journey_id, leg_index, &query.profile)
+            .await
+            .map_err(internal_error)?
+            .map(Json)
+            .ok_or_else(not_found);
+    }
+    if !state.use_mock_data {
+        return Err(not_found());
+    }
+    Ok(Json(json!({
+        "status": "available", "trainZone": "middle",
+        "reasonCode": if query.profile == "wheelchair" { "closest_to_elevator" } else { "closest_to_transfer" },
+        "precision": "zone", "basis": "mock_verified_station_rule",
+        "targetElementId": "mock-lift-1", "layoutVersion": "mock-v1",
+        "validUntil": "2099-01-01T00:00:00Z", "mock": true,
+        "journeyId": journey_id, "legIndex": leg_index, "profile": query.profile
+    })))
+}
+
+async fn boarding_guidance_db(
+    pool: &PgPool,
+    journey_id: &str,
+    leg_index: usize,
+    profile: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT rule.train_zone, rule.reason_code, rule.precision,
+               rule.coach_position_from_front, rule.door_side_relative_to_travel,
+               rule.target_element_id, rule.layout_version, rule.valid_until,
+               element.wheelchair_accessible,
+               COALESCE(status.available, element.default_available) AS target_available
+        FROM journey_boarding_guidance guidance
+        JOIN metro_boarding_rules rule ON rule.rule_id = guidance.rule_id
+        JOIN station_layouts layout
+          ON layout.station_id = rule.arrival_station_id
+         AND layout.version = rule.layout_version AND layout.active = true
+        JOIN station_layout_elements element
+          ON element.station_id = rule.arrival_station_id
+         AND element.layout_version = rule.layout_version
+         AND element.element_id = rule.target_element_id
+        LEFT JOIN LATERAL (
+          SELECT facility.available
+          FROM station_facility_status facility
+          WHERE facility.station_id = rule.arrival_station_id
+            AND facility.element_id = rule.target_element_id
+            AND facility.observed_at <= now() AND facility.valid_until >= now()
+          ORDER BY facility.observed_at DESC LIMIT 1
+        ) status ON true
+        WHERE guidance.journey_id = $1 AND guidance.leg_index = $2 AND guidance.profile = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(journey_id)
+    .bind(leg_index as i32)
+    .bind(profile)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let valid_until = row.get::<DateTime<Utc>, _>("valid_until");
+    let target_available = row.get::<Option<bool>, _>("target_available");
+    let wheelchair_verified = row.get::<Option<bool>, _>("wheelchair_accessible") == Some(true);
+    if valid_until < Utc::now()
+        || target_available != Some(true)
+        || (profile == "wheelchair" && !wheelchair_verified)
+    {
+        return Ok(Some(json!({
+            "status": "unavailable",
+            "reason": if valid_until < Utc::now() { "expired" } else { "path_or_facility_unavailable" }
+        })));
+    }
+    Ok(Some(json!({
+        "status": "available",
+        "trainZone": row.get::<String, _>("train_zone"),
+        "reasonCode": row.get::<String, _>("reason_code"),
+        "precision": row.get::<String, _>("precision"),
+        "basis": "verified_station_rule",
+        "targetElementId": row.get::<String, _>("target_element_id"),
+        "layoutVersion": row.get::<String, _>("layout_version"),
+        "validUntil": valid_until,
+        "coachPositionFromFront": row.get::<Option<i32>, _>("coach_position_from_front"),
+        "doorSideRelativeToTravel": row.get::<Option<String>, _>("door_side_relative_to_travel")
+    })))
+}
+
 pub(crate) async fn stop_area(Path(id): Path<String>) -> Json<Value> {
     Json(json!({"id": id, "warning": "stop area detail is pending imported stop-area data"}))
 }
@@ -356,34 +889,29 @@ pub(crate) async fn stop_area(Path(id): Path<String>) -> Json<Value> {
 pub(crate) async fn departures(
     State(state): State<AppState>,
     Query(query): Query<DeparturesQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, ApiError> {
+    query.validate()?;
     let limit = query.limit.unwrap_or(10);
     let earliest = query
         .time
         .as_deref()
         .and_then(parse_query_time_seconds)
         .unwrap_or_else(current_prague_time_seconds);
+    let service_date = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Prague)
+        .date_naive();
     if let Some(pool) = &state.db {
-        return match departures_db(pool, &query.stop_id, earliest, limit).await {
-            Ok(departures) => Json(json!({
+        return match departures_db(pool, &query.stop_id, earliest, limit, service_date).await {
+            Ok(departures) => Ok(Json(json!({
                 "stop_id": query.stop_id,
                 "departures": departures,
                 "data_status": database_data_status()
-            })),
-            Err(error) => Json(json!({
-                "stop_id": query.stop_id,
-                "departures": [],
-                "data_status": {
-                    "source": "database",
-                    "schedule": "unknown",
-                    "realtime": "unavailable",
-                    "warnings": [format!("database departures query failed: {error}")]
-                }
-            })),
+            }))),
+            Err(error) => Err(service_unavailable(error)),
         };
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "stop_id": query.stop_id,
         "departures": fixture_departures()
             .into_iter()
@@ -400,7 +928,7 @@ pub(crate) async fn departures(
             "realtime": "unavailable",
             "warnings": if state.use_mock_data { vec!["fixture departures are in use"] } else { Vec::<&str>::new() }
         }
-    }))
+    })))
 }
 
 pub(crate) async fn board_departures(Path(stop_id): Path<String>) -> Json<Value> {
@@ -424,14 +952,25 @@ pub(crate) async fn realtime_vehicles(
         ));
     };
     let limit = query.limit.unwrap_or(2_000).clamp(1, 10_000) as i64;
-    let source_filter = query.source.or_else(|| {
+    let requested_filter = query.source.or_else(|| {
         query.provider.as_deref().map(|provider| match provider {
-            "pid" => "pid_realtime".to_string(),
-            "ids_jmk" => "ids_jmk_realtime".to_string(),
-            "duk" => "duk_realtime".to_string(),
+            "pid" => "pid_gtfs_rt".to_string(),
+            "ids_jmk" => "ids_jmk_positions".to_string(),
+            "duk" => "duk_positions".to_string(),
             value => value.to_string(),
         })
     });
+    let (source_filter, source_feed_filter) = match requested_filter {
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "pid_realtime" | "ids_jmk_realtime" | "duk_realtime"
+            ) =>
+        {
+            (None, Some(value))
+        }
+        value => (value, None),
+    };
     let (west, south, east, north) = bbox.map_or((None, None, None, None), |values| {
         (
             Some(values[0]),
@@ -445,6 +984,7 @@ pub(crate) async fn realtime_vehicles(
         SELECT DISTINCT ON (realtime.source_feed_id, realtime.vehicle_id)
           realtime.source, realtime.source_feed_id, realtime.vehicle_id,
           realtime.trip_id, realtime.route_id, realtime.stop_id,
+          realtime.service_date, call.stop_sequence,
           delay_seconds, estimated_arrival, estimated_departure,
           ST_Y(vehicle_position::geometry) AS lat,
           ST_X(vehicle_position::geometry) AS lon,
@@ -457,25 +997,33 @@ pub(crate) async fn realtime_vehicles(
         FROM realtime_updates realtime
         JOIN source_feeds feed
           ON feed.id = realtime.source_feed_id
-         AND feed.id = 'pid_realtime'
          AND feed.enabled = true
+        LEFT JOIN LATERAL (
+          SELECT stop_time.stop_sequence
+          FROM stop_times stop_time
+          WHERE stop_time.trip_id = realtime.trip_id
+            AND stop_time.stop_id = realtime.stop_id
+          ORDER BY stop_time.stop_sequence ASC
+          LIMIT 1
+        ) call ON true
         WHERE realtime.vehicle_id IS NOT NULL
-          AND realtime.source_feed_id = 'pid_realtime'
           AND vehicle_position IS NOT NULL
           AND (valid_until IS NULL OR valid_until >= now())
-          AND ($1::text IS NULL OR realtime.source = $1 OR realtime.source_feed_id = $1)
+          AND ($1::text IS NULL OR realtime.source = $1)
+          AND ($2::text IS NULL OR realtime.source_feed_id = $2)
           AND (
-            $2::double precision IS NULL
+            $3::double precision IS NULL
             OR ST_Covers(
-              ST_MakeEnvelope($2, $3, $4, $5, 4326),
+              ST_MakeEnvelope($3, $4, $5, $6, 4326),
               vehicle_position::geometry
             )
           )
         ORDER BY realtime.source_feed_id, realtime.vehicle_id, fetched_at DESC
-        LIMIT $6
+        LIMIT $7
         "#,
     )
     .bind(source_filter)
+    .bind(source_feed_filter)
     .bind(west)
     .bind(south)
     .bind(east)
@@ -485,7 +1033,17 @@ pub(crate) async fn realtime_vehicles(
     .await
     {
         Ok(rows) => Ok(Json(json!({
-            "vehicles": rows.into_iter().map(|row| json!({
+            "vehicles": rows.into_iter().map(|row| {
+              let trip_id = row.get::<Option<String>, _>("trip_id");
+              let stop_id = row.get::<Option<String>, _>("stop_id");
+              let service_date = row.get::<Option<chrono::NaiveDate>, _>("service_date")
+                  .unwrap_or_else(|| Utc::now().with_timezone(&chrono_tz::Europe::Prague).date_naive());
+              let run_id = trip_id.as_deref().map(|trip_id| operational_run_id(trip_id, service_date));
+              let call_id = run_id.as_deref()
+                  .zip(stop_id.as_deref())
+                  .zip(row.get::<Option<i32>, _>("stop_sequence"))
+                  .map(|((run_id, stop_id), sequence)| operational_call_id(run_id, stop_id, sequence as i64));
+              json!({
                 "id": format!("{}:{}", vehicle_provider(&row.get::<String, _>("source")), row.get::<String, _>("vehicle_id")),
                 "provider": vehicle_provider(&row.get::<String, _>("source")),
                 "source": {
@@ -506,6 +1064,8 @@ pub(crate) async fn realtime_vehicles(
                     "id": row.get::<Option<String>, _>("route_id"),
                     "shortName": row.get::<Option<String>, _>("route_short_name"),
                     "tripId": row.get::<Option<String>, _>("trip_id"),
+                    "runId": run_id,
+                    "callId": call_id,
                     "destination": row.get::<Option<String>, _>("destination"),
                     "nextStopId": row.get::<Option<String>, _>("stop_id")
                 },
@@ -527,11 +1087,10 @@ pub(crate) async fn realtime_vehicles(
                 "updatedAt": row.get::<DateTime<Utc>, _>("fetched_at"),
                 "validUntil": row.get::<Option<DateTime<Utc>>, _>("valid_until"),
                 "confidence": row.get::<String, _>("confidence")
-            })).collect::<Vec<_>>()
+              })
+            }).collect::<Vec<_>>()
         }))),
-        Err(error) => Ok(Json(
-            json!({"vehicles": [], "warnings": [error.to_string()]}),
-        )),
+        Err(error) => Err(service_unavailable(error)),
     }
 }
 
@@ -554,7 +1113,10 @@ pub(crate) async fn data_sources_status(State(state): State<AppState>) -> Json<V
                last_success_at, source_timestamp, records_received,
                records_written, error_message, metadata
         FROM data_source_syncs
-        WHERE source_id IN ('pid_gtfs', 'pid_lines_geodata', 'pid_gtfs_rt')
+        WHERE source_id IN (
+          'pid_gtfs', 'pid_lines_geodata', 'pid_gtfs_rt',
+          'ids_jmk_gtfs', 'ids_jmk_positions'
+        )
         ORDER BY source_id ASC
         "#,
     )
@@ -576,7 +1138,9 @@ pub(crate) async fn data_sources_status(State(state): State<AppState>) -> Json<V
                 "metadata": row.get::<Value, _>("metadata")
             })).collect::<Vec<_>>()
         })),
-        Err(error) => Json(json!({"sources": [], "warnings": [error.to_string()]})),
+        Err(error) => Json(
+            json!({"sources": [], "warnings": [safe_data_warning(error, "Transport data query unavailable")]}),
+        ),
     }
 }
 
@@ -584,8 +1148,28 @@ pub(crate) async fn journey_search(
     State(state): State<AppState>,
     Json(body): Json<JourneySearchBody>,
 ) -> Result<Json<Value>, ApiError> {
+    if body.mode != "depart_at" {
+        return Err(ApiError {
+            code: "unsupported_search_mode".to_string(),
+            message: "Only depart_at is supported; arrive_by search is not available yet"
+                .to_string(),
+        });
+    }
+    body.validate_limits()?;
+    validate_journey_preferences(&body)?;
     let departure_time = parse_journey_departure_seconds(&body.datetime)?;
     let service_date = parse_journey_service_date(&body.datetime)?;
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Prague)
+        .date_naive();
+    if state.db.is_some()
+        && !(-1..=90).contains(&service_date.signed_duration_since(today).num_days())
+    {
+        return Err(ApiError {
+            code: "validation_error".into(),
+            message: "Search date must be between yesterday and 90 days ahead".into(),
+        });
+    }
     let include_intermediate_stops = body.include_intermediate_stops;
     let _request_metadata = (
         &body.mode,
@@ -613,6 +1197,7 @@ pub(crate) async fn journey_search(
             &state.routing_realtime_cache,
             &state.config.routing_snapshot_dir,
             &state.route_search_diagnostics,
+            &state.telemetry,
             &body,
             departure_time,
             service_date,
@@ -636,6 +1221,11 @@ pub(crate) async fn journey_search(
                 )
                 .await;
                 ticketing_result?;
+                state.telemetry.journey(
+                    journeys.len(),
+                    !warnings.is_empty(),
+                    matches!(realtime_status, "unavailable" | "scheduled"),
+                );
                 Ok(Json(json!({
                     "journeys": journeys,
                     "related": related,
@@ -643,16 +1233,7 @@ pub(crate) async fn journey_search(
                     "warnings": warnings
                 })))
             }
-            Err(error) => Ok(Json(json!({
-                "journeys": [],
-                "data_status": {
-                    "source": "database",
-                    "schedule": "unknown",
-                    "realtime": "unavailable",
-                    "warnings": [format!("database journey search failed: {error}")]
-                },
-                "warnings": [format!("database journey search failed: {error}")]
-            }))),
+            Err(error) => Err(service_unavailable(error)),
         };
     }
 
@@ -713,7 +1294,9 @@ pub(crate) async fn journey_search(
             .map(|journey| serde_json::to_value(journey).unwrap_or_else(|_| json!({})))
             .collect::<Vec<_>>()
     };
-    let fixture_related = json!({"stops":state.stops.iter().map(|stop|json!({"id":stop.id,"name":stop.name})).collect::<Vec<_>>(),"routes":[]});
+    let fixture_related = json!({"stops":state.stops.iter().map(stop_search_json).collect::<Vec<_>>(),"routes":[],"trips":[],"stop_times":[]});
+    attach_journey_display_metadata(&mut journey_values, &fixture_related);
+    attach_journey_assistance_identity(&mut journey_values, &fixture_related, service_date);
     state
         .ticketing
         .annotate_journeys(&mut journey_values, &fixture_related, service_date)
@@ -741,12 +1324,16 @@ pub(crate) fn fixture_journeys_with_stop_calls(journeys: &[Journey], stops: &[St
                     json!({
                         "trip_id": leg.trip_id,
                         "stop_id": stop_id,
-                        "stop_sequence": null,
+                        "stop_sequence": if origin { 0 } else { 1 },
                         "name": stop.map(|stop| stop.name.as_str()).unwrap_or(stop_id),
                         "municipality": stop.and_then(|stop| stop.municipality.as_deref()),
                         "lat": stop.and_then(|stop| stop.lat),
                         "lon": stop.and_then(|stop| stop.lon),
                         "platform": stop.and_then(|stop| stop.platform_code.as_deref()),
+                        "station_id": stop.and_then(|stop| stop.station_id.as_deref()),
+                        "complex_id": stop.and_then(|stop| stop.complex_id.as_deref()),
+                        "has_station_layout": stop.is_some_and(|stop| stop.has_station_layout),
+                        "station_layout_version": stop.and_then(|stop| stop.station_layout_version.as_deref()),
                         "scheduled_arrival_seconds": arrival,
                         "scheduled_departure_seconds": departure,
                         "scheduled_arrival": transit_model::seconds_to_time(arrival),
@@ -899,7 +1486,7 @@ pub(crate) async fn realtime_trip(
             "updates": [],
             "realtime_status": "unavailable",
             "mock": false,
-            "warnings": [format!("database realtime trip query failed: {error}")]
+            "warnings": [safe_data_warning(error, "database realtime trip query unavailable")]
         })),
     }
 }
@@ -976,7 +1563,7 @@ pub(crate) async fn realtime_status(State(state): State<AppState>) -> Json<Value
             "status": "unavailable",
             "sources": [],
             "mock": false,
-            "warnings": [format!("database realtime status query failed: {error}")]
+            "warnings": [safe_data_warning(error, "database realtime status query unavailable")]
         })),
     }
 }

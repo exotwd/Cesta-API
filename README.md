@@ -11,7 +11,7 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 - Shared transport domain model crates.
 - Fixture-backed routing core with a simple Connection Scan Algorithm.
 - GTFS importer crate that parses core GTFS files from zip archives and validates common data-quality issues.
-- PID GTFS schedule, line geometry and realtime import pipelines.
+- PID and IDS JMK GTFS schedule pipelines, PID line geometry, and realtime imports for PID and IDS JMK (including DPMB).
 - API endpoints for health, metadata, auth, user data, stops, departures, journeys, realtime status, offline packages, tickets, public boards and admin import/data-quality status.
 - Authenticated ČD Ticket API integration for searches, quotes, add-ons, verified checkout/issuance, owned documents, and refunds.
 - Embedded administrator interface for database browsing, stop maps, import history, validation issues and source-feed management.
@@ -28,8 +28,8 @@ Cesta API is the backend foundation for Czech public transport data. It includes
 
 ## What Uses Real Data
 
-- The `schedule-updater` checks official PID GTFS and seven-day line geometry every six hours and imports only changed schedules.
-- The realtime worker consumes PID GTFS-Realtime and rich Golemio vehicle data every 20 seconds. Non-PID connectors are disabled in PID-only mode. PID delays are joined to concrete trips and stops.
+- The `schedule-updater` checks official PID and IDS JMK GTFS every six hours, imports only changed schedules, and rejects an IDS JMK feed whose service horizon is already expired.
+- The realtime worker consumes PID GTFS-Realtime and rich Golemio vehicle data every 20 seconds, plus official IDS JMK vehicle positions every 15 seconds. Both providers use exact identifiers from their matching static feed.
 - `/metadata/data-status`, `/stops/search`, `/stops/{id}` and `/departures` read imported database data when `USE_MOCK_DATA=false`.
 - API response shapes include data freshness and warnings so mock or unavailable data is not hidden.
 
@@ -62,6 +62,7 @@ Useful local commands:
 cargo test
 cargo run -p cesta-api
 cargo run -p data-pipeline -- sync-pid
+cargo run -p data-pipeline -- sync-ids-jmk
 cargo run -p realtime-worker
 cargo run -p realtime-worker -- --check-feeds
 ```
@@ -131,9 +132,9 @@ Invoke-RestMethod ("http://localhost:8070/departures?stopId=" + [uri]::EscapeDat
 Invoke-RestMethod -Method Post http://localhost:8070/journeys/search -ContentType "application/json" -Body '{"from":{"type":"stop","id":"stop-praha-hl-n"},"to":{"type":"stop","id":"stop-brno-hl-n"},"datetime":"2026-07-06T21:05:00+02:00","mode":"depart_at","transport_modes":["train"],"max_transfers":4,"walking_speed":"normal","prefer_reliable_transfers":true,"offline_compatible":false}'
 ```
 
-## PID-Only Source Policy
+## Official Source Policy
 
-PID GTFS, PID line geometry and PID realtime are the only enabled transport feeds. Historical GGU rows and validation reports remain in PostgreSQL for auditability, but public queries and routing exclude disabled feeds. Legacy GGU CLI operations are blocked unless `GGU_IMPORTS_ENABLED=true` is set explicitly.
+PID GTFS, PID line geometry, PID realtime, IDS JMK GTFS and IDS JMK realtime are enabled. The IDS JMK feeds are the official public-data channel for Brno services operated by DPMB; because the published GTFS has one aggregate agency rather than a reliable operator split, the complete IDS JMK feed is retained. Historical GGU rows and validation reports remain in PostgreSQL for auditability, but public queries and routing exclude disabled feeds. Legacy GGU CLI operations are blocked unless `GGU_IMPORTS_ENABLED=true` is set explicitly.
 
 Inspect PostgreSQL table and index usage before and after storage maintenance:
 
@@ -141,12 +142,13 @@ Inspect PostgreSQL table and index usage before and after storage maintenance:
 Get-Content -Raw .\infra\postgres\maintenance\storage_report.sql | docker compose exec -T postgres psql -U cesta -d cesta
 ```
 
-## PID Automatic Updates
+## Automatic Schedule Updates
 
-`docker compose up --build` starts `schedule-updater` and `realtime-worker`. Trigger a PID schedule and line-geometry refresh manually with:
+`docker compose up --build` starts `schedule-updater` and `realtime-worker`. Trigger schedule refreshes manually with:
 
 ```powershell
 docker compose --profile tools run --rm data-pipeline sync-pid
+docker compose --profile tools run --rm data-pipeline sync-ids-jmk
 ```
 
 Inspect source freshness and current vehicle data:

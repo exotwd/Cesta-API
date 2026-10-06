@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use gtfs_importer::{GtfsDataset, ImportOptions, ValidationSeverity, parse_gtfs_zip, sha256_file};
@@ -38,12 +38,17 @@ const DEFAULT_CZ_CITIES_URL: &str =
     "https://raw.githubusercontent.com/33bcdd/souradnice-mest/master/souradnice.csv";
 const DEFAULT_PID_GTFS_URL: &str = "https://data.pid.cz/PID_GTFS.zip";
 const DEFAULT_PID_LINES_URL: &str = "https://data.pid.cz/geodata/Linky_7d_WGS84.json";
+const DEFAULT_IDS_JMK_GTFS_URL: &str = "https://kordis-jmk.cz/gtfs/gtfs.zip";
 const PID_FEED_ID: &str = "pid_gtfs";
 const PID_LINES_FEED_ID: &str = "pid_lines_geodata";
 const PID_SOURCE_PRIORITY: i32 = 10;
+const IDS_JMK_FEED_ID: &str = "ids_jmk_gtfs";
+const IDS_JMK_SOURCE_PRIORITY: i32 = 20;
 const DEFAULT_RAW_RUNS_TO_KEEP: usize = 3;
 const DEFAULT_DB_IMPORT_RUNS_TO_KEEP: usize = 1;
 const DEFAULT_INCOMPLETE_RAW_RUN_MAX_AGE_HOURS: u64 = 24;
+const DEFAULT_DATABASE_STORAGE_PATH: &str = "/mnt/cesta-data";
+const DEFAULT_MIN_DATABASE_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
@@ -175,6 +180,7 @@ struct StopTimeBatch {
     pickup_types: Vec<Option<i16>>,
     drop_off_types: Vec<Option<i16>>,
     timepoints: Vec<Option<bool>>,
+    stop_headsigns: Vec<Option<String>>,
     platforms: Vec<Option<String>>,
     raw_notes: Vec<Option<String>>,
     import_run_ids: Vec<Uuid>,
@@ -193,6 +199,7 @@ impl StopTimeBatch {
             pickup_types: Vec::with_capacity(capacity),
             drop_off_types: Vec::with_capacity(capacity),
             timepoints: Vec::with_capacity(capacity),
+            stop_headsigns: Vec::with_capacity(capacity),
             platforms: Vec::with_capacity(capacity),
             raw_notes: Vec::with_capacity(capacity),
             import_run_ids: Vec::with_capacity(capacity),
@@ -218,6 +225,7 @@ impl StopTimeBatch {
         self.pickup_types.clear();
         self.drop_off_types.clear();
         self.timepoints.clear();
+        self.stop_headsigns.clear();
         self.platforms.clear();
         self.raw_notes.clear();
         self.import_run_ids.clear();
@@ -241,6 +249,12 @@ struct Cli {
     pid_gtfs_url: String,
     #[arg(long, env = "PID_LINES_URL", default_value = DEFAULT_PID_LINES_URL)]
     pid_lines_url: String,
+    #[arg(
+        long,
+        env = "IDS_JMK_GTFS_URL",
+        default_value = DEFAULT_IDS_JMK_GTFS_URL
+    )]
+    ids_jmk_gtfs_url: String,
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
     #[command(subcommand)]
@@ -280,6 +294,10 @@ enum Command {
         #[arg(long)]
         force_db_export: bool,
     },
+    SyncIdsJmk {
+        #[arg(long)]
+        force_db_export: bool,
+    },
     RunScheduler {
         #[arg(
             long,
@@ -294,6 +312,7 @@ enum Command {
 enum Source {
     GguLatest,
     Pid,
+    IdsJmk,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -321,6 +340,12 @@ async fn main() -> Result<()> {
             let run_dir = download_pid_gtfs(&cli.storage_dir, &cli.pid_gtfs_url).await?;
             println!("{}", run_dir.display());
         }
+        Command::Download {
+            source: Source::IdsJmk,
+        } => {
+            let run_dir = download_ids_jmk_gtfs(&cli.storage_dir, &cli.ids_jmk_gtfs_url).await?;
+            println!("{}", run_dir.display());
+        }
         Command::Import {
             source: Source::GguLatest,
             limit_rows,
@@ -343,6 +368,20 @@ async fn main() -> Result<()> {
         } => {
             let run_dir = latest_pid_run_dir(&cli.storage_dir)?;
             import_pid_gtfs(
+                &run_dir,
+                limit_rows,
+                cli.database_url.as_deref(),
+                force_db_export,
+            )
+            .await?;
+        }
+        Command::Import {
+            source: Source::IdsJmk,
+            limit_rows,
+            force_db_export,
+        } => {
+            let run_dir = latest_ids_jmk_run_dir(&cli.storage_dir)?;
+            import_ids_jmk_gtfs(
                 &run_dir,
                 limit_rows,
                 cli.database_url.as_deref(),
@@ -387,6 +426,20 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Command::ImportAndValidate {
+            source: Source::IdsJmk,
+            limit_rows,
+            force_db_export,
+        } => {
+            let run_dir = download_ids_jmk_gtfs(&cli.storage_dir, &cli.ids_jmk_gtfs_url).await?;
+            import_ids_jmk_gtfs(
+                &run_dir,
+                limit_rows,
+                cli.database_url.as_deref(),
+                force_db_export,
+            )
+            .await?;
+        }
         Command::Summarize {
             target: Target::Latest,
         } => {
@@ -415,16 +468,30 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Command::SyncIdsJmk { force_db_export } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for sync-ids-jmk")?;
+            sync_ids_jmk(
+                &cli.storage_dir,
+                database_url,
+                &cli.ids_jmk_gtfs_url,
+                force_db_export,
+            )
+            .await?;
+        }
         Command::RunScheduler { interval_seconds } => {
             let database_url = cli
                 .database_url
                 .as_deref()
                 .context("DATABASE_URL is required for run-scheduler")?;
-            run_pid_scheduler(
+            run_schedule_scheduler(
                 &cli.storage_dir,
                 database_url,
                 &cli.pid_gtfs_url,
                 &cli.pid_lines_url,
+                &cli.ids_jmk_gtfs_url,
                 interval_seconds,
             )
             .await?;
@@ -441,7 +508,7 @@ fn ensure_ggu_imports_enabled() -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "GGU imports are disabled while PID-only mode is active; use sync-pid instead"
+            "GGU imports are disabled by the official-source policy; use sync-pid or sync-ids-jmk instead"
         )
     }
 }
@@ -606,23 +673,37 @@ fn czech_city_importance(name: &str) -> i32 {
     }
 }
 
-async fn run_pid_scheduler(
+async fn run_schedule_scheduler(
     storage_dir: &Path,
     database_url: &str,
-    gtfs_url: &str,
-    lines_url: &str,
+    pid_gtfs_url: &str,
+    pid_lines_url: &str,
+    ids_jmk_gtfs_url: &str,
     interval_seconds: u64,
 ) -> Result<()> {
     let interval_seconds = interval_seconds.max(300);
     loop {
-        let retry_after = if let Err(error) =
-            sync_pid(storage_dir, database_url, gtfs_url, lines_url, false).await
-        {
+        // Imports each run source-level cleanup and cross-feed repair functions. Keep
+        // them sequential so those maintenance phases cannot race each other.
+        let pid_result = sync_pid(
+            storage_dir,
+            database_url,
+            pid_gtfs_url,
+            pid_lines_url,
+            false,
+        )
+        .await;
+        let ids_jmk_result = sync_ids_jmk(storage_dir, database_url, ids_jmk_gtfs_url, false).await;
+        let mut failed = false;
+        if let Err(error) = pid_result {
             tracing::error!(error = %error, "PID schedule synchronization failed");
-            60
-        } else {
-            interval_seconds
-        };
+            failed = true;
+        }
+        if let Err(error) = ids_jmk_result {
+            tracing::error!(error = %error, "IDS JMK schedule synchronization failed");
+            failed = true;
+        }
+        let retry_after = if failed { 60 } else { interval_seconds };
         tokio::time::sleep(Duration::from_secs(retry_after)).await;
     }
 }
@@ -688,6 +769,76 @@ async fn sync_pid(
         record_data_sync(
             &pool,
             PID_FEED_ID,
+            gtfs_url,
+            "schedule",
+            attempted_at,
+            succeeded_at,
+            records,
+            records,
+            error_message.as_deref(),
+            serde_json::json!({"status": status, "details": metadata}),
+        )
+        .await?;
+    }
+    result.map(|_| ())
+}
+
+async fn sync_ids_jmk(
+    storage_dir: &Path,
+    database_url: &str,
+    gtfs_url: &str,
+    force_db_export: bool,
+) -> Result<()> {
+    let attempted_at = Utc::now();
+    let result = async {
+        let run_dir = download_ids_jmk_gtfs(storage_dir, gtfs_url).await?;
+        import_ids_jmk_gtfs(&run_dir, None, Some(database_url), force_db_export).await?;
+        Ok::<PathBuf, anyhow::Error>(run_dir)
+    }
+    .await;
+
+    if let Ok(pool) = connect_import_database(database_url).await
+        && apply_feed_migrations(&pool).await.is_ok()
+    {
+        let (status, succeeded_at, error_message, metadata) = match &result {
+            Ok(run_dir) => (
+                "success",
+                Some(Utc::now()),
+                None,
+                serde_json::json!({"run_dir": run_dir.display().to_string()}),
+            ),
+            Err(error) => (
+                "error",
+                None,
+                Some(error.to_string()),
+                serde_json::json!({}),
+            ),
+        };
+        let records = if result.is_ok() {
+            sqlx::query(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM routes WHERE source_feed_id = $1) AS routes,
+                  (SELECT COUNT(*) FROM trips WHERE source_feed_id = $1) AS trips,
+                  (SELECT COUNT(*) FROM stop_times WHERE source_feed_id = $1) AS stop_times
+                "#,
+            )
+            .bind(IDS_JMK_FEED_ID)
+            .fetch_one(&pool)
+            .await
+            .ok()
+            .map(|row| {
+                row.get::<i64, _>("routes")
+                    + row.get::<i64, _>("trips")
+                    + row.get::<i64, _>("stop_times")
+            })
+            .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        record_data_sync(
+            &pool,
+            IDS_JMK_FEED_ID,
             gtfs_url,
             "schedule",
             attempted_at,
@@ -878,6 +1029,223 @@ async fn import_pid_gtfs(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+async fn download_ids_jmk_gtfs(storage_dir: &Path, url: &str) -> Result<PathBuf> {
+    const FILE_NAME: &str = "IDS_JMK_GTFS.zip";
+    let reusable_run = latest_reusable_ids_jmk_run(storage_dir)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
+    let previous = reusable_run
+        .as_ref()
+        .and_then(|run| run.manifest.get(FILE_NAME));
+    let remote = fetch_remote_file_metadata(&client, url, previous).await?;
+
+    if let Some(run) = &reusable_run
+        && can_reuse_file(run, FILE_NAME, remote.as_ref())
+    {
+        tracing::info!(path = %run.path.display(), "IDS JMK GTFS has not changed");
+        prune_raw_run_directories_best_effort(storage_dir, "ids-jmk", &run.path).await;
+        return Ok(run.path.clone());
+    }
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let run_dir = storage_dir
+        .join("raw")
+        .join("ids-jmk")
+        .join("latest")
+        .join(timestamp);
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("download {url}"))?
+        .error_for_status()?;
+    fs::create_dir_all(&run_dir).await?;
+    let status = response.status().as_u16();
+    let etag = header_to_string(response.headers(), ETAG);
+    let last_modified = header_to_string(response.headers(), LAST_MODIFIED);
+    let content_length = header_to_u64(response.headers(), CONTENT_LENGTH);
+    let output = run_dir.join(FILE_NAME);
+    let mut file = fs::File::create(&output).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        file.write_all(&chunk?).await?;
+    }
+    file.flush().await?;
+    let size_bytes = fs::metadata(&output).await?.len();
+    let sha256 = sha256_file(&output)?;
+    let manifest = vec![serde_json::json!({
+        "file": FILE_NAME,
+        "feed_id": IDS_JMK_FEED_ID,
+        "priority": IDS_JMK_SOURCE_PRIORITY,
+        "url": url,
+        "http_status": status,
+        "downloaded": true,
+        "size_bytes": size_bytes,
+        "sha256": sha256,
+        "etag": etag,
+        "last_modified": last_modified,
+        "content_length": content_length
+    })];
+    fs::write(
+        run_dir.join("download-manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )
+    .await?;
+    prune_raw_run_directories_best_effort(storage_dir, "ids-jmk", &run_dir).await;
+    Ok(run_dir)
+}
+
+fn latest_reusable_ids_jmk_run(storage_dir: &Path) -> Result<Option<ReusableRun>> {
+    let root = storage_dir.join("raw").join("ids-jmk").join("latest");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut entries = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries.into_iter().rev() {
+        let path = entry.path();
+        let manifest_path = path.join("download-manifest.json");
+        if !manifest_path.exists() || !path.join("IDS_JMK_GTFS.zip").exists() {
+            continue;
+        }
+        let entries: Vec<ManifestEntry> = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
+        return Ok(Some(ReusableRun {
+            path,
+            manifest: entries
+                .into_iter()
+                .map(|entry| (entry.file.clone(), entry))
+                .collect(),
+        }));
+    }
+    Ok(None)
+}
+
+fn latest_ids_jmk_run_dir(storage_dir: &Path) -> Result<PathBuf> {
+    latest_reusable_ids_jmk_run(storage_dir)?
+        .map(|run| run.path)
+        .context("no IDS JMK GTFS downloads found; run download ids-jmk first")
+}
+
+async fn import_ids_jmk_gtfs(
+    run_dir: &Path,
+    limit_rows: Option<usize>,
+    database_url: Option<&str>,
+    force_db_export: bool,
+) -> Result<()> {
+    const FILE_NAME: &str = "IDS_JMK_GTFS.zip";
+    let path = run_dir.join(FILE_NAME);
+    let manifest = download_manifest_by_file(run_dir)?;
+    let manifest_entry = manifest.get(FILE_NAME);
+    let checksum = file_checksum(&path, manifest_entry)?;
+    let pool = match database_url {
+        Some(url) if !url.is_empty() => Some(connect_import_database(url).await?),
+        _ => None,
+    };
+    if let Some(pool) = &pool {
+        apply_feed_migrations(pool).await?;
+        if !force_db_export
+            && let Some(skip) = database_import_skip_reason(
+                pool,
+                &format!("{IDS_JMK_FEED_ID}:{FILE_NAME}"),
+                checksum.as_deref(),
+            )
+            .await?
+        {
+            println!("{}", serde_json::to_string_pretty(&skip)?);
+            return Ok(());
+        }
+    }
+
+    let dataset = parse_gtfs_zip(
+        &path,
+        ImportOptions {
+            source_feed_id: IDS_JMK_FEED_ID.to_string(),
+            source_priority: IDS_JMK_SOURCE_PRIORITY,
+            limit_rows,
+        },
+    )?;
+    if limit_rows.is_none() {
+        validate_ids_jmk_dataset(&dataset, Utc::now().date_naive())?;
+    }
+    let database = if let Some(pool) = &pool {
+        export_dataset_to_postgres(
+            pool,
+            run_dir,
+            FILE_NAME,
+            IDS_JMK_FEED_ID,
+            IDS_JMK_SOURCE_PRIORITY,
+            &dataset,
+            limit_rows.is_none(),
+            manifest_entry,
+            checksum.as_deref(),
+        )
+        .await?
+    } else {
+        serde_json::json!({"exported": false})
+    };
+    let service_horizon = gtfs_service_horizon(&dataset);
+    let summary = serde_json::json!({
+        "file": FILE_NAME,
+        "feed_id": IDS_JMK_FEED_ID,
+        "agencies": dataset.agencies.len(),
+        "stops": dataset.stops.len(),
+        "routes": dataset.routes.len(),
+        "trips": dataset.trips.len(),
+        "stop_times": dataset.stop_times.len(),
+        "shape_points": dataset.shapes.len(),
+        "calendars": dataset.calendars.len(),
+        "calendar_dates": dataset.calendar_dates.len(),
+        "transfers": dataset.transfers.len(),
+        "service_horizon": service_horizon,
+        "validation_issues": dataset.validation_issues,
+        "database": database
+    });
+    std::fs::write(
+        run_dir.join("import-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
+}
+
+fn gtfs_service_horizon(dataset: &GtfsDataset) -> Option<NaiveDate> {
+    dataset
+        .calendars
+        .iter()
+        .map(|calendar| calendar.end_date)
+        .chain(
+            dataset
+                .calendar_dates
+                .iter()
+                .map(|exception| exception.date),
+        )
+        .max()
+}
+
+fn validate_ids_jmk_dataset(dataset: &GtfsDataset, today: NaiveDate) -> Result<()> {
+    if dataset.stops.is_empty() || dataset.routes.is_empty() || dataset.trips.is_empty() {
+        anyhow::bail!("IDS JMK GTFS is incomplete: stops, routes and trips must be non-empty");
+    }
+    if dataset
+        .validation_issues
+        .iter()
+        .any(|issue| issue.severity == ValidationSeverity::Error)
+    {
+        anyhow::bail!("IDS JMK GTFS contains blocking validation errors");
+    }
+    let horizon =
+        gtfs_service_horizon(dataset).context("IDS JMK GTFS has no verifiable service horizon")?;
+    if horizon < today {
+        anyhow::bail!("IDS JMK GTFS is stale: service horizon {horizon} is before {today}");
+    }
     Ok(())
 }
 
@@ -1370,6 +1738,56 @@ fn db_import_runs_to_keep() -> usize {
         .max(1)
 }
 
+fn minimum_database_free_bytes() -> u64 {
+    std::env::var("MIN_DATABASE_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MIN_DATABASE_FREE_BYTES)
+}
+
+fn ensure_database_storage_headroom() -> Result<Option<serde_json::Value>> {
+    let configured_path = std::env::var_os("DATABASE_STORAGE_PATH");
+    let storage_path = configured_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE_STORAGE_PATH));
+    if !storage_path.exists() {
+        if configured_path.is_some() {
+            anyhow::bail!(
+                "configured database storage path does not exist: {}",
+                storage_path.display()
+            );
+        }
+        return Ok(None);
+    }
+
+    let available_bytes = fs2::available_space(&storage_path).with_context(|| {
+        format!(
+            "failed to inspect database storage headroom at {}",
+            storage_path.display()
+        )
+    })?;
+    let total_bytes = fs2::total_space(&storage_path).with_context(|| {
+        format!(
+            "failed to inspect database storage capacity at {}",
+            storage_path.display()
+        )
+    })?;
+    let required_bytes = minimum_database_free_bytes();
+    if available_bytes < required_bytes {
+        anyhow::bail!(
+            "schedule import deferred: database storage has {available_bytes} bytes free but requires at least {required_bytes} bytes"
+        );
+    }
+
+    Ok(Some(serde_json::json!({
+        "path": storage_path.display().to_string(),
+        "available_bytes": available_bytes,
+        "required_bytes": required_bytes,
+        "total_bytes": total_bytes
+    })))
+}
+
 fn incomplete_raw_run_max_age() -> Duration {
     let hours = std::env::var("RAW_INCOMPLETE_RUN_MAX_AGE_HOURS")
         .ok()
@@ -1782,10 +2200,54 @@ async fn apply_feed_migrations(pool: &PgPool) -> Result<()> {
             ),
         )
         .await?;
-        apply_feed_migration(
+        apply_feed_nontransactional_migration(
             &mut connection,
             "0028_pid_realtime_vehicle_index",
             include_str!("../../../infra/postgres/migrations/0028_pid_realtime_vehicle_index.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0029_ids_jmk_dpmb",
+            include_str!("../../../infra/postgres/migrations/0029_ids_jmk_dpmb.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0030_ids_jmk_activation",
+            include_str!("../../../infra/postgres/migrations/0030_ids_jmk_activation.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0031_stop_headsigns",
+            include_str!("../../../infra/postgres/migrations/0031_stop_headsigns.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0032_profile_raptor_defaults",
+            include_str!("../../../infra/postgres/migrations/0032_profile_raptor_defaults.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0033_schedule_import_storage_safety",
+            include_str!(
+                "../../../infra/postgres/migrations/0033_schedule_import_storage_safety.sql"
+            ),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0034_realtime_unlogged",
+            include_str!("../../../infra/postgres/migrations/0034_realtime_unlogged.sql"),
+        )
+        .await?;
+        apply_feed_migration(
+            &mut connection,
+            "0035_station_assistance",
+            include_str!("../../../infra/postgres/migrations/0035_station_assistance.sql"),
         )
         .await
     }
@@ -1815,6 +2277,38 @@ async fn apply_feed_migration(
     }
 
     sqlx::raw_sql(statements).execute(&mut *connection).await?;
+    sqlx::query("INSERT INTO cesta_schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(version)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+async fn apply_feed_nontransactional_migration(
+    connection: &mut PgConnection,
+    version: &str,
+    statements: &str,
+) -> Result<()> {
+    let already_applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM cesta_schema_migrations WHERE version = $1)",
+    )
+    .bind(version)
+    .fetch_one(&mut *connection)
+    .await?;
+    if already_applied {
+        return Ok(());
+    }
+
+    // The PostgreSQL extended query protocol treats a multi-statement string as
+    // one implicit transaction. Execute each statement separately so operations
+    // such as CREATE/DROP INDEX CONCURRENTLY stay outside a transaction block.
+    for statement in statements
+        .split(';')
+        .map(str::trim)
+        .filter(|sql| !sql.is_empty())
+    {
+        sqlx::query(statement).execute(&mut *connection).await?;
+    }
     sqlx::query("INSERT INTO cesta_schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(version)
         .execute(&mut *connection)
@@ -1914,6 +2408,7 @@ async fn database_import_skip_reason(
     .fetch_optional(pool)
     .await?
     {
+        let previous_import_run_id = row.get::<Uuid, _>("id");
         let previous_summary = row.get::<Value, _>("summary");
         if previous_summary
             .get("complete_dataset")
@@ -1923,6 +2418,29 @@ async fn database_import_skip_reason(
             return Ok(None);
         }
         let feed_id = source.split(':').next().unwrap_or(source);
+        let has_core_schedule: bool = sqlx::query_scalar(
+            r#"
+            SELECT
+              EXISTS (SELECT 1 FROM trips WHERE source_feed_id = $1)
+              AND EXISTS (SELECT 1 FROM stop_times WHERE source_feed_id = $1)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM trips
+                WHERE source_feed_id = $1
+                  AND import_run_id IS DISTINCT FROM $2
+              )
+            "#,
+        )
+        .bind(feed_id)
+        .bind(previous_import_run_id)
+        .fetch_one(pool)
+        .await?;
+        if previous_summary.get("trips").is_none()
+            || previous_summary.get("stop_times").is_none()
+            || !has_core_schedule
+        {
+            return Ok(None);
+        }
         let has_service_calendar: bool = sqlx::query_scalar(
             r#"
             SELECT
@@ -1936,7 +2454,17 @@ async fn database_import_skip_reason(
         if previous_summary.get("calendars").is_none() || !has_service_calendar {
             return Ok(None);
         }
-        if feed_id == PID_FEED_ID {
+        if feed_id == IDS_JMK_FEED_ID {
+            let current_horizon = previous_summary
+                .get("service_horizon")
+                .and_then(Value::as_str)
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .is_some_and(|horizon| horizon >= Utc::now().date_naive());
+            if !current_horizon {
+                return Ok(None);
+            }
+        }
+        if matches!(feed_id, PID_FEED_ID | IDS_JMK_FEED_ID) {
             let has_official_transfers: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM transfers WHERE source_feed_id = $1 AND transfer_type = 2)",
             )
@@ -1946,14 +2474,16 @@ async fn database_import_skip_reason(
             if previous_summary.get("transfers").is_none() || !has_official_transfers {
                 return Ok(None);
             }
-            let has_shapes: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM shapes WHERE source_feed_id = $1)",
-            )
-            .bind(feed_id)
-            .fetch_one(pool)
-            .await?;
-            if previous_summary.get("shape_points").is_none() || !has_shapes {
-                return Ok(None);
+            if feed_id == PID_FEED_ID {
+                let has_shapes: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM shapes WHERE source_feed_id = $1)",
+                )
+                .bind(feed_id)
+                .fetch_one(pool)
+                .await?;
+                if previous_summary.get("shape_points").is_none() || !has_shapes {
+                    return Ok(None);
+                }
             }
         }
         return Ok(Some(serde_json::json!({
@@ -1962,7 +2492,7 @@ async fn database_import_skip_reason(
             "skip_reason": "source_checksum_unchanged",
             "source": source,
             "sha256": checksum,
-            "previous_import_run_id": row.get::<Uuid, _>("id"),
+            "previous_import_run_id": previous_import_run_id,
             "previous_finished_at": row.get::<Option<chrono::DateTime<Utc>>, _>("finished_at"),
             "previous_summary": previous_summary
         })));
@@ -1983,7 +2513,9 @@ async fn export_dataset_to_postgres(
     manifest_entry: Option<&ManifestEntry>,
     checksum: Option<&str>,
 ) -> Result<serde_json::Value> {
+    let storage_headroom = ensure_database_storage_headroom()?;
     apply_feed_migrations(pool).await?;
+    let pre_import_storage_maintenance = vacuum_schedule_tables(pool).await;
 
     let source = format!("{feed_id}:{file_name}");
     let import_run_id: Uuid = sqlx::query_scalar(
@@ -1998,10 +2530,14 @@ async fn export_dataset_to_postgres(
         "sha256": checksum,
         "size_bytes": manifest_entry.and_then(|entry| entry.size_bytes),
         "etag": manifest_entry.and_then(|entry| entry.etag.clone()),
-        "last_modified": manifest_entry.and_then(|entry| entry.last_modified.clone())
+        "last_modified": manifest_entry.and_then(|entry| entry.last_modified.clone()),
+        "storage_headroom": storage_headroom.clone(),
+        "pre_import_storage_maintenance": pre_import_storage_maintenance.clone()
     }))
     .fetch_one(pool)
     .await?;
+
+    prepare_seen_schedule_keys(pool, import_run_id).await?;
 
     let mut agencies = HashSet::new();
     let mut stops = HashSet::new();
@@ -2395,6 +2931,9 @@ async fn export_dataset_to_postgres(
         stop_time_batch.pickup_types.push(stop_time.pickup_type);
         stop_time_batch.drop_off_types.push(stop_time.drop_off_type);
         stop_time_batch.timepoints.push(stop_time.timepoint);
+        stop_time_batch
+            .stop_headsigns
+            .push(stop_time.stop_headsign.clone());
         stop_time_batch.platforms.push(stop_time.platform.clone());
         stop_time_batch.raw_notes.push(stop_time.raw_notes.clone());
         stop_time_batch.import_run_ids.push(import_run_id);
@@ -2416,19 +2955,20 @@ async fn export_dataset_to_postgres(
         );
     }
 
-    let (inserted_transfers, ignored_trip_specific_transfers) = if feed_id == PID_FEED_ID {
-        export_pid_gtfs_transfers(
-            pool,
-            dataset,
-            feed_id,
-            import_run_id,
-            &stops,
-            complete_dataset,
-        )
-        .await?
-    } else {
-        (0, 0)
-    };
+    let (inserted_transfers, ignored_trip_specific_transfers) =
+        if matches!(feed_id, PID_FEED_ID | IDS_JMK_FEED_ID) {
+            export_gtfs_transfers(
+                pool,
+                dataset,
+                feed_id,
+                import_run_id,
+                &stops,
+                complete_dataset,
+            )
+            .await?
+        } else {
+            (0, 0)
+        };
 
     let (inserted_calendars, inserted_calendar_dates) =
         export_service_calendars(pool, dataset, feed_id, import_run_id).await?;
@@ -2462,6 +3002,7 @@ async fn export_dataset_to_postgres(
             "reason": "partial import created with --limit-rows"
         })
     };
+    clear_seen_schedule_keys(pool, import_run_id).await?;
 
     // These database-side repairs preserve source identity while automatically flattening exact
     // aliases and safe nearby same-direction groups. All mappings are re-applied after imports.
@@ -2500,6 +3041,8 @@ async fn export_dataset_to_postgres(
         "size_bytes": manifest_entry.and_then(|entry| entry.size_bytes),
         "etag": manifest_entry.and_then(|entry| entry.etag.clone()),
         "last_modified": manifest_entry.and_then(|entry| entry.last_modified.clone()),
+        "storage_headroom": storage_headroom,
+        "pre_import_storage_maintenance": pre_import_storage_maintenance,
         "agencies": agencies.len(),
         "stops": stops.len(),
         "routes": routes.len(),
@@ -2510,6 +3053,7 @@ async fn export_dataset_to_postgres(
         "trip_specific_transfers_not_generalized": ignored_trip_specific_transfers,
         "calendars": inserted_calendars,
         "calendar_dates": inserted_calendar_dates,
+        "service_horizon": gtfs_service_horizon(dataset),
         "skipped_stop_times": skipped_stop_times,
         "stale_cleanup": stale_cleanup,
         "automatic_repairs": automatic_repair_summary,
@@ -2529,6 +3073,7 @@ async fn export_dataset_to_postgres(
             prune_obsolete_feed_import_data(pool, feed_id, import_run_id, db_import_runs_to_keep())
                 .await?;
         summary["retention_cleanup"] = retention_cleanup;
+        summary["storage_maintenance"] = vacuum_schedule_tables(pool).await;
         sqlx::query("UPDATE import_runs SET summary = $2 WHERE id = $1")
             .bind(import_run_id)
             .bind(&summary)
@@ -2541,6 +3086,12 @@ async fn export_dataset_to_postgres(
         .fetch_one(pool)
         .await?;
     let visible_stops: i64 = row.try_get("count")?;
+    if complete_dataset && feed_id == IDS_JMK_FEED_ID {
+        sqlx::query("UPDATE source_feeds SET enabled = true WHERE id = $1")
+            .bind(feed_id)
+            .execute(pool)
+            .await?;
+    }
     Ok(serde_json::json!({
         "exported": true,
         "import_run_id": import_run_id,
@@ -2549,7 +3100,27 @@ async fn export_dataset_to_postgres(
     }))
 }
 
-async fn export_pid_gtfs_transfers(
+async fn vacuum_schedule_tables(pool: &PgPool) -> serde_json::Value {
+    match sqlx::query("VACUUM (ANALYZE) trips, stop_times, shapes, schedule_import_seen_keys")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => serde_json::json!({
+            "vacuumed": true,
+            "tables": ["trips", "stop_times", "shapes", "schedule_import_seen_keys"]
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "post-import schedule vacuum failed");
+            serde_json::json!({
+                "vacuumed": false,
+                "error": error.to_string(),
+                "tables": ["trips", "stop_times", "shapes", "schedule_import_seen_keys"]
+            })
+        }
+    }
+}
+
+async fn export_gtfs_transfers(
     pool: &PgPool,
     dataset: &GtfsDataset,
     feed_id: &str,
@@ -2559,13 +3130,14 @@ async fn export_pid_gtfs_transfers(
 ) -> Result<(u64, usize), sqlx::Error> {
     let mut inserted = 0_u64;
     let mut trip_specific = 0_usize;
+    let mut eligible = Vec::new();
     for transfer in &dataset.transfers {
         if transfer.from_trip_id.is_some() || transfer.to_trip_id.is_some() {
             trip_specific += 1;
             continue;
         }
-        // PID type 2 rows are authoritative physical minimum-change times. Type 1
-        // rows are trip-pair guarantees and must not be widened into generic links.
+        // Type 2 rows are authoritative physical minimum-change times. Type 1 rows
+        // are trip-pair guarantees and must not be widened into generic links.
         if transfer.transfer_type != 2
             || !known_stops.contains(&transfer.from_stop_id)
             || !known_stops.contains(&transfer.to_stop_id)
@@ -2575,6 +3147,25 @@ async fn export_pid_gtfs_transfers(
         let Some(min_transfer_seconds) = transfer.min_transfer_time else {
             continue;
         };
+        eligible.push((
+            scoped_id(feed_id, &transfer.from_stop_id),
+            scoped_id(feed_id, &transfer.to_stop_id),
+            min_transfer_seconds as i32,
+        ));
+    }
+    for chunk in eligible.chunks(10_000) {
+        let from_stop_ids = chunk
+            .iter()
+            .map(|(from_stop_id, _, _)| from_stop_id.clone())
+            .collect::<Vec<_>>();
+        let to_stop_ids = chunk
+            .iter()
+            .map(|(_, to_stop_id, _)| to_stop_id.clone())
+            .collect::<Vec<_>>();
+        let min_transfer_seconds = chunk
+            .iter()
+            .map(|(_, _, seconds)| *seconds)
+            .collect::<Vec<_>>();
         inserted += sqlx::query(
             r#"
             INSERT INTO transfers (
@@ -2582,7 +3173,10 @@ async fn export_pid_gtfs_transfers(
               walking_geometry, confidence, accessibility_level, source,
               import_run_id, source_feed_id, transfer_type
             )
-            VALUES ($1, $2, $3, NULL, NULL, 'exact', NULL, 'pid_gtfs_transfer', $4, $5, 2)
+            SELECT item.from_stop_id, item.to_stop_id, item.min_transfer_seconds,
+                   NULL, NULL, 'exact', NULL, $6, $4, $5, 2
+            FROM UNNEST($1::text[], $2::text[], $3::integer[])
+              AS item(from_stop_id, to_stop_id, min_transfer_seconds)
             ON CONFLICT (from_stop_id, to_stop_id) DO UPDATE SET
               min_transfer_seconds = EXCLUDED.min_transfer_seconds,
               distance_meters = EXCLUDED.distance_meters,
@@ -2595,11 +3189,12 @@ async fn export_pid_gtfs_transfers(
               transfer_type = EXCLUDED.transfer_type
             "#,
         )
-        .bind(scoped_id(feed_id, &transfer.from_stop_id))
-        .bind(scoped_id(feed_id, &transfer.to_stop_id))
-        .bind(min_transfer_seconds as i32)
+        .bind(from_stop_ids)
+        .bind(to_stop_ids)
+        .bind(min_transfer_seconds)
         .bind(import_run_id)
         .bind(feed_id)
+        .bind(format!("{feed_id}_transfer"))
         .execute(pool)
         .await?
         .rows_affected();
@@ -2690,16 +3285,51 @@ async fn export_service_calendars(
     Ok((calendars, calendar_dates))
 }
 
+async fn prepare_seen_schedule_keys(pool: &PgPool, import_run_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        DELETE FROM schedule_import_seen_keys seen
+        WHERE seen.import_run_id = $1
+           OR NOT EXISTS (
+             SELECT 1
+             FROM import_runs run
+             WHERE run.id = seen.import_run_id
+               AND run.status = 'running'
+           )
+        "#,
+    )
+    .bind(import_run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn clear_seen_schedule_keys(pool: &PgPool, import_run_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM schedule_import_seen_keys WHERE import_run_id = $1")
+        .bind(import_run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 async fn prune_stale_feed_schedule_rows(
     pool: &PgPool,
     feed_id: &str,
     import_run_id: Uuid,
 ) -> Result<serde_json::Value> {
+    ensure_database_storage_headroom()?;
     let deleted_stop_times = sqlx::query(
         r#"
-        DELETE FROM stop_times
-        WHERE source_feed_id = $1
-          AND import_run_id IS DISTINCT FROM $2
+        DELETE FROM stop_times item
+        WHERE item.source_feed_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM schedule_import_seen_keys seen
+            WHERE seen.import_run_id = $2
+              AND seen.entity_type = 'stop_time'
+              AND seen.entity_id = item.trip_id
+              AND seen.sequence = item.stop_sequence
+          )
         "#,
     )
     .bind(feed_id)
@@ -2708,11 +3338,19 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    ensure_database_storage_headroom()?;
     let deleted_trips = sqlx::query(
         r#"
-        DELETE FROM trips
-        WHERE source_feed_id = $1
-          AND import_run_id IS DISTINCT FROM $2
+        DELETE FROM trips item
+        WHERE item.source_feed_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM schedule_import_seen_keys seen
+            WHERE seen.import_run_id = $2
+              AND seen.entity_type = 'trip'
+              AND seen.entity_id = item.id
+              AND seen.sequence = 0
+          )
         "#,
     )
     .bind(feed_id)
@@ -2760,11 +3398,19 @@ async fn prune_stale_feed_schedule_rows(
     .await?
     .rows_affected();
 
+    ensure_database_storage_headroom()?;
     let deleted_shapes = sqlx::query(
         r#"
-        DELETE FROM shapes
-        WHERE source_feed_id = $1
-          AND import_run_id IS DISTINCT FROM $2
+        DELETE FROM shapes item
+        WHERE item.source_feed_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM schedule_import_seen_keys seen
+            WHERE seen.import_run_id = $2
+              AND seen.entity_type = 'shape'
+              AND seen.entity_id = item.shape_id
+              AND seen.sequence = item.shape_pt_sequence
+          )
         "#,
     )
     .bind(feed_id)
@@ -2795,9 +3441,13 @@ async fn prune_stale_feed_schedule_rows(
           AND EXISTS (
             SELECT 1
             FROM stop_times AS stop_time
+            JOIN schedule_import_seen_keys seen
+              ON seen.import_run_id = $2
+             AND seen.entity_type = 'stop_time'
+             AND seen.entity_id = stop_time.trip_id
+             AND seen.sequence = stop_time.stop_sequence
             WHERE stop_time.stop_id = stop.id
               AND stop_time.source_feed_id = $1
-              AND stop_time.import_run_id = $2
           )
           AND (stop.import_run_id IS DISTINCT FROM $2 OR stop.is_active = false)
         "#,
@@ -2983,15 +3633,16 @@ async fn prune_obsolete_feed_import_data(
     }))
 }
 
-async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, sqlx::Error> {
+async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64> {
     if batch.is_empty() {
         return Ok(0);
     }
 
+    ensure_database_storage_headroom()?;
     let row_count = batch.len() as u64;
     sqlx::query(
         r#"
-        WITH rows AS (
+        WITH rows AS MATERIALIZED (
           SELECT *
           FROM UNNEST(
             $1::text[],
@@ -3008,6 +3659,14 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
             id, import_run_id, source_feed_id, source_id, route_id, service_id, headsign,
             direction_id, shape_id, source_priority
           )
+        ),
+        seen AS (
+          INSERT INTO schedule_import_seen_keys (
+            import_run_id, entity_type, entity_id, sequence
+          )
+          SELECT import_run_id, 'trip', id, 0
+          FROM rows
+          ON CONFLICT DO NOTHING
         )
         INSERT INTO trips (
           id, import_run_id, source_feed_id, source_id, route_id, service_id, headsign,
@@ -3026,8 +3685,8 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           direction_id = EXCLUDED.direction_id,
           shape_id = EXCLUDED.shape_id,
           source_priority = EXCLUDED.source_priority
-        WHERE (
-          trips.import_run_id,
+        WHERE trips.import_run_id IS DISTINCT FROM EXCLUDED.import_run_id
+           OR (
           trips.source_feed_id,
           trips.route_id,
           trips.service_id,
@@ -3036,7 +3695,6 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
           trips.shape_id,
           trips.source_priority
         ) IS DISTINCT FROM (
-          EXCLUDED.import_run_id,
           EXCLUDED.source_feed_id,
           EXCLUDED.route_id,
           EXCLUDED.service_id,
@@ -3063,13 +3721,31 @@ async fn flush_trip_batch(pool: &PgPool, batch: &mut TripBatch) -> Result<u64, s
     Ok(row_count)
 }
 
-async fn flush_shape_batch(pool: &PgPool, batch: &mut ShapeBatch) -> Result<u64, sqlx::Error> {
+async fn flush_shape_batch(pool: &PgPool, batch: &mut ShapeBatch) -> Result<u64> {
     if batch.is_empty() {
         return Ok(0);
     }
+    ensure_database_storage_headroom()?;
     let row_count = batch.len() as u64;
     sqlx::query(
         r#"
+        WITH rows AS MATERIALIZED (
+          SELECT *
+          FROM UNNEST(
+            $1::text[], $2::integer[], $3::double precision[], $4::double precision[],
+            $5::double precision[], $6::uuid[], $7::text[]
+          ) AS item(
+            shape_id, sequence, lat, lon, distance_traveled, import_run_id, source_feed_id
+          )
+        ),
+        seen AS (
+          INSERT INTO schedule_import_seen_keys (
+            import_run_id, entity_type, entity_id, sequence
+          )
+          SELECT import_run_id, 'shape', shape_id, sequence
+          FROM rows
+          ON CONFLICT DO NOTHING
+        )
         INSERT INTO shapes (
           shape_id, shape_pt_sequence, geom, distance_traveled,
           import_run_id, source_feed_id
@@ -3077,17 +3753,15 @@ async fn flush_shape_batch(pool: &PgPool, batch: &mut ShapeBatch) -> Result<u64,
         SELECT shape_id, sequence,
                ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography,
                distance_traveled, import_run_id, source_feed_id
-        FROM UNNEST(
-          $1::text[], $2::integer[], $3::double precision[], $4::double precision[],
-          $5::double precision[], $6::uuid[], $7::text[]
-        ) AS item(
-          shape_id, sequence, lat, lon, distance_traveled, import_run_id, source_feed_id
-        )
+        FROM rows
         ON CONFLICT (shape_id, shape_pt_sequence) DO UPDATE SET
           geom = EXCLUDED.geom,
           distance_traveled = EXCLUDED.distance_traveled,
           import_run_id = EXCLUDED.import_run_id,
           source_feed_id = EXCLUDED.source_feed_id
+        WHERE NOT ST_Equals(shapes.geom::geometry, EXCLUDED.geom::geometry)
+           OR shapes.distance_traveled IS DISTINCT FROM EXCLUDED.distance_traveled
+           OR shapes.source_feed_id IS DISTINCT FROM EXCLUDED.source_feed_id
         "#,
     )
     .bind(&batch.shape_ids)
@@ -3103,37 +3777,53 @@ async fn flush_shape_batch(pool: &PgPool, batch: &mut ShapeBatch) -> Result<u64,
     Ok(row_count)
 }
 
-async fn flush_stop_time_batch(
-    pool: &PgPool,
-    batch: &mut StopTimeBatch,
-) -> Result<u64, sqlx::Error> {
+async fn flush_stop_time_batch(pool: &PgPool, batch: &mut StopTimeBatch) -> Result<u64> {
     if batch.is_empty() {
         return Ok(0);
     }
 
+    ensure_database_storage_headroom()?;
     let row_count = batch.len() as u64;
     sqlx::query(
         r#"
+        WITH rows AS MATERIALIZED (
+          SELECT *
+          FROM UNNEST(
+            $1::text[],
+            $2::text[],
+            $3::integer[],
+            $4::integer[],
+            $5::integer[],
+            $6::smallint[],
+            $7::smallint[],
+            $8::boolean[],
+            $9::text[],
+            $10::text[],
+            $11::text[],
+            $12::uuid[],
+            $13::text[],
+            $14::integer[]
+          ) AS item(
+            trip_id, stop_id, stop_sequence, arrival_time, departure_time, pickup_type,
+            drop_off_type, timepoint, stop_headsign, platform, raw_notes, import_run_id,
+            source_feed_id, source_priority
+          )
+        ),
+        seen AS (
+          INSERT INTO schedule_import_seen_keys (
+            import_run_id, entity_type, entity_id, sequence
+          )
+          SELECT import_run_id, 'stop_time', trip_id, stop_sequence
+          FROM rows
+          ON CONFLICT DO NOTHING
+        )
         INSERT INTO stop_times (
           trip_id, stop_id, stop_sequence, arrival_time, departure_time, pickup_type,
-          drop_off_type, timepoint, platform, raw_notes, import_run_id, source_feed_id, source_priority
+          drop_off_type, timepoint, stop_headsign, platform, raw_notes, import_run_id,
+          source_feed_id, source_priority
         )
         SELECT *
-        FROM UNNEST(
-          $1::text[],
-          $2::text[],
-          $3::integer[],
-          $4::integer[],
-          $5::integer[],
-          $6::smallint[],
-          $7::smallint[],
-          $8::boolean[],
-          $9::text[],
-          $10::text[],
-          $11::uuid[],
-          $12::text[],
-          $13::integer[]
-        )
+        FROM rows
         ON CONFLICT (trip_id, stop_sequence) DO UPDATE SET
           stop_id = EXCLUDED.stop_id,
           arrival_time = EXCLUDED.arrival_time,
@@ -3141,31 +3831,32 @@ async fn flush_stop_time_batch(
           pickup_type = EXCLUDED.pickup_type,
           drop_off_type = EXCLUDED.drop_off_type,
           timepoint = EXCLUDED.timepoint,
+          stop_headsign = EXCLUDED.stop_headsign,
           platform = EXCLUDED.platform,
           raw_notes = EXCLUDED.raw_notes,
           import_run_id = EXCLUDED.import_run_id,
           source_feed_id = EXCLUDED.source_feed_id,
           source_priority = EXCLUDED.source_priority
         WHERE (
-          stop_times.import_run_id,
           stop_times.stop_id,
           stop_times.arrival_time,
           stop_times.departure_time,
           stop_times.pickup_type,
           stop_times.drop_off_type,
           stop_times.timepoint,
+          stop_times.stop_headsign,
           stop_times.platform,
           stop_times.raw_notes,
           stop_times.source_feed_id,
           stop_times.source_priority
         ) IS DISTINCT FROM (
-          EXCLUDED.import_run_id,
           EXCLUDED.stop_id,
           EXCLUDED.arrival_time,
           EXCLUDED.departure_time,
           EXCLUDED.pickup_type,
           EXCLUDED.drop_off_type,
           EXCLUDED.timepoint,
+          EXCLUDED.stop_headsign,
           EXCLUDED.platform,
           EXCLUDED.raw_notes,
           EXCLUDED.source_feed_id,
@@ -3181,6 +3872,7 @@ async fn flush_stop_time_batch(
     .bind(&batch.pickup_types)
     .bind(&batch.drop_off_types)
     .bind(&batch.timepoints)
+    .bind(&batch.stop_headsigns)
     .bind(&batch.platforms)
     .bind(&batch.raw_notes)
     .bind(&batch.import_run_ids)
@@ -3301,6 +3993,76 @@ mod tests {
         let dates = parse_pid_validity("20260704,20260705").unwrap();
         assert_eq!(dates.len(), 2);
         assert_eq!(dates[0].to_string(), "2026-07-04");
+    }
+
+    #[test]
+    fn rejects_ids_jmk_schedule_with_expired_service_horizon() {
+        let mut dataset = GtfsDataset::default();
+        dataset.stops.push(transit_model::Stop {
+            id: "stop".to_string(),
+            source_ids: Vec::new(),
+            name: "Stop".to_string(),
+            normalized_name: "stop".to_string(),
+            municipality: Some("Brno".to_string()),
+            district: None,
+            region: Some("Jihomoravský kraj".to_string()),
+            lat: Some(49.195),
+            lon: Some(16.608),
+            geom: None,
+            coordinate_confidence: transit_model::CoordinateConfidence::Exact,
+            coordinate_source: Some(IDS_JMK_FEED_ID.to_string()),
+            stop_area_id: None,
+            platform_code: None,
+            location_type: StopLocationType::Stop,
+            parent_station_id: None,
+            station_id: None,
+            complex_id: None,
+            has_station_layout: false,
+            station_layout_version: None,
+            wheelchair_boarding: AccessibilityStatus::Unknown,
+            modes: vec![TransportMode::Tram],
+            is_active: true,
+        });
+        dataset.routes.push(transit_model::Route {
+            id: "route".to_string(),
+            source_id: "route".to_string(),
+            agency_id: None,
+            operator_id: None,
+            short_name: Some("1".to_string()),
+            long_name: None,
+            mode: TransportMode::Tram,
+            gtfs_route_type: Some(0),
+            color: None,
+            text_color: None,
+            source_priority: IDS_JMK_SOURCE_PRIORITY,
+            is_active: true,
+        });
+        dataset.trips.push(gtfs_importer::GtfsTrip {
+            route_id: "route".to_string(),
+            service_id: "service".to_string(),
+            trip_id: "trip".to_string(),
+            trip_headsign: None,
+            direction_id: None,
+            shape_id: None,
+        });
+        dataset.calendars.push(transit_model::Calendar {
+            service_id: "service".to_string(),
+            monday: true,
+            tuesday: true,
+            wednesday: true,
+            thursday: true,
+            friday: true,
+            saturday: true,
+            sunday: true,
+            start_date: NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(),
+            end_date: NaiveDate::from_ymd_opt(2022, 12, 31).unwrap(),
+        });
+
+        let error =
+            validate_ids_jmk_dataset(&dataset, NaiveDate::from_ymd_opt(2026, 9, 14).unwrap())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("is stale"));
     }
 
     #[test]

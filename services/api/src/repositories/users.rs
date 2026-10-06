@@ -8,7 +8,7 @@ pub(crate) async fn find_by_email(
     email: &str,
 ) -> Result<Option<UserRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id,email,password_hash,display_name,created_at,deleted_at FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL",
+        "SELECT id,email,password_hash,display_name,created_at,deleted_at,auth_version FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -18,7 +18,7 @@ pub(crate) async fn find_by_email(
 
 pub(crate) async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<UserRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id,email,password_hash,display_name,created_at,deleted_at FROM users WHERE id=$1",
+        "SELECT id,email,password_hash,display_name,created_at,deleted_at,auth_version FROM users WHERE id=$1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -46,5 +46,6 @@ async fn user_from_row(
         roles,
         created_at: row.get("created_at"),
         deleted_at: row.get("deleted_at"),
+        auth_version: row.get("auth_version"),
     }))
 }
