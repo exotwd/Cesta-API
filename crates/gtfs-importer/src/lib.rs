@@ -1,3 +1,4 @@
+pub mod regional_mapper;
 use std::{
     fs::File,
     io::{Read, Seek},

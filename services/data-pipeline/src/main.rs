@@ -294,6 +294,10 @@ enum Command {
         #[arg(long)]
         force_db_export: bool,
     },
+    SyncMotis {
+        #[arg(long)]
+        force_db_export: bool,
+    },
     SyncIdsJmk {
         #[arg(long)]
         force_db_export: bool,
@@ -453,6 +457,13 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .context("DATABASE_URL is required for import-cities")?;
             import_czech_cities(database_url, &source_url).await?;
+        }
+        Command::SyncMotis { force_db_export } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for sync-motis")?;
+            sync_motis(&cli.storage_dir, database_url, force_db_export).await?;
         }
         Command::SyncPid { force_db_export } => {
             let database_url = cli
@@ -4199,4 +4210,90 @@ mod tests {
 
         fs::remove_dir_all(storage).await.unwrap();
     }
+}
+
+
+async fn sync_motis(
+    storage_dir: &Path,
+    database_url: &str,
+    _force_db_export: bool,
+) -> Result<()> {
+    tracing::info!("Starting sync_motis");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()?;
+        
+    let jdf_url = "https://motis.obehy.cz/get-feeds/cz-jdf-filtered-gtfs.zip";
+    let czptt_url = "https://motis.obehy.cz/get-feeds/cz-czptt-gtfs.zip";
+    
+    let run_dir = storage_dir.join("raw").join("motis").join("latest");
+    tokio::fs::create_dir_all(&run_dir).await?;
+    
+    // Download JDF
+    let jdf_path = run_dir.join("cz-jdf-filtered-gtfs.zip");
+    if !jdf_path.exists() {
+        tracing::info!("Downloading JDF GTFS...");
+        let resp = client.get(jdf_url).send().await?.error_for_status()?;
+        tokio::fs::write(&jdf_path, resp.bytes().await?).await?;
+    }
+    
+    let pool = connect_import_database(database_url).await?;
+    apply_feed_migrations(&pool).await?;
+    
+    tracing::info!("Parsing JDF GTFS...");
+    let jdf_dataset = parse_gtfs_zip(
+        &jdf_path,
+        ImportOptions {
+            source_feed_id: "motis_jdf".to_string(),
+            source_priority: 30,
+            limit_rows: None,
+        },
+    )?;
+    
+    tracing::info!("Importing JDF GTFS...");
+    export_dataset_to_postgres(
+        &pool,
+        &run_dir,
+        "cz-jdf-filtered-gtfs.zip",
+        "motis_jdf",
+        30,
+        &jdf_dataset,
+        true,
+        None,
+        None,
+    ).await?;
+    
+    // Download CZPTT
+    let czptt_path = run_dir.join("cz-czptt-gtfs.zip");
+    if !czptt_path.exists() {
+        tracing::info!("Downloading CZPTT GTFS...");
+        let resp = client.get(czptt_url).send().await?.error_for_status()?;
+        tokio::fs::write(&czptt_path, resp.bytes().await?).await?;
+    }
+    
+    tracing::info!("Parsing CZPTT GTFS...");
+    let czptt_dataset = parse_gtfs_zip(
+        &czptt_path,
+        ImportOptions {
+            source_feed_id: "motis_czptt".to_string(),
+            source_priority: 40,
+            limit_rows: None,
+        },
+    )?;
+    
+    tracing::info!("Importing CZPTT GTFS...");
+    export_dataset_to_postgres(
+        &pool,
+        &run_dir,
+        "cz-czptt-gtfs.zip",
+        "motis_czptt",
+        40,
+        &czptt_dataset,
+        true,
+        None,
+        None,
+    ).await?;
+    
+    Ok(())
 }
