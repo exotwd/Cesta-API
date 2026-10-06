@@ -6,12 +6,15 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 jsonwebtoken.workspace = true
 prost.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+quick-xml = { version = "0.37", features = ["serialize"] }
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true

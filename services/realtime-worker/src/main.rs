@@ -1,3 +1,5 @@
+mod duk;
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -294,7 +296,7 @@ async fn main() -> Result<()> {
         },
         async move {
             if non_pid_enabled && duk_enabled {
-                run_duk_loop(pool, client).await;
+                duk::run_duk_loop(pool, client).await;
             } else {
                 tracing::info!(
                     "DÚK realtime connector is disabled until redistribution terms are confirmed"
@@ -1215,98 +1217,6 @@ async fn enrich_ids_jmk_vehicle_records(
     Ok(())
 }
 
-async fn run_duk_loop(pool: PgPool, client: Client) {
-    let url = env::var("DUK_VEHICLES_URL")
-        .unwrap_or_else(|_| "https://tabule.portabo.cz/api/v1-tabule/cis/GetTraffic/0".to_string());
-    let interval = env_u64("DUK_POLL_INTERVAL_SECONDS", 30).max(15);
-    loop {
-        let attempted_at = Utc::now();
-        let result = sync_duk(&pool, &client, &url).await;
-        finish_sync(
-            &pool,
-            DUK_SOURCE,
-            &url,
-            "vehicle_positions",
-            attempted_at,
-            result,
-        )
-        .await;
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-    }
-}
-
-async fn sync_duk(
-    pool: &PgPool,
-    client: &Client,
-    url: &str,
-) -> Result<(usize, usize, Option<DateTime<Utc>>, Value)> {
-    let payload: Value = client
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let vehicles = payload
-        .get("VehicleList")
-        .and_then(Value::as_array)
-        .context("DUK response is missing VehicleList")?;
-    let mut records = Vec::with_capacity(vehicles.len());
-    let mut latest_source_time: Option<DateTime<Utc>> = None;
-    for vehicle in vehicles {
-        let Some(vehicle_id) = value_string(vehicle.get("ID")) else {
-            continue;
-        };
-        let fetched_at = vehicle
-            .get("GPSPositionDT")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-        latest_source_time =
-            Some(latest_source_time.map_or(fetched_at, |time| time.max(fetched_at)));
-        records.push(RealtimeRecord {
-            source: DUK_SOURCE,
-            source_feed_id: DUK_FEED_ID,
-            source_entity_id: format!("vehicle:{vehicle_id}"),
-            trip_id: vehicle
-                .get("qride_tripID")
-                .and_then(Value::as_str)
-                .map(|id| format!("duk:trip:{id}")),
-            route_id: value_string(vehicle.get("CISLineID")).map(|id| format!("duk:route:{id}")),
-            stop_id: match (
-                value_string(vehicle.get("StationNode")),
-                value_string(vehicle.get("StationPost")),
-            ) {
-                (Some(node), Some(post)) => Some(format!("duk:stop:{node}:{post}")),
-                (Some(node), None) => Some(format!("duk:stop:{node}")),
-                _ => None,
-            },
-            delay_seconds: value_i32(vehicle.get("Delay")).map(|minutes| minutes * 60),
-            estimated_arrival: vehicle
-                .get("ArrivalDT")
-                .and_then(Value::as_str)
-                .and_then(parse_timestamp),
-            estimated_departure: vehicle
-                .get("TODepartureDT")
-                .and_then(Value::as_str)
-                .and_then(parse_timestamp),
-            cancellation_status: None,
-            vehicle_id: Some(vehicle_id),
-            lat: value_f64(vehicle.get("Latitude")),
-            lon: value_f64(vehicle.get("Longitude")),
-            bearing: value_f64(vehicle.get("Azimut")),
-            details: VehicleDetails::default(),
-            fetched_at,
-            valid_until: fetched_at + chrono::Duration::seconds(90),
-            service_date: None,
-            raw_payload: vehicle.clone(),
-        });
-    }
-    let received = records.len();
-    let written = persist_records(pool, &records).await?;
-    Ok((received, written, latest_source_time, json!({})))
-}
 
 async fn persist_records(pool: &PgPool, records: &[RealtimeRecord]) -> Result<usize> {
     let records = deduplicate_records(records);
