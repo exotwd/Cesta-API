@@ -8512,7 +8512,8 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
                    modes, source_priority, is_active
             FROM stops
             WHERE is_active = true
-              AND normalized_name = $1
+              AND geom IS NOT NULL
+              AND ST_DWithin(geom, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 300.0)
               AND (
                 source_feed_id IS NULL
                 OR EXISTS (
@@ -8533,12 +8534,14 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
             LIMIT 250
             "#,
         )
-        .bind(pid_source_stop_query(&stop.normalized_name))
+        .bind(stop.lon.unwrap())
+        .bind(stop.lat.unwrap())
         .fetch_all(pool)
         .await?;
+        let stop_canonical = canonical_stop_name(stop);
         for sibling in sibling_rows {
             let sibling = stop_from_row(sibling)?;
-            if stops_are_same_suggestion(stop, &sibling) {
+            if canonical_stop_name(&sibling) == stop_canonical {
                 ids.push(sibling.id);
             }
         }
