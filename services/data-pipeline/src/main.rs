@@ -302,6 +302,10 @@ enum Command {
         #[arg(long)]
         force_db_export: bool,
     },
+    SyncGgu {
+        #[arg(long)]
+        force_db_export: bool,
+    },
     RunScheduler {
         #[arg(
             long,
@@ -334,7 +338,6 @@ async fn main() -> Result<()> {
         Command::Download {
             source: Source::GguLatest,
         } => {
-            ensure_ggu_imports_enabled()?;
             let run_dir = download_ggu_latest(&cli.storage_dir, &cli.ggu_latest_base_url).await?;
             println!("{}", run_dir.display());
         }
@@ -355,7 +358,6 @@ async fn main() -> Result<()> {
             limit_rows,
             force_db_export,
         } => {
-            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             import_ggu_latest(
                 &run_dir,
@@ -396,7 +398,6 @@ async fn main() -> Result<()> {
         Command::Validate {
             target: Target::Latest,
         } => {
-            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             validate_latest(&run_dir)?;
         }
@@ -405,7 +406,6 @@ async fn main() -> Result<()> {
             limit_rows,
             force_db_export,
         } => {
-            ensure_ggu_imports_enabled()?;
             let run_dir = download_ggu_latest(&cli.storage_dir, &cli.ggu_latest_base_url).await?;
             import_ggu_latest(
                 &run_dir,
@@ -447,7 +447,6 @@ async fn main() -> Result<()> {
         Command::Summarize {
             target: Target::Latest,
         } => {
-            ensure_ggu_imports_enabled()?;
             let run_dir = latest_run_dir(&cli.storage_dir)?;
             summarize(&run_dir)?;
         }
@@ -492,6 +491,19 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Command::SyncGgu { force_db_export } => {
+            let database_url = cli
+                .database_url
+                .as_deref()
+                .context("DATABASE_URL is required for sync-ggu")?;
+            sync_ggu(
+                &cli.storage_dir,
+                database_url,
+                &cli.ggu_latest_base_url,
+                force_db_export,
+            )
+            .await?;
+        }
         Command::RunScheduler { interval_seconds } => {
             let database_url = cli
                 .database_url
@@ -503,25 +515,13 @@ async fn main() -> Result<()> {
                 &cli.pid_gtfs_url,
                 &cli.pid_lines_url,
                 &cli.ids_jmk_gtfs_url,
+                &cli.ggu_latest_base_url,
                 interval_seconds,
             )
             .await?;
         }
     }
     Ok(())
-}
-
-fn ensure_ggu_imports_enabled() -> Result<()> {
-    let enabled = std::env::var("GGU_IMPORTS_ENABLED")
-        .ok()
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
-    if enabled {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "GGU imports are disabled by the official-source policy; use sync-pid or sync-ids-jmk instead"
-        )
-    }
 }
 
 async fn import_czech_cities(database_url: &str, source_url: &str) -> Result<()> {
@@ -690,6 +690,7 @@ async fn run_schedule_scheduler(
     pid_gtfs_url: &str,
     pid_lines_url: &str,
     ids_jmk_gtfs_url: &str,
+    ggu_latest_base_url: &str,
     interval_seconds: u64,
 ) -> Result<()> {
     let interval_seconds = interval_seconds.max(300);
@@ -705,6 +706,7 @@ async fn run_schedule_scheduler(
         )
         .await;
         let ids_jmk_result = sync_ids_jmk(storage_dir, database_url, ids_jmk_gtfs_url, false).await;
+        let ggu_result = sync_ggu(storage_dir, database_url, ggu_latest_base_url, false).await;
         let mut failed = false;
         if let Err(error) = pid_result {
             tracing::error!(error = %error, "PID schedule synchronization failed");
@@ -712,6 +714,10 @@ async fn run_schedule_scheduler(
         }
         if let Err(error) = ids_jmk_result {
             tracing::error!(error = %error, "IDS JMK schedule synchronization failed");
+            failed = true;
+        }
+        if let Err(error) = ggu_result {
+            tracing::error!(error = %error, "GGU schedule synchronization failed");
             failed = true;
         }
         let retry_after = if failed { 60 } else { interval_seconds };
@@ -851,6 +857,75 @@ async fn sync_ids_jmk(
             &pool,
             IDS_JMK_FEED_ID,
             gtfs_url,
+            "schedule",
+            attempted_at,
+            succeeded_at,
+            records,
+            records,
+            error_message.as_deref(),
+            serde_json::json!({"status": status, "details": metadata}),
+        )
+        .await?;
+    }
+    result.map(|_| ())
+}
+
+async fn sync_ggu(
+    storage_dir: &Path,
+    database_url: &str,
+    ggu_latest_base_url: &str,
+    force_db_export: bool,
+) -> Result<()> {
+    let attempted_at = Utc::now();
+    let result = async {
+        let run_dir = download_ggu_latest(storage_dir, ggu_latest_base_url).await?;
+        import_ggu_latest(&run_dir, None, Some(database_url), force_db_export).await?;
+        Ok::<PathBuf, anyhow::Error>(run_dir)
+    }
+    .await;
+
+    if let Ok(pool) = connect_import_database(database_url).await
+        && apply_feed_migrations(&pool).await.is_ok()
+    {
+        let (status, succeeded_at, error_message, metadata) = match &result {
+            Ok(run_dir) => (
+                "success",
+                Some(Utc::now()),
+                None,
+                serde_json::json!({"run_dir": run_dir.display().to_string()}),
+            ),
+            Err(error) => (
+                "error",
+                None,
+                Some(error.to_string()),
+                serde_json::json!({}),
+            ),
+        };
+        let records = if result.is_ok() {
+            sqlx::query(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM routes WHERE source_feed_id IN ('ggu_jdf_gtfs_latest', 'ggu_czptt_gtfs_latest')) AS routes,
+                  (SELECT COUNT(*) FROM trips WHERE source_feed_id IN ('ggu_jdf_gtfs_latest', 'ggu_czptt_gtfs_latest')) AS trips,
+                  (SELECT COUNT(*) FROM stop_times WHERE source_feed_id IN ('ggu_jdf_gtfs_latest', 'ggu_czptt_gtfs_latest')) AS stop_times
+                "#,
+            )
+            .fetch_one(&pool)
+            .await
+            .ok()
+            .map(|row| {
+                row.get::<i64, _>("routes")
+                    + row.get::<i64, _>("trips")
+                    + row.get::<i64, _>("stop_times")
+            })
+            .unwrap_or(0) as usize
+        } else {
+            0
+        };
+        record_data_sync(
+            &pool,
+            "ggu_jdf_gtfs_latest", // Use the main JDF feed ID as the sync status tracker for all GGU
+            ggu_latest_base_url,
             "schedule",
             attempted_at,
             succeeded_at,

@@ -134,7 +134,7 @@ Invoke-RestMethod -Method Post http://localhost:8070/journeys/search -ContentTyp
 
 ## Official Source Policy
 
-PID GTFS, PID line geometry, PID realtime, IDS JMK GTFS and IDS JMK realtime are enabled. The IDS JMK feeds are the official public-data channel for Brno services operated by DPMB; because the published GTFS has one aggregate agency rather than a reliable operator split, the complete IDS JMK feed is retained. Historical GGU rows and validation reports remain in PostgreSQL for auditability, but public queries and routing exclude disabled feeds. Legacy GGU CLI operations are blocked unless `GGU_IMPORTS_ENABLED=true` is set explicitly.
+PID GTFS, PID line geometry, PID realtime, IDS JMK GTFS, IDS JMK realtime and GGU GTFS feeds are enabled. The IDS JMK feeds are the official public-data channel for Brno services operated by DPMB; because the published GTFS has one aggregate agency rather than a reliable operator split, the complete IDS JMK feed is retained. GGU schedule integration retrieves national rail and regional bus services from JRUtil exports.
 
 Inspect PostgreSQL table and index usage before and after storage maintenance:
 
@@ -149,6 +149,7 @@ Get-Content -Raw .\infra\postgres\maintenance\storage_report.sql | docker compos
 ```powershell
 docker compose --profile tools run --rm data-pipeline sync-pid
 docker compose --profile tools run --rm data-pipeline sync-ids-jmk
+docker compose --profile tools run --rm data-pipeline sync-ggu
 ```
 
 Inspect source freshness and current vehicle data:
