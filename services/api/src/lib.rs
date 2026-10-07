@@ -8538,10 +8538,9 @@ async fn equivalent_stop_ids_db(pool: &PgPool, stop: &Stop) -> Result<Vec<String
         .bind(stop.lat.unwrap())
         .fetch_all(pool)
         .await?;
-        let stop_canonical = canonical_stop_name(stop);
         for sibling in sibling_rows {
             let sibling = stop_from_row(sibling)?;
-            if canonical_stop_name(&sibling) == stop_canonical {
+            if stops_are_equivalent_for_routing(stop, &sibling) {
                 ids.push(sibling.id);
             }
         }
@@ -11599,6 +11598,50 @@ fn canonical_stop_name_parts(name: &str, municipality: Option<&str>) -> String {
         .to_string()
 }
 
+fn stops_are_equivalent_for_routing(left: &Stop, right: &Stop) -> bool {
+    if left.id == right.id {
+        return true;
+    }
+    if let (Some(left_complex), Some(right_complex)) = (
+        pid_stop_complex_id(&left.id),
+        pid_stop_complex_id(&right.id),
+    ) && left_complex == right_complex
+    {
+        return true;
+    }
+    if left.stop_area_id.is_some() && left.stop_area_id == right.stop_area_id {
+        return true;
+    }
+    if left.parent_station_id.is_some() && left.parent_station_id == right.parent_station_id {
+        return true;
+    }
+    if let (Some(left_base), Some(right_base)) = (
+        railway_station_stop_base(&left.id),
+        railway_station_stop_base(&right.id),
+    ) && left_base == right_base
+    {
+        return true;
+    }
+
+    if canonical_stop_name(left) == canonical_stop_name(right) {
+        let left_municipality = left.municipality.as_deref().map(normalize_search_text);
+        let right_municipality = right.municipality.as_deref().map(normalize_search_text);
+        if matches!((&left_municipality, &right_municipality), (Some(left), Some(right)) if left != right)
+        {
+            return false;
+        }
+
+        match (left.lat.zip(left.lon), right.lat.zip(right.lon)) {
+            (Some((left_lat, left_lon)), Some((right_lat, right_lon))) => {
+                haversine_m(left_lat, left_lon, right_lat, right_lon) <= 300.0
+            }
+            _ => left_municipality.is_some() && left_municipality == right_municipality,
+        }
+    } else {
+        false
+    }
+}
+
 fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
     if left.id == right.id {
         return true;
@@ -11647,6 +11690,7 @@ fn stops_are_same_suggestion(left: &Stop, right: &Stop) -> bool {
         _ => left_municipality.is_some() && left_municipality == right_municipality,
     }
 }
+
 
 fn stop_modes_require_separate_suggestions(left: &Stop, right: &Stop) -> bool {
     let modal_kind = |stop: &Stop| {
