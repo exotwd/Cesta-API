@@ -11582,10 +11582,17 @@ fn canonical_stop_name(stop: &Stop) -> String {
 
 fn canonical_stop_name_parts(name: &str, municipality: Option<&str>) -> String {
     let name = normalize_search_text(name);
+    let mut sliced_name = name.as_str();
+    if let Some(idx) = sliced_name.find(" smer ") {
+        sliced_name = &sliced_name[..idx];
+    } else if let Some(idx) = sliced_name.find(",smer ") {
+        sliced_name = &sliced_name[..idx];
+    }
+    
     let municipality = municipality.map(normalize_search_text).unwrap_or_default();
-    name.strip_prefix(&format!("{municipality} "))
+    sliced_name.strip_prefix(&format!("{municipality} "))
         .filter(|_| !municipality.is_empty())
-        .unwrap_or(&name)
+        .unwrap_or(sliced_name)
         .to_string()
 }
 

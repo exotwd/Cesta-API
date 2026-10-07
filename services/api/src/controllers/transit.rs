@@ -326,7 +326,23 @@ pub(crate) fn ranked_stop_suggestions<'a>(
     for stop in scored_stops
         .into_iter()
         .filter(|(score, _, _)| score_floor.is_none_or(|floor| *score >= floor))
-        .map(|(_, _, stop)| stop)
+        .map(|(_, _, mut stop)| {
+            let lower = stop.name.to_lowercase();
+            let mut idx = None;
+            if let Some(i) = lower.find(" směr ") { idx = Some(i); }
+            else if let Some(i) = lower.find(",směr ") { idx = Some(i); }
+            else if let Some(i) = lower.find(" smer ") { idx = Some(i); }
+            else if let Some(i) = lower.find(",smer ") { idx = Some(i); }
+            if let Some(i) = idx {
+                let chars = lower[..i].chars().count();
+                if let Some((byte_idx, _)) = stop.name.char_indices().nth(chars) {
+                    stop.name.truncate(byte_idx);
+                }
+                let trimmed = stop.name.trim_end().to_string();
+                stop.name = if trimmed.ends_with(',') { trimmed[..trimmed.len() - 1].to_string() } else { trimmed };
+            }
+            stop
+        })
     {
         if let Some(existing) = suggestions
             .iter_mut()
